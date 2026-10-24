@@ -690,12 +690,10 @@ describe("gateway uncovered branches", () => {
         // not configured
         expect(await g.h.__agentEnterSandbox(session.id)).toContain("not configured");
         process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
-        // empty allowlist → nobody; tells the model to ask for /sandbox on
-        expect(await g.h.__agentEnterSandbox(session.id)).toContain("/sandbox on");
-        expect(await Sandbox.find("D_MGR", ts)).toBeNull();
-        // another user listed → still refused
+        // an allowlist without this user → refused, and told not to do the work here
         process.env.SLAUDE_SANDBOX_AUTO_USERS = "U0OTHER";
-        expect(await g.h.__agentEnterSandbox(session.id)).toContain("/sandbox on");
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("not on the sandbox allowlist");
+        expect(await Sandbox.find("D_MGR", ts)).toBeNull();
         // a /remote target → refused even when allowed
         process.env.SLAUDE_SANDBOX_AUTO_USERS = "*";
         await Remote.setTarget({ channelId: "D_MGR", threadTs: ts, teamId: "T", userId: WORLD.manager, addr: "tcA", dir: "/r", lockByRemote: false });
@@ -706,6 +704,10 @@ describe("gateway uncovered branches", () => {
         expect(await g.h.__agentEnterSandbox(session.id)).toContain("next turn");
         expect((await Sandbox.find("D_MGR", ts))?.created_by).toBe(WORLD.manager);
         expect(await g.h.__agentEnterSandbox(session.id)).toContain("already on");
+        // no allowlist at all → everyone
+        await Sandbox._wipeForTests();
+        delete process.env.SLAUDE_SANDBOX_AUTO_USERS;
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("next turn");
         expect(await g.h.__agentEnterSandbox("no-such-session")).toContain("no active thread");
       } finally {
         delete process.env.SLAUDE_SANDBOX_MCP_URL;

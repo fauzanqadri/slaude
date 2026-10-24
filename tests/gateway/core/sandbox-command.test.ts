@@ -31,7 +31,11 @@ beforeEach(async () => {
   await OneOnOne._wipeForTests();
   replies = []; notes = []; reloads = 0; destroyed = [];
 });
-afterEach(() => { delete process.env.SLAUDE_SANDBOX_MCP_URL; delete process.env.SLAUDE_REMOTE; });
+afterEach(() => {
+  delete process.env.SLAUDE_SANDBOX_MCP_URL;
+  delete process.env.SLAUDE_REMOTE;
+  delete process.env.SLAUDE_SANDBOX_AUTO_USERS;
+});
 
 describe("/sandbox", () => {
   it("not configured → refused, nothing stored", async () => {
@@ -67,6 +71,26 @@ describe("/sandbox", () => {
     await handleSandboxCommand(off, ctx(), deps(false));
     expect(await Sandbox.find("C1", "1.0")).toBeNull();
     expect(replies[0]).toContain("did not confirm");
+  });
+
+  it("an allowlist limits on and off to its users; status stays open; unset or * = everyone", async () => {
+    process.env.SLAUDE_SANDBOX_AUTO_USERS = "U_A, U_C";
+    await handleSandboxCommand(on, ctx({ userId: "U_B" }), deps());
+    expect(replies[0]).toContain("allowlist");
+    expect(await Sandbox.find("C1", "1.0")).toBeNull();
+    await handleSandboxCommand(on, ctx({ userId: "U_A" }), deps());
+    expect(await Sandbox.find("C1", "1.0")).not.toBeNull();
+    await handleSandboxCommand(off, ctx({ userId: "U_B" }), deps());
+    expect(await Sandbox.find("C1", "1.0")).not.toBeNull();
+    expect(destroyed).toEqual([]);
+    await handleSandboxCommand(status, ctx({ userId: "U_B" }), deps());
+    expect(replies.at(-1)).toContain("*on*");
+    process.env.SLAUDE_SANDBOX_AUTO_USERS = "*";
+    await handleSandboxCommand(off, ctx({ userId: "U_B" }), deps());
+    expect(await Sandbox.find("C1", "1.0")).toBeNull();
+    process.env.SLAUDE_SANDBOX_AUTO_USERS = "";
+    await handleSandboxCommand(on, ctx({ userId: "U_B" }), deps());
+    expect(await Sandbox.find("C1", "1.0")).not.toBeNull();
   });
 
   it("off when not on → nothing destroyed", async () => {

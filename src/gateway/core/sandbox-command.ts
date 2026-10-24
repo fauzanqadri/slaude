@@ -28,8 +28,8 @@ export interface SandboxCommandDeps {
 
 const defaultDeps: SandboxCommandDeps = { destroy: destroySandbox };
 
-/** `/sandbox [on|off|status]`: per-thread sandbox mode. Open to anyone admitted to
- *  the thread: the sandbox holds no credential. On replaces /remote (the last
+/** `/sandbox [on|off|status]`: per-thread sandbox mode. On and off are limited to
+ *  SLAUDE_SANDBOX_AUTO_USERS; status is open. On replaces /remote (the last
  *  command wins); off destroys the sandbox at once. */
 export async function handleSandboxCommand(hit: SandboxHit, ctx: SandboxCommandCtx, deps: SandboxCommandDeps = defaultDeps): Promise<void> {
   if (!env.sandbox.mcpUrl()) {
@@ -43,6 +43,11 @@ export async function handleSandboxCommand(hit: SandboxHit, ctx: SandboxCommandC
     await ctx.reply(on
       ? `Sandbox mode: *on* (since <@${on.created_by}> turned it on) — my shell and file tools run in this thread's sandbox.`
       : "Sandbox mode: *off* — tools run on the server. `/sandbox on` to work on code in a sandbox.");
+    return;
+  }
+
+  if (!env.sandbox.autoAllowed(userId)) {
+    await ctx.reply(":no_entry: You are not on this deployment's sandbox allowlist (SLAUDE_SANDBOX_AUTO_USERS); ask the manager to add you.");
     return;
   }
 

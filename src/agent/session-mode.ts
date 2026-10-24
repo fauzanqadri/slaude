@@ -26,7 +26,7 @@ export function sessionModeBlock(
 
 const SANDBOX_AVAILABLE_BLOCK = [
   "<sandbox-available>",
-  "Code work (cloning, building, testing, editing or committing a repo) runs in a per-thread sandbox, not on this server. Before any code work, call mcp__slaude_surface__enter_sandbox; if it says you may not, ask the user to type `/sandbox on`. Reading, answering questions and calling MCP tools stay here.",
+  "Code work (cloning, building, testing, editing or committing a repo) runs in a per-thread sandbox, not on this server. Before any code work, call mcp__slaude_surface__enter_sandbox; if the user is not allowed, say so and do not do the code work here. Reading, answering questions and calling MCP tools stay here.",
   "</sandbox-available>",
 ].join("\n");
 

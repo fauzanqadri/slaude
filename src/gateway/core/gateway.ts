@@ -1291,7 +1291,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     if (!env.sandbox.mcpUrl()) return "Sandbox mode is not configured on this deployment.";
     if (await Sandbox.find(ctx.channel, threadTs)) return "Sandbox mode is already on in this thread.";
     if (await Remote.findTarget(ctx.channel, threadTs)) return `This thread runs on the user's own machine (/remote). ${ask}`;
-    if (!env.sandbox.autoAllowed(ctx.userId)) return `You may not switch this thread yourself for this user. ${ask}`;
+    if (!env.sandbox.autoAllowed(ctx.userId)) return "This user is not on the sandbox allowlist, so the thread stays here; tell them to ask the manager for access. Do not do the code work on this server.";
     await Sandbox.set({ channelId: ctx.channel, threadTs, createdBy: ctx.userId ?? "" });
     agent.reloadAfterTurn(sessionId);
     return "Sandbox mode on from the next turn: finish this reply, tell the user their next message continues in the sandbox, and do no code work here.";

@@ -599,13 +599,13 @@ export const env = {
     mcpUrl: () => opt("SLAUDE_SANDBOX_MCP_URL").trim(),
     /** Bearer token sent to the sandbox MCP server. Empty = no Authorization header. */
     mcpToken: () => opt("SLAUDE_SANDBOX_MCP_TOKEN").trim(),
-    /** Slack user ids whose turns may switch a thread on through the agent's
-     *  `enter_sandbox` tool (comma-separated; `*` = everyone; empty = nobody).
-     *  `/sandbox on` is open to everyone regardless. */
+    /** Slack user ids allowed to switch sandbox mode: `/sandbox on|off`, and the
+     *  agent's `enter_sandbox` on their turns (comma-separated). Unset, empty or
+     *  `*` = everyone (no allowlist). `/sandbox` status is always open. */
     autoUsers: () => csv(opt("SLAUDE_SANDBOX_AUTO_USERS")),
     autoAllowed: (userId: string | undefined): boolean => {
       const list = csv(opt("SLAUDE_SANDBOX_AUTO_USERS"));
-      return list.includes("*") || (!!userId && list.includes(userId));
+      return list.length === 0 || list.includes("*") || (!!userId && list.includes(userId));
     },
   },
   gitPush: {
