@@ -87,6 +87,12 @@ export const surfaceContract = {
         scope: z.string().optional().describe('Guest constraint description for action="open". Free text — you interpret and enforce it for non-initiator users.'),
       },
     },
+    enter_sandbox: {
+      name: "enter_sandbox",
+      description:
+        "Move THIS thread into its own sandbox before changing code: clone, build, test, commit. From the next turn your shell and file tools run in the sandbox (repos under /workspace, no credentials; publish with git_push). Only allowed when the user who started this turn is on the deployment's allowlist; otherwise the result tells you to ask them to type `/sandbox on`. Returns a short status to relay.",
+      schema: {},
+    },
     set_mention_only: {
       name: "set_mention_only",
       description:

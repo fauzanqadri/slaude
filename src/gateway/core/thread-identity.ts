@@ -7,6 +7,7 @@
  * the agent.
  */
 import * as OneOnOne from "../../db/one-on-one";
+import * as Sandbox from "../../db/sandbox";
 import { activeRemoteTarget } from "../../remote/active";
 import { env } from "../../config/env";
 
@@ -17,6 +18,8 @@ export interface ThreadIdentity {
   lock: { user: string; openScope: string | null } | null;
   /** The remote target, only when it belongs to the runAs user. */
   remote: { addr: string; dir: string } | undefined;
+  /** /sandbox on for this thread (only when a sandbox server is configured). */
+  sandbox: boolean;
 }
 
 export async function threadIdentity(
@@ -32,5 +35,6 @@ export async function threadIdentity(
     runAsUser,
     lock: lockRow ? { user: lockRow.locked_user, openScope: lockRow.open_scope } : null,
     remote: target && target.userId === runAsUser ? { addr: target.addr, dir: target.dir } : undefined,
+    sandbox: env.sandbox.mcpUrl() ? !!(await Sandbox.find(channel, thread)) : false,
   };
 }

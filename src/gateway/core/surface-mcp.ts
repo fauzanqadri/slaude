@@ -33,6 +33,9 @@ export interface SurfaceMcpOpts {
    *  surface-mcp stays decoupled from the db). When present, the set_mention_only
    *  tool is mounted. */
   setMentionOnly?: (active: boolean) => Promise<string>;
+  /** Switch the current thread to sandbox mode (gateway injects the engine, which
+   *  checks SLAUDE_SANDBOX_AUTO_USERS). When present, enter_sandbox is mounted. */
+  enterSandbox?: () => Promise<string>;
 }
 
 /** Build the agent-facing interaction tools for a Surface. Core tools are always present;
@@ -132,6 +135,17 @@ export function surfaceTools(surface: Surface, opts: SurfaceMcpOpts = {}): Surfa
       handler: async ({ active }) => {
         try { return ok(await setMentionOnly(active)); }
         catch (e: any) { return fail(`set_mention_only failed: ${e?.message ?? String(e)}`); }
+      },
+    });
+  }
+
+  if (opts.enterSandbox) {
+    const enterSandbox = opts.enterSandbox;
+    defs.push({
+      ...c.enter_sandbox,
+      handler: async () => {
+        try { return ok(await enterSandbox()); }
+        catch (e: any) { return fail(`enter_sandbox failed: ${e?.message ?? String(e)}`); }
       },
     });
   }

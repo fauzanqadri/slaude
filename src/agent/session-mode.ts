@@ -14,13 +14,21 @@ export function sessionModeBlock(
   remote?: { userId: string; dir: string } | null,
   sandbox = false,
   localExecOff = false,
+  sandboxAvailable = false,
 ): string {
   const base = lockBlock(lock);
   if (remote) return [base, remoteBlock(remote)].filter(Boolean).join("\n\n");
   if (sandbox) return [base, SANDBOX_BLOCK].filter(Boolean).join("\n\n");
-  if (localExecOff) return [base, LOCAL_EXEC_OFF_BLOCK].filter(Boolean).join("\n\n");
-  return base;
+  const available = sandboxAvailable ? SANDBOX_AVAILABLE_BLOCK : "";
+  if (localExecOff) return [base, LOCAL_EXEC_OFF_BLOCK, available].filter(Boolean).join("\n\n");
+  return [base, available].filter(Boolean).join("\n\n");
 }
+
+const SANDBOX_AVAILABLE_BLOCK = [
+  "<sandbox-available>",
+  "Code work (cloning, building, testing, editing or committing a repo) runs in a per-thread sandbox, not on this server. Before any code work, call mcp__slaude_surface__enter_sandbox; if it says you may not, ask the user to type `/sandbox on`. Reading, answering questions and calling MCP tools stay here.",
+  "</sandbox-available>",
+].join("\n");
 
 const LOCAL_EXEC_OFF_BLOCK = [
   "<local-exec-off>",
@@ -34,7 +42,9 @@ const SANDBOX_BLOCK = [
   "Your file and shell tools (Bash, Read, Write, Edit, Glob, Grep) run in an isolated sandbox for this thread — not on this server.",
   "The sandbox holds no credentials: anything that needs one (pushing code, opening a pull request, calling an API) cannot be done from Bash there. The knowledge base, MCP servers and web tools are unchanged and still run here.",
   "Background jobs: Bash with run_in_background returns an ID; read output with mcp__remote__bash_output and stop it with mcp__remote__bash_kill.",
+  "To publish work: commit on a branch named factory/<name>, then call mcp__remote__git_push (it asks the user for approval and pushes from outside the sandbox).",
   "If a sandbox tool fails because the sandbox is unreachable or expired, stop and tell the user. Do not retry in a loop and do not work around it.",
+  "The user can leave with `/sandbox off`, which destroys the sandbox: push anything worth keeping first.",
   "</sandbox-mode>",
 ].join("\n");
 

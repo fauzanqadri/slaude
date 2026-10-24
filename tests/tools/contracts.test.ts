@@ -127,6 +127,7 @@ describe("contract snapshots — MCP servers register exactly what the contracts
       initiator: () => "U1",
       setOneOnOne: async () => "ok",
       setMentionOnly: async () => "ok",
+      enterSandbox: async () => "ok",
     });
     await assertMatchesContract(real, surfaceContract);
   });

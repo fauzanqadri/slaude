@@ -31,6 +31,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 // specifier means coverage is attributed to src/agent/manager.ts.
 const { AgentManager } = await import("../../src/agent/manager");
 const Sessions = await import("../../src/db/sessions");
+const Sandbox = await import("../../src/db/sandbox");
 
 // ---------------------------------------------------------------------------
 // Fake SDK session
@@ -554,6 +555,7 @@ describe("sandbox mode (SLAUDE_SANDBOX_MCP_URL)", () => {
     const asked: string[] = [];
     mgr.setPermissionResolver(async (_sid, toolName, input) => { asked.push(toolName); return { behavior: "allow", updatedInput: input } as any; });
     mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    mgr.setSandboxResolver(async () => true);
     const row = await mgr.ensureSession(thread());
     const fs = plan();
     await mgr.sendMessage(row.id, "hello");
@@ -577,6 +579,7 @@ describe("sandbox mode (SLAUDE_SANDBOX_MCP_URL)", () => {
 
   it("a /remote target wins over the sandbox", () => withSandbox(async () => {
     const mgr = new AgentManager();
+    mgr.setSandboxResolver(async () => true);
     mgr.setRemote(
       async () => ({ teamId: "T1", userId: "U_A", addr: "tcA", dir: "/r" }),
       () => ({ exec: noopExec, release: async () => {}, dispose: async () => {} }),
@@ -590,6 +593,47 @@ describe("sandbox mode (SLAUDE_SANDBOX_MCP_URL)", () => {
     expect(fs.options.systemPrompt.append).not.toContain("<sandbox-mode>");
     await shutdown(mgr, row.id);
   }));
+
+  it("a thread not switched on runs locally, with the sandbox-available hint", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers?.remote).toBeUndefined();
+    expect(fs.options.toolAliases).toBeUndefined();
+    expect(fs.options.systemPrompt.append).not.toContain("<sandbox-mode>");
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-available>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("with no resolver, a /sandbox row in the database switches the thread on", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    const t = thread();
+    await Sandbox.set({ channelId: t.channel_id, threadTs: t.thread_ts, createdBy: "U_A" });
+    const row = await mgr.ensureSession(t);
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers.remote.type).toBe("http");
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-mode>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("no sandbox server configured: no hint, even with a stale row", async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    mgr.setSandboxResolver(async () => true);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers?.remote).toBeUndefined();
+    expect(fs.options.systemPrompt.append).not.toContain("sandbox-");
+    await shutdown(mgr, row.id);
+  });
 });
 
 describe("local execution off (SLAUDE_LOCAL_EXEC=off)", () => {

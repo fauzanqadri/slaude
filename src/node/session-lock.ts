@@ -26,3 +26,12 @@ export function lockFromClaims(store: TokenSource, sessionId: string): OneOnOneL
     open_scope: c.lock.openScope ?? null,
   };
 }
+
+/** The /sandbox switch from the same token: false when the claim is absent (the
+ *  gateway omits it when off), undefined when there is no token for this session. */
+export function sandboxFromClaims(store: TokenSource, sessionId: string): boolean | undefined {
+  const token = store.tokenFor(sessionId);
+  const c = token ? decodeClaims(token) : null;
+  if (!c || c.session !== sessionId) return undefined;
+  return c.sandbox === true;
+}

@@ -592,12 +592,21 @@ export const env = {
     },
   },
   sandbox: {
-    /** Sandbox mode: when set, every session's shell and file tools run on this
-     *  streamable-HTTP MCP server (same six tools as `/remote`) instead of
-     *  locally. A `/remote` target, when present, takes precedence. Empty = off. */
+    /** Sandbox mode: the streamable-HTTP MCP server (same six tools as `/remote`)
+     *  that a thread's shell and file tools run on once the thread is switched
+     *  on with `/sandbox on` or `enter_sandbox`. Other threads run locally.
+     *  A `/remote` target takes precedence. Empty = the feature is off. */
     mcpUrl: () => opt("SLAUDE_SANDBOX_MCP_URL").trim(),
     /** Bearer token sent to the sandbox MCP server. Empty = no Authorization header. */
     mcpToken: () => opt("SLAUDE_SANDBOX_MCP_TOKEN").trim(),
+    /** Slack user ids whose turns may switch a thread on through the agent's
+     *  `enter_sandbox` tool (comma-separated; `*` = everyone; empty = nobody).
+     *  `/sandbox on` is open to everyone regardless. */
+    autoUsers: () => csv(opt("SLAUDE_SANDBOX_AUTO_USERS")),
+    autoAllowed: (userId: string | undefined): boolean => {
+      const list = csv(opt("SLAUDE_SANDBOX_AUTO_USERS"));
+      return list.includes("*") || (!!userId && list.includes(userId));
+    },
   },
   gitPush: {
     /** Remotes `git_push` may push a factory/* branch to, exactly as given

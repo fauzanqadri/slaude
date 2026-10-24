@@ -320,7 +320,7 @@ export function makeQueueDispatch(agent: AgentManager, opts: QueueDispatchOpts =
       // The lock rides the token for the node's session-mode block (a node has
       // no database): always present (null = unlocked) so a node can tell it
       // from a token minted by an older gateway.
-      const { runAsUser, lock: lockClaim, remote: remoteClaim } = await threadIdentity(
+      const { runAsUser, lock: lockClaim, remote: remoteClaim, sandbox: sandboxClaim } = await threadIdentity(
         meta.channelId,
         meta.threadTs,
         async () => meta.oauthUser ?? (await agent.resolveEffectiveIdentity(session.id, meta.channelId, meta.threadTs)),
@@ -353,8 +353,10 @@ export function makeQueueDispatch(agent: AgentManager, opts: QueueDispatchOpts =
           lock: lockClaim,
           remote: remoteClaim ?? null,
           mcpEpoch: await turnMcpEpoch({ tenant: tenantId, persona: personaId, team: meta.teamId, runAsUser }, epochs),
+          sandbox: sandboxClaim,
         }),
         ...(remoteClaim ? { remote: remoteClaim } : {}),
+        ...(sandboxClaim ? { sandbox: true } : {}),
       });
       // Routing (spec §2, node labels spec §4.6): warm + fresh on a node that
       // still carries the persona's label → that node's queue; anything else →

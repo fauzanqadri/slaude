@@ -7,6 +7,7 @@ import { generateSshKeyPair, isValidSshKeyPair } from "../../remote/keygen";
 import { preflight, remoteCleanup } from "../../remote/preflight";
 import { isRemoteDir, isTailcatAddr } from "../../remote/shell";
 import { tailcatPing } from "../../remote/tailcat";
+import { SANDBOX_GONE_NOTE, destroySandbox, turnSandboxOff } from "../../remote/sandbox-destroy";
 import type { SlashHit } from "../slack/commands";
 
 type RemoteHit = Extract<SlashHit, { kind: "remote" }>;
@@ -22,6 +23,8 @@ export interface RemoteCommandCtx {
   reply(text: string): Promise<void>;
   sayPrivately(text: string): Promise<void>;
   reload(): void;
+  /** Queue a line for the agent's transcript on its next turn (agent.noteSessionEvent). */
+  note?(text: string): void;
 }
 
 export interface RemoteCommandDeps {
@@ -33,6 +36,8 @@ export interface RemoteCommandDeps {
   validKey(pair: Remote.RemoteKeyPair): boolean;
   /** Active cron jobs firing into this thread that someone other than `userId` created. */
   listForeignThreadCrons(channelId: string, threadTs: string, userId: string): Promise<number>;
+  /** Destroy a thread's sandbox when /remote on replaces sandbox mode. */
+  destroySandbox?: (sessionId: string) => Promise<boolean>;
 }
 
 const defaultDeps: RemoteCommandDeps = {
@@ -125,6 +130,26 @@ export async function endRemoteForThread(
   return { ended: !!gone, lockByRemote: gone?.lock_by_remote === 1 };
 }
 
+/** End the thread's remote mode, as `/remote off` does: only the target owner or the
+ *  manager may; releases the 1on1 lock when /remote created it. Shared with
+ *  `/sandbox on`, which replaces remote mode. The caller reloads and replies. */
+export async function turnRemoteOff(
+  ctx: Pick<RemoteCommandCtx, "channelId" | "threadTs" | "userId" | "sessionId" | "isManager">,
+  deps: Pick<RemoteCommandDeps, "cleanup"> = defaultDeps,
+): Promise<{ ok: true; lockByRemote: boolean } | { ok: false; message: string }> {
+  const { channelId, threadTs, userId } = ctx;
+  const t = await Remote.findTarget(channelId, threadTs);
+  if (!t) return { ok: false, message: "Remote mode is not on in this thread." };
+  if (t.user_id !== userId && !ctx.isManager) {
+    return { ok: false, message: `Only <@${t.user_id}> or the manager can turn remote mode off.` };
+  }
+  const { lockByRemote } = await endRemoteForThread(channelId, threadTs, { sessionId: ctx.sessionId, cleanup: deps.cleanup });
+  // Only release a lock that is still this target owner's: a stale row never unlocks someone else.
+  if (lockByRemote && t.user_id === (await OneOnOne.find(channelId, threadTs))?.locked_user) await OneOnOne.unlock(channelId, threadTs);
+  forgetRemoteStatus(ctx.sessionId);
+  return { ok: true, lockByRemote };
+}
+
 export async function handleRemoteCommand(hit: RemoteHit, ctx: RemoteCommandCtx, deps: RemoteCommandDeps = defaultDeps): Promise<void> {
   if (!env.remote.enabled()) {
     await ctx.reply(":no_entry: `/remote` is not enabled on this deployment.");
@@ -151,21 +176,13 @@ export async function handleRemoteCommand(hit: RemoteHit, ctx: RemoteCommandCtx,
   }
 
   if (hit.action === "off") {
-    const t = await Remote.findTarget(channelId, threadTs);
-    if (!t) {
-      await ctx.reply("Remote mode is not on in this thread.");
+    const r = await turnRemoteOff(ctx, deps);
+    if (!r.ok) {
+      await ctx.reply(r.message);
       return;
     }
-    if (t.user_id !== userId && !ctx.isManager) {
-      await ctx.reply(`Only <@${t.user_id}> or the manager can turn remote mode off.`);
-      return;
-    }
-    const { lockByRemote } = await endRemoteForThread(channelId, threadTs, { sessionId: ctx.sessionId, cleanup: deps.cleanup });
-    // Only release a lock that is still this target owner's: a stale row never unlocks someone else.
-    if (lockByRemote && t.user_id === (await OneOnOne.find(channelId, threadTs))?.locked_user) await OneOnOne.unlock(channelId, threadTs);
-    forgetRemoteStatus(ctx.sessionId);
     ctx.reload();
-    await ctx.reply(`:house: Remote mode *off* — tools run on the server again.${lockByRemote ? " 1on1 released." : ""}`);
+    await ctx.reply(`:house: Remote mode *off* — tools run on the server again.${r.lockByRemote ? " 1on1 released." : ""}`);
     return;
   }
 
@@ -227,6 +244,9 @@ export async function handleRemoteCommand(hit: RemoteHit, ctx: RemoteCommandCtx,
   }
   await Remote.setTarget({ channelId, threadTs, teamId, userId, addr: hit.addr, dir: pf.dir, lockByRemote });
   forgetRemoteStatus(ctx.sessionId);
+  // The last command wins: remote mode replaces sandbox mode, and the sandbox goes.
+  const sbx = await turnSandboxOff(channelId, threadTs, ctx.sessionId, deps.destroySandbox ?? destroySandbox);
+  if (sbx.wasOn) ctx.note?.(SANDBOX_GONE_NOTE);
   ctx.reload();
   await ctx.reply(`:satellite: Remote mode *on* — my shell and file tools now run on <@${userId}>'s machine in \`${pf.dir}\`. The thread is locked to you. \`/remote off\` to switch back.`);
 }

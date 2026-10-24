@@ -47,7 +47,7 @@ import { makeNodePermissionResolver } from "./shims/permission";
 import { JOB_TOKEN_TTL_SEC } from "../gateway/api/auth";
 import type { RuntimeBundle } from "../gateway/api/tenants";
 import { decodeClaims, makeRemoteFactory, makeRemoteResolver } from "./remote";
-import { lockFromClaims } from "./session-lock";
+import { lockFromClaims, sandboxFromClaims } from "./session-lock";
 import { type NodeManifest, loadNodeManifest, makeNodeLocalMcpResolver } from "./manifest";
 import { ChildEnvPatch } from "../agent/child-env";
 import { VoiceCalls } from "../voice/call";
@@ -636,6 +636,8 @@ export async function startNodeWorker(opts: NodeWorkerOpts = {}): Promise<NodeWo
   // The /1on1 lock (session-mode block, config identity) from the job token's
   // signed claim: a node has no database to read it from.
   agent.setSessionLockResolver(async (sessionId) => lockFromClaims(store, sessionId));
+  // The /sandbox switch, from the same token.
+  agent.setSandboxResolver(async (sessionId) => sandboxFromClaims(store, sessionId));
 
   /**
    * A 401 for this node's own credential (revoked or expired) PAUSES every

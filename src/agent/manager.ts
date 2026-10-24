@@ -37,6 +37,7 @@ import type { ThreadKey } from "../db/sessions";
 import { dbSessionStore, type SessionStore } from "./session-store";
 import * as OneOnOne from "../db/one-on-one";
 import type { OneOnOneLockRow } from "../db/one-on-one";
+import * as Sandbox from "../db/sandbox";
 import { memory } from "../memory";
 import type { MemoryProvider } from "../memory/provider";
 import { ChildEnvPatch, scrubChildEnv, withoutKeys } from "./child-env";
@@ -562,6 +563,21 @@ export class AgentManager extends EventEmitter {
     this.#lockResolver = fn;
   }
 
+  #sandboxResolver: ((sessionId: string) => Promise<boolean | undefined>) | null = null;
+
+  /** Install where a session's sandbox switch comes from, like the lock: a node
+   *  reads the claim the gateway signed into the job token; undefined (an older
+   *  gateway) falls back to the database. Unset = the database (mono, gateway). */
+  setSandboxResolver(fn: ((sessionId: string) => Promise<boolean | undefined>) | null) {
+    this.#sandboxResolver = fn;
+  }
+
+  async #sandboxFor(sessionId: string, channel: string | null, threadTs: string | null): Promise<boolean> {
+    const supplied = this.#sandboxResolver ? await this.#sandboxResolver(sessionId) : undefined;
+    if (supplied !== undefined) return supplied;
+    return !!channel && !!threadTs && !!(await Sandbox.find(channel, threadTs));
+  }
+
   async #lockFor(sessionId: string, channel: string, threadTs: string): Promise<OneOnOneLockRow | null> {
     const supplied = this.#lockResolver ? await this.#lockResolver(sessionId) : undefined;
     if (supplied !== undefined) return supplied;
@@ -889,6 +905,8 @@ export class AgentManager extends EventEmitter {
       sandbox?: boolean;
       /** SLAUDE_LOCAL_EXEC=off and neither a remote nor a sandbox: no shell here. */
       localExecOff?: boolean;
+      /** A sandbox server is configured but this thread is not in it. */
+      sandboxAvailable?: boolean;
       mcpServers?: Record<string, unknown>;
       /** The CLI reads no MCP source but mcpServers (a node): the block is
        *  the whole list. */
@@ -911,7 +929,7 @@ export class AgentManager extends EventEmitter {
     return [
       soulSystemBlock(soul.soulMd),
       channelMandateBlock(ctx.channelId, soul.soulJson, sessionId, personaName),
-      sessionModeBlock(ctx.lock ?? null, ctx.remote, ctx.sandbox, ctx.localExecOff),
+      sessionModeBlock(ctx.lock ?? null, ctx.remote, ctx.sandbox, ctx.localExecOff, ctx.sandboxAvailable),
       mcpServers
         ? `<mcp-servers>\nMCP server namespaces mounted this session. Call tools as \`mcp__<server>__<tool>\`.\n${Object.keys(mcpServers)
             .map((n) => `- ${n}`)
@@ -1106,8 +1124,11 @@ export class AgentManager extends EventEmitter {
     // Remote mode: tools for this session run on the lock owner's machine.
     const remoteTarget = this.#remoteResolver ? await this.#remoteResolver(sessionId) : null;
     // Sandbox mode: the same six tools, served by an HTTP MCP server keyed by
-    // session. A /remote target wins: the user picked their own machine.
-    const sandboxUrl = remoteTarget ? "" : env.sandbox.mcpUrl();
+    // session, for threads switched on with /sandbox or enter_sandbox. A /remote
+    // target wins: the user picked their own machine.
+    const sandboxOn = !remoteTarget && !!env.sandbox.mcpUrl()
+      && (await this.#sandboxFor(sessionId, row.slack_channel_id, row.slack_thread_ts));
+    const sandboxUrl = sandboxOn ? env.sandbox.mcpUrl() : "";
     const model = await this.#sessionModel(sessionId, row.model, personaName);
     // Fail-safe: with local execution off, a thread that has neither a /remote
     // target nor a sandbox gets no shell or file-writing tools at all.
@@ -1120,6 +1141,7 @@ export class AgentManager extends EventEmitter {
       remote: remoteTarget ? { userId: remoteTarget.userId, dir: remoteTarget.dir } : null,
       sandbox: !!sandboxUrl,
       localExecOff,
+      sandboxAvailable: !remoteTarget && !sandboxUrl && !!env.sandbox.mcpUrl(),
       mcpServers: strictNames ? (Object.keys(strictNames).length > 0 ? strictNames : undefined) : mcpServers,
       strictMcp: !!localMcp,
       memBlock,

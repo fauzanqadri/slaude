@@ -5,6 +5,7 @@ import { makeQueueDispatch } from "../../../src/gateway/core/dispatch";
 import { db, type SessionRow } from "../../../src/db/schema";
 import * as OneOnOne from "../../../src/db/one-on-one";
 import * as Remote from "../../../src/db/remote";
+import * as Sandbox from "../../../src/db/sandbox";
 import { sessionConfigFp } from "../../../src/remote/fingerprint";
 
 function harness(lockOwner: string | undefined | Error) {
@@ -112,6 +113,29 @@ describe("dispatch remote claims", () => {
     expect(h.claims().remote).toBeUndefined();
     expect(h.claims().sessionConfigFp).toBe(sessionConfigFp({ runAs: null, lock: null, remote: null }));
     await h.dispatch.close();
+  });
+
+  it("/sandbox on: sandbox claim and a fingerprint that differs from off; ignored when no server is configured", async () => {
+    await Sandbox._wipeForTests();
+    await Sandbox.set({ channelId: "C1", threadTs: "1.1", createdBy: "UTESTA" });
+    try {
+      const off = harness(undefined);
+      await off.dispatch.dispatch(SESSION, "hi", { ...META, userId: "UTESTA" });
+      expect(off.claims().sandbox).toBeUndefined();
+      expect(off.claims().sessionConfigFp).toBe(sessionConfigFp({ runAs: null, lock: null, remote: null }));
+      await off.dispatch.close();
+
+      process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+      const on = harness(undefined);
+      await on.dispatch.dispatch(SESSION, "hi", { ...META, userId: "UTESTA" });
+      expect(on.claims().sandbox).toBe(true);
+      expect(on.claims().sessionConfigFp).toBe(sessionConfigFp({ runAs: null, lock: null, remote: null, sandbox: true }));
+      expect(on.claims().sessionConfigFp).not.toBe(sessionConfigFp({ runAs: null, lock: null, remote: null }));
+      await on.dispatch.close();
+    } finally {
+      delete process.env.SLAUDE_SANDBOX_MCP_URL;
+      await Sandbox._wipeForTests();
+    }
   });
 
   // The fingerprint is what reboots a warm node session when the /1on1 lock

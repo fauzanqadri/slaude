@@ -50,7 +50,7 @@ const OneOnOne = await import("../../src/db/one-on-one");
 const { memory } = await import("../../src/memory");
 const { memory: sqliteMemory } = await import("../../src/memory/sqlite-provider");
 const { NodeDbAccessError } = await import("../../src/db/client");
-const { lockFromClaims } = await import("../../src/node/session-lock");
+const { lockFromClaims, sandboxFromClaims } = await import("../../src/node/session-lock");
 const { sessionConfigFp } = await import("../../src/remote/fingerprint");
 
 // Every variable this file sets, restored afterwards: the suite runs in one process.
@@ -285,5 +285,25 @@ describe("lockFromClaims", () => {
       channel_id: "C1", thread_ts: "1.1", locked_user: "U1", created_by: "", created_at: 0, open_scope: "x",
     });
     expect(lockFromClaims({ tokenFor: () => token({ session: "s", lock: null }) }, "s")).toBeNull();
+  });
+});
+
+describe("sandboxFromClaims", () => {
+  it("true only when the token for this session carries sandbox: true", () => {
+    expect(sandboxFromClaims({ tokenFor: () => token({ session: "s", sandbox: true }) }, "s")).toBe(true);
+    expect(sandboxFromClaims({ tokenFor: () => token({ session: "s" }) }, "s")).toBe(false);
+  });
+
+  it("undefined with no token, or a token minted for another session", () => {
+    expect(sandboxFromClaims({ tokenFor: () => undefined }, "s")).toBeUndefined();
+    expect(sandboxFromClaims({ tokenFor: () => token({ session: "other", sandbox: true }) }, "s")).toBeUndefined();
+  });
+});
+
+describe("sessionConfigFp and the sandbox switch", () => {
+  const base = { runAs: null, lock: null, remote: null } as const;
+  it("off leaves every existing fingerprint unchanged; on changes it", () => {
+    expect(sessionConfigFp({ ...base, sandbox: false })).toBe(sessionConfigFp(base));
+    expect(sessionConfigFp({ ...base, sandbox: true })).not.toBe(sessionConfigFp(base));
   });
 });
