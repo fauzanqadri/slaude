@@ -33,6 +33,8 @@ import { handleRemoteCommand, endRemoteForThread, remoteStatusOn } from "./remot
 import { handleSandboxCommand } from "./sandbox-command";
 import { handleParticipantCommand, handleWorkflowCommand, startWorkflow } from "./workflow-command";
 import { StageGate } from "../slack/stage-gate";
+import { createWorkflowApi } from "../../workflow/api";
+import type { WorkflowThreadRow } from "../../db/workflow";
 import { activeRemoteTarget } from "../../remote/active";
 import { HelperClient } from "../../remote/helper-client";
 import { cleanupCommand } from "../../remote/tools/bash";
@@ -134,6 +136,8 @@ export interface GatewayHandle {
   /** `/brain-import/*` — persona memory migration (own token). Optional so
    *  test doubles needn't implement it. */
   fetchBrainImport?(req: Request): Promise<Response | null>;
+  /** Ticket-workflow callbacks from the factory (/workflow/v1). */
+  fetchWorkflow?(req: Request): Promise<Response | null>;
   /** TEST/SIM SEAM ONLY. The pending-gate source behind /v1/pending. */
   __pendingSource(): PendingSource;
   /** TEST/SIM SEAM ONLY. Live per-session MCP contexts built by the resolver.
@@ -3238,6 +3242,48 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   });
 
   const brainImportApi = createBrainImportApi();
+  // Ticket workflows: a factory callback runs a stage as a turn in the run's session.
+  // The route is registered the way a cron run's is, so replies reach the thread
+  // after a restart or on another replica.
+  const workflowRoute = (session: SessionRow, userId: string) => {
+    if (routes.get(session.id)) return;
+    const personaId = session.persona_id && session.persona_id !== "default" ? session.persona_id : undefined;
+    const app: AppRef = { apiAppId: session.slack_app_id ?? undefined, teamId: session.slack_team_id ?? undefined };
+    const ctx: SlackContext = {
+      client: outClientForPersona(personaId, app),
+      apiAppId: app.apiAppId,
+      resolveBotToken: () => t.botTokenFor?.(app),
+      channel: session.slack_channel_id ?? "",
+      threadTs: session.slack_thread_ts ?? "",
+      inboundTs: String(Date.now() / 1000),
+      userId,
+      teamId: app.teamId,
+      personaId,
+    };
+    ctx.requestApproval = (req) => approvals.request({ channel: ctx.channel, threadTs: ctx.threadTs, sessionId: session.id, app, ...req });
+    ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
+    routes.set(session.id, { ctx, surface: wrapSurface(surfaceForCtx(ctx), session.id), spoke: false });
+  };
+  const workflowApi = createWorkflowApi({
+    injectTurn: async (row: WorkflowThreadRow, prompt: string) => {
+      const session = await Sessions.findById(row.session_id);
+      if (!session) throw new Error(`session ${row.session_id} for run ${row.run_id} not found`);
+      workflowRoute(session, row.starter_user_id);
+      const eventTs = `${Date.now() / 1000}`;
+      const meta = panelDispatchMeta(session, row.starter_user_id, eventTs);
+      const envelope =
+        `<channel source="workflow" channel_id="${row.channel_id}" thread_ts="${row.thread_ts}" ` +
+        `inbound_ts="${eventTs}" user_id="${row.starter_user_id}" run_id="${escapeAttr(row.run_id)}">\n${prompt}\n</channel>\n\n` +
+        `Post your work in the thread with the \`mcp__${SLACK_MCP_NAME}__reply\` tool. Plain assistant text is not delivered.`;
+      if (queueDispatch) await queueDispatch.dispatch(session, envelope, meta);
+      else await agent.sendMessage(session.id, envelope);
+    },
+    post: async (row: WorkflowThreadRow, text: string) => {
+      const session = await Sessions.findById(row.session_id);
+      const app: AppRef = { apiAppId: session?.slack_app_id ?? undefined, teamId: session?.slack_team_id ?? undefined };
+      await botClientFor(app).chat.postMessage({ channel: row.channel_id, thread_ts: row.thread_ts, text });
+    },
+  });
 
   const panelApi = panelInfra
     ? createPanelApi({
@@ -3293,6 +3339,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     fetchPortal: (req: Request) => portalApi.fetch(req),
     fetchDeploy: (req: Request) => deployApi.fetch(req),
     fetchBrainImport: (req: Request) => brainImportApi.fetch(req),
+    fetchWorkflow: (req: Request) => workflowApi(req),
     __pendingSource: () => v1.pendingSource,
     __sessionCtx: (sessionId: string) => sessionCtx.get(sessionId),
     __resolveMcp: (sessionId: string) => mcpResolver(sessionId),
