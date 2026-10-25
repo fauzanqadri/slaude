@@ -620,6 +620,25 @@ export const env = {
       return list.length === 0 || list.includes("*") || (!!userId && list.includes(userId));
     },
   },
+  workflow: {
+    /** `SLAUDE_WORKFLOW=1`: ticket workflows on the factory framework (/workflow,
+     *  /participant, stage approval cards, the /workflow/v1 callbacks). Default off. */
+    enabled: (): boolean => {
+      const raw = opt("SLAUDE_WORKFLOW", "0").toLowerCase();
+      return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+    },
+    /** Base URL of the factory API (an app built on the factory framework). */
+    serviceUrl: () => opt("SLAUDE_WORKFLOW_SERVICE_URL").trim(),
+    /** Bearer slaude sends to the factory API (the app's FACTORY_API_TOKEN). */
+    serviceToken: () => opt("SLAUDE_WORKFLOW_SERVICE_TOKEN").trim(),
+    /** Bearer the factory sends to /workflow/v1 (the app's FACTORY_CALLBACK_TOKEN). Empty = routes 404. */
+    callbackToken: () => opt("SLAUDE_WORKFLOW_CALLBACK_TOKEN").trim(),
+    /** On and pointed at a factory: the feature exists for users. */
+    active: (): boolean => {
+      const raw = opt("SLAUDE_WORKFLOW", "0").toLowerCase();
+      return (raw === "1" || raw === "true" || raw === "yes" || raw === "on") && !!opt("SLAUDE_WORKFLOW_SERVICE_URL").trim();
+    },
+  },
   gitPush: {
     /** Remotes `git_push` may push a factory/* branch to, exactly as given
      *  (comma-separated URLs). Empty = the tool refuses every call. */

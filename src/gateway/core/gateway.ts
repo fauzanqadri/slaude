@@ -31,6 +31,7 @@ import { humanizeToolStatus, redactSecrets } from "./status-text";
 import * as Remote from "../../db/remote";
 import { handleRemoteCommand, endRemoteForThread, remoteStatusOn } from "./remote-command";
 import { handleSandboxCommand } from "./sandbox-command";
+import { handleParticipantCommand, handleWorkflowCommand } from "./workflow-command";
 import { activeRemoteTarget } from "../../remote/active";
 import { HelperClient } from "../../remote/helper-client";
 import { cleanupCommand } from "../../remote/tools/bash";
@@ -1819,6 +1820,17 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           reload: () => { agent.reload(session.id); },
           note: (text) => agent.noteSessionEvent(session.id, text),
         });
+        return;
+      }
+      if (slash.kind === "workflow" || slash.kind === "participant") {
+        const soul = soulData();
+        const wctx = {
+          channelId, threadTs, userId, sessionId: session.id,
+          isManager: userId === soul.manager.userId || userId === soul.backupManager.userId,
+          reply,
+        };
+        if (slash.kind === "workflow") await handleWorkflowCommand(slash, wctx);
+        else await handleParticipantCommand(slash, wctx);
         return;
       }
       if (slash.kind === "sandbox") {

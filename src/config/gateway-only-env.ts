@@ -21,6 +21,9 @@ import { flag, parseBootCheckMode, type NodeBootCheckMode } from "./security-swi
  */
 export const GATEWAY_ONLY_ENV_NAMES: readonly string[] = [
   "SLAUDE_MASTER_KEY",
+  // Ticket workflows: the factory API bearer and the /workflow/v1 callback bearer.
+  "SLAUDE_WORKFLOW_SERVICE_TOKEN",
+  "SLAUDE_WORKFLOW_CALLBACK_TOKEN",
   "SLAUDE_JOB_SECRET",
   "SLAUDE_NODE_KEY",
   "SLAUDE_NODE_KEY_PREVIOUS",

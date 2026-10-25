@@ -82,6 +82,8 @@ const ALLOW: Record<string, string> = {
   SLAUDE_GIT_PUSH_TOKEN_USER: "a Basic-auth user name, not a secret",
   SLAUDE_LOCAL_EXEC: "a policy switch, not a secret; read where the session boots (the node)",
   SLAUDE_SANDBOX: "the sandbox feature switch, not a secret",
+  SLAUDE_WORKFLOW: "the ticket-workflow feature switch, not a secret",
+  SLAUDE_WORKFLOW_SERVICE_URL: "an address, not a secret; used by the gateway's /workflow command and stage cards",
   SLAUDE_SANDBOX_AUTO_USERS: "a Slack user-id allowlist, not a secret; read by the gateway's /sandbox command and enter_sandbox tool",
 };
 
