@@ -31,7 +31,8 @@ import { humanizeToolStatus, redactSecrets } from "./status-text";
 import * as Remote from "../../db/remote";
 import { handleRemoteCommand, endRemoteForThread, remoteStatusOn } from "./remote-command";
 import { handleSandboxCommand } from "./sandbox-command";
-import { handleParticipantCommand, handleWorkflowCommand } from "./workflow-command";
+import { handleParticipantCommand, handleWorkflowCommand, startWorkflow } from "./workflow-command";
+import { StageGate } from "../slack/stage-gate";
 import { activeRemoteTarget } from "../../remote/active";
 import { HelperClient } from "../../remote/helper-client";
 import { cleanupCommand } from "../../remote/tools/bash";
@@ -567,6 +568,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     return botClientFor(route ? appOf(route.ctx) : undefined);
   });
   const permissions = new PermissionGate(t);
+  const stageGate = new StageGate(t);
   const approvals = new ApprovalGate(t, env.slack.approvers(), {
     timeoutSeconds: () => soulData().approvalTimeoutSeconds || 300,
   });
@@ -919,6 +921,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         setOneOnOne: (action, scope) => agentOneOnOne(sessionId, route.ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(route.ctx, active),
         ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(sessionId, route.ctx) } : {}),
+        ...(env.workflow.active() ? workflowTools(sessionId, route.ctx) : {}),
       }),
       [RUNTIME_MCP_NAME]: createRuntimeMcp(route.ctx),
       [CONNECT_MCP_NAME]: createConnectMcp({ connect: (server) => agentConnect(sessionId, route.ctx, server) }),
@@ -1280,6 +1283,24 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     if (!await MentionOnly.find(ctx.channel, threadTs)) return "This thread isn't in mention-only mode — nothing to change.";
     await MentionOnly.clear(ctx.channel, threadTs);
     return "Mention-only off — I'll follow this thread normally again.";
+  }
+
+  // Ticket-workflow tools for one session: the starter is the turn's Slack user, and
+  // the stage card goes into the session's thread (gateway-side, so mono and split agree).
+  function workflowTools(sessionId: string, ctx: SlackContext) {
+    const threadTs = ctx.threadTs ?? ctx.inboundTs ?? "";
+    return {
+      startWorkflow: async (i: { pipeline: string; ticketRef?: string; request: string }) => {
+        const r = await startWorkflow({ channelId: ctx.channel, threadTs, sessionId, starter: ctx.userId ?? "", pipeline: i.pipeline, ticketRef: i.ticketRef, request: i.request });
+        return r.ok
+          ? `Workflow ${i.pipeline}@${r.pipelineVersion} started (run ${r.runId}); <@${ctx.userId}> is the starter. The first stage arrives as the next turn.`
+          : r.message;
+      },
+      requestStageApproval: async (i: { stage: string; summary: string; next?: string; outcome?: string }) => {
+        const r = await stageGate.post({ channel: ctx.channel, threadTs, app: appOf(ctx), sessionId, ...i });
+        return "error" in r ? r.error : `Approval card posted for stage "${i.stage}". Stop here; the workflow sends the next turn after a decision.`;
+      },
+    };
   }
 
   // Agent-facing sandbox switch — the /sandbox on engine, gated on the turn's
@@ -3122,6 +3143,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         setOneOnOne: (action, scope) => agentOneOnOne(claims.session, ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(ctx, active),
         ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(claims.session, ctx) } : {}),
+        ...(env.workflow.active() ? workflowTools(claims.session, ctx) : {}),
       }),
       connect: (claims, ctx, server) => agentConnect(claims.session, ctx, server),
       brainDeps: brainDepsFor,

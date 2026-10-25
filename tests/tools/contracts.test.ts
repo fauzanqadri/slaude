@@ -128,6 +128,8 @@ describe("contract snapshots — MCP servers register exactly what the contracts
       setOneOnOne: async () => "ok",
       setMentionOnly: async () => "ok",
       enterSandbox: async () => "ok",
+      startWorkflow: async () => "ok",
+      requestStageApproval: async () => "ok",
     });
     await assertMatchesContract(real, surfaceContract);
   });
