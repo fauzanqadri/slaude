@@ -24,6 +24,7 @@ const status = { kind: "sandbox", action: "status" } as const;
 
 beforeEach(async () => {
   process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+  process.env.SLAUDE_SANDBOX = "1";
   process.env.SLAUDE_MASTER_KEY = Buffer.alloc(32, 7).toString("base64");
   __resetMasterKeyCache();
   await Sandbox._wipeForTests();
@@ -33,15 +34,24 @@ beforeEach(async () => {
 });
 afterEach(() => {
   delete process.env.SLAUDE_SANDBOX_MCP_URL;
+  delete process.env.SLAUDE_SANDBOX;
   delete process.env.SLAUDE_REMOTE;
   delete process.env.SLAUDE_SANDBOX_AUTO_USERS;
 });
 
 describe("/sandbox", () => {
+  it("SLAUDE_SANDBOX off → refused even with the URL set, nothing stored", async () => {
+    delete process.env.SLAUDE_SANDBOX;
+    await handleSandboxCommand(on, ctx(), deps());
+    expect(replies[0]).toContain("not enabled");
+    expect(await Sandbox.find("C1", "1.0")).toBeNull();
+  });
+
   it("not configured → refused, nothing stored", async () => {
     delete process.env.SLAUDE_SANDBOX_MCP_URL;
+    delete process.env.SLAUDE_SANDBOX;
     await handleSandboxCommand(on, ctx(), deps());
-    expect(replies[0]).toContain("not configured");
+    expect(replies[0]).toContain("not enabled");
     expect(await Sandbox.find("C1", "1.0")).toBeNull();
   });
 

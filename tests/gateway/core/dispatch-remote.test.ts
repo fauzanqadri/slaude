@@ -126,6 +126,8 @@ describe("dispatch remote claims", () => {
       await off.dispatch.close();
 
       process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+
+      process.env.SLAUDE_SANDBOX = "1";
       const on = harness(undefined);
       await on.dispatch.dispatch(SESSION, "hi", { ...META, userId: "UTESTA" });
       expect(on.claims().sandbox).toBe(true);
@@ -134,6 +136,7 @@ describe("dispatch remote claims", () => {
       await on.dispatch.close();
     } finally {
       delete process.env.SLAUDE_SANDBOX_MCP_URL;
+      delete process.env.SLAUDE_SANDBOX;
       await Sandbox._wipeForTests();
     }
   });

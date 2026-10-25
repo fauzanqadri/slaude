@@ -917,7 +917,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         initiator: () => route.ctx.userId,
         setOneOnOne: (action, scope) => agentOneOnOne(sessionId, route.ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(route.ctx, active),
-        ...(env.sandbox.mcpUrl() ? { enterSandbox: () => agentEnterSandbox(sessionId, route.ctx) } : {}),
+        ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(sessionId, route.ctx) } : {}),
       }),
       [RUNTIME_MCP_NAME]: createRuntimeMcp(route.ctx),
       [CONNECT_MCP_NAME]: createConnectMcp({ connect: (server) => agentConnect(sessionId, route.ctx, server) }),
@@ -1288,7 +1288,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   async function agentEnterSandbox(sessionId: string, ctx: SlackContext): Promise<string> {
     const threadTs = ctx.threadTs ?? ctx.inboundTs ?? "";
     const ask = "Ask the user to type `/sandbox on` in this thread.";
-    if (!env.sandbox.mcpUrl()) return "Sandbox mode is not configured on this deployment.";
+    if (!env.sandbox.activeUrl()) return "Sandbox mode is not enabled on this deployment.";
     if (await Sandbox.find(ctx.channel, threadTs)) return "Sandbox mode is already on in this thread.";
     if (await Remote.findTarget(ctx.channel, threadTs)) return `This thread runs on the user's own machine (/remote). ${ask}`;
     if (!env.sandbox.autoAllowed(ctx.userId)) return "This user is not on the sandbox allowlist, so the thread stays here; tell them to ask the manager for access. Do not do the code work on this server.";
@@ -3109,7 +3109,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         initiator: () => ctx.userId,
         setOneOnOne: (action, scope) => agentOneOnOne(claims.session, ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(ctx, active),
-        ...(env.sandbox.mcpUrl() ? { enterSandbox: () => agentEnterSandbox(claims.session, ctx) } : {}),
+        ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(claims.session, ctx) } : {}),
       }),
       connect: (claims, ctx, server) => agentConnect(claims.session, ctx, server),
       brainDeps: brainDepsFor,

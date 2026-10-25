@@ -32,8 +32,8 @@ const defaultDeps: SandboxCommandDeps = { destroy: destroySandbox };
  *  SLAUDE_SANDBOX_AUTO_USERS; status is open. On replaces /remote (the last
  *  command wins); off destroys the sandbox at once. */
 export async function handleSandboxCommand(hit: SandboxHit, ctx: SandboxCommandCtx, deps: SandboxCommandDeps = defaultDeps): Promise<void> {
-  if (!env.sandbox.mcpUrl()) {
-    await ctx.reply(":no_entry: `/sandbox` is not configured on this deployment (SLAUDE_SANDBOX_MCP_URL is empty).");
+  if (!env.sandbox.activeUrl()) {
+    await ctx.reply(":no_entry: `/sandbox` is not enabled on this deployment (SLAUDE_SANDBOX is off or SLAUDE_SANDBOX_MCP_URL is empty).");
     return;
   }
   const { channelId, threadTs, userId } = ctx;

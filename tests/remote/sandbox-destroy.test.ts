@@ -6,6 +6,7 @@ afterEach(() => {
   server?.stop(true);
   server = undefined;
   delete process.env.SLAUDE_SANDBOX_MCP_URL;
+  delete process.env.SLAUDE_SANDBOX;
   delete process.env.SLAUDE_SANDBOX_MCP_TOKEN;
 });
 
@@ -19,6 +20,7 @@ function serve(status: number, seen: Seen[]) {
     },
   });
   process.env.SLAUDE_SANDBOX_MCP_URL = `http://127.0.0.1:${server.port}/mcp`;
+  process.env.SLAUDE_SANDBOX = "1";
   process.env.SLAUDE_SANDBOX_MCP_TOKEN = "tok";
 }
 
@@ -36,6 +38,15 @@ describe("destroySandbox", () => {
     server!.stop(true);
     expect(await destroySandbox("s")).toBe(false);
     delete process.env.SLAUDE_SANDBOX_MCP_URL;
+    delete process.env.SLAUDE_SANDBOX;
     expect(await destroySandbox("s")).toBe(false);
+  });
+
+  it("does not call the server when SLAUDE_SANDBOX is off", async () => {
+    const seen: Seen[] = [];
+    serve(204, seen);
+    delete process.env.SLAUDE_SANDBOX;
+    expect(await destroySandbox("s")).toBe(false);
+    expect(seen).toEqual([]);
   });
 });

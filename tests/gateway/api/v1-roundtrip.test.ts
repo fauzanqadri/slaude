@@ -85,7 +85,7 @@ const FIXTURES: Record<string, Record<string, Fixture>> = {
     typing: { input: { on: true }, expect: "not_mounted" }, // SlackSurface has no "typing" capability
     set_one_on_one: { input: { action: "off" } },
     set_mention_only: { input: { active: false } },
-    enter_sandbox: { input: {}, expect: "not_mounted" }, // mounted only when SLAUDE_SANDBOX_MCP_URL is set
+    enter_sandbox: { input: {}, expect: "not_mounted" }, // mounted only when SLAUDE_SANDBOX=1 and SLAUDE_SANDBOX_MCP_URL is set
     soul_override: { input: { field: "trust", action: "list" } },
   },
   slack: {

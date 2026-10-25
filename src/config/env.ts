@@ -597,6 +597,18 @@ export const env = {
      *  on with `/sandbox on` or `enter_sandbox`. Other threads run locally.
      *  A `/remote` target takes precedence. Empty = the feature is off. */
     mcpUrl: () => opt("SLAUDE_SANDBOX_MCP_URL").trim(),
+    /** `SLAUDE_SANDBOX=1`: the switch for the whole feature, so the connection can be
+     *  turned off without removing the URL (which comes from a secret store). Default off. */
+    enabled: (): boolean => {
+      const raw = opt("SLAUDE_SANDBOX", "0").toLowerCase();
+      return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+    },
+    /** The sandbox MCP URL when the feature is on, else "". Every caller goes through this. */
+    activeUrl: (): string => {
+      const raw = opt("SLAUDE_SANDBOX", "0").toLowerCase();
+      const on = raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+      return on ? opt("SLAUDE_SANDBOX_MCP_URL").trim() : "";
+    },
     /** Bearer token sent to the sandbox MCP server. Empty = no Authorization header. */
     mcpToken: () => opt("SLAUDE_SANDBOX_MCP_TOKEN").trim(),
     /** Slack user ids allowed to switch sandbox mode: `/sandbox on|off`, and the

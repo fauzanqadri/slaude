@@ -1126,9 +1126,9 @@ export class AgentManager extends EventEmitter {
     // Sandbox mode: the same six tools, served by an HTTP MCP server keyed by
     // session, for threads switched on with /sandbox or enter_sandbox. A /remote
     // target wins: the user picked their own machine.
-    const sandboxOn = !remoteTarget && !!env.sandbox.mcpUrl()
+    const sandboxOn = !remoteTarget && !!env.sandbox.activeUrl()
       && (await this.#sandboxFor(sessionId, row.slack_channel_id, row.slack_thread_ts));
-    const sandboxUrl = sandboxOn ? env.sandbox.mcpUrl() : "";
+    const sandboxUrl = sandboxOn ? env.sandbox.activeUrl() : "";
     const model = await this.#sessionModel(sessionId, row.model, personaName);
     // Fail-safe: with local execution off, a thread that has neither a /remote
     // target nor a sandbox gets no shell or file-writing tools at all.
@@ -1141,7 +1141,7 @@ export class AgentManager extends EventEmitter {
       remote: remoteTarget ? { userId: remoteTarget.userId, dir: remoteTarget.dir } : null,
       sandbox: !!sandboxUrl,
       localExecOff,
-      sandboxAvailable: !remoteTarget && !sandboxUrl && !!env.sandbox.mcpUrl(),
+      sandboxAvailable: !remoteTarget && !sandboxUrl && !!env.sandbox.activeUrl(),
       mcpServers: strictNames ? (Object.keys(strictNames).length > 0 ? strictNames : undefined) : mcpServers,
       strictMcp: !!localMcp,
       memBlock,

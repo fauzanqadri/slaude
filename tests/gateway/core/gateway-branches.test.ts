@@ -688,8 +688,9 @@ describe("gateway uncovered branches", () => {
       await Sandbox._wipeForTests();
       try {
         // not configured
-        expect(await g.h.__agentEnterSandbox(session.id)).toContain("not configured");
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("not enabled");
         process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+        process.env.SLAUDE_SANDBOX = "1";
         // an allowlist without this user → refused, and told not to do the work here
         process.env.SLAUDE_SANDBOX_AUTO_USERS = "U0OTHER";
         expect(await g.h.__agentEnterSandbox(session.id)).toContain("not on the sandbox allowlist");
@@ -711,6 +712,7 @@ describe("gateway uncovered branches", () => {
         expect(await g.h.__agentEnterSandbox("no-such-session")).toContain("no active thread");
       } finally {
         delete process.env.SLAUDE_SANDBOX_MCP_URL;
+        delete process.env.SLAUDE_SANDBOX;
         delete process.env.SLAUDE_SANDBOX_AUTO_USERS;
         await Sandbox._wipeForTests();
       }

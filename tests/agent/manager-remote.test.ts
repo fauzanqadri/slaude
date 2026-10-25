@@ -543,9 +543,11 @@ describe("remote handle disposal bound and fail-closed", () => {
 describe("sandbox mode (SLAUDE_SANDBOX_MCP_URL)", () => {
   const withSandbox = async (fn: () => Promise<void>) => {
     process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+    process.env.SLAUDE_SANDBOX = "1";
     process.env.SLAUDE_SANDBOX_MCP_TOKEN = "tok";
     try { await fn(); } finally {
       delete process.env.SLAUDE_SANDBOX_MCP_URL;
+      delete process.env.SLAUDE_SANDBOX;
       delete process.env.SLAUDE_SANDBOX_MCP_TOKEN;
     }
   };
@@ -621,6 +623,26 @@ describe("sandbox mode (SLAUDE_SANDBOX_MCP_URL)", () => {
     expect(fs.options.systemPrompt.append).toContain("<sandbox-mode>");
     await shutdown(mgr, row.id);
   }));
+
+  it("SLAUDE_SANDBOX off with the URL set: no sandbox server and no hint, even with a /sandbox row", async () => {
+    process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+    delete process.env.SLAUDE_SANDBOX;
+    try {
+      const mgr = new AgentManager();
+      mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+      const t = thread();
+      await Sandbox.set({ channelId: t.channel_id, threadTs: t.thread_ts, createdBy: "U_A" });
+      const row = await mgr.ensureSession(t);
+      const fs = plan();
+      await mgr.sendMessage(row.id, "hello");
+      await until(() => fs.options !== null, 3000, "boot");
+      expect(fs.options.mcpServers?.remote).toBeUndefined();
+      expect(fs.options.systemPrompt.append).not.toContain("sandbox-");
+      await shutdown(mgr, row.id);
+    } finally {
+      delete process.env.SLAUDE_SANDBOX_MCP_URL;
+    }
+  });
 
   it("no sandbox server configured: no hint, even with a stale row", async () => {
     const mgr = new AgentManager();

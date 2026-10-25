@@ -8,7 +8,7 @@ const TIMEOUT_MS = 15_000;
  *  is not fatal: the server still stops the sandbox when idle and deletes it after
  *  its keep window. */
 export async function destroySandbox(sessionId: string): Promise<boolean> {
-  const base = env.sandbox.mcpUrl();
+  const base = env.sandbox.activeUrl();
   if (!base) return false;
   const token = env.sandbox.mcpToken();
   try {

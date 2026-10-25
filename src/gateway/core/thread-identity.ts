@@ -35,6 +35,6 @@ export async function threadIdentity(
     runAsUser,
     lock: lockRow ? { user: lockRow.locked_user, openScope: lockRow.open_scope } : null,
     remote: target && target.userId === runAsUser ? { addr: target.addr, dir: target.dir } : undefined,
-    sandbox: env.sandbox.mcpUrl() ? !!(await Sandbox.find(channel, thread)) : false,
+    sandbox: env.sandbox.activeUrl() ? !!(await Sandbox.find(channel, thread)) : false,
   };
 }
