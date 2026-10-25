@@ -50,7 +50,7 @@ const OneOnOne = await import("../../src/db/one-on-one");
 const { memory } = await import("../../src/memory");
 const { memory: sqliteMemory } = await import("../../src/memory/sqlite-provider");
 const { NodeDbAccessError } = await import("../../src/db/client");
-const { lockFromClaims, sandboxFromClaims } = await import("../../src/node/session-lock");
+const { lockFromClaims, sandboxFromClaims, workflowFromClaims } = await import("../../src/node/session-lock");
 const { sessionConfigFp } = await import("../../src/remote/fingerprint");
 
 // Every variable this file sets, restored afterwards: the suite runs in one process.
@@ -307,3 +307,20 @@ describe("sessionConfigFp and the sandbox switch", () => {
     expect(sessionConfigFp({ ...base, sandbox: true })).not.toBe(sessionConfigFp(base));
   });
 });
+
+describe("workflowFromClaims", () => {
+  it("the claim when present, null when absent, undefined with no token for this session", () => {
+    const w = { runId: "run-C-1", pipeline: "ticket", starter: "U1" };
+    expect(workflowFromClaims({ tokenFor: () => token({ session: "s", workflow: w }) }, "s")).toEqual(w);
+    expect(workflowFromClaims({ tokenFor: () => token({ session: "s" }) }, "s")).toBeNull();
+    expect(workflowFromClaims({ tokenFor: () => undefined }, "s")).toBeUndefined();
+    expect(workflowFromClaims({ tokenFor: () => token({ session: "other", workflow: w }) }, "s")).toBeUndefined();
+  });
+
+  it("the fingerprint changes only when a workflow runs", () => {
+    const base = { runAs: null, lock: null, remote: null } as const;
+    expect(sessionConfigFp({ ...base, workflowRunId: undefined })).toBe(sessionConfigFp(base));
+    expect(sessionConfigFp({ ...base, workflowRunId: "run-C-1" })).not.toBe(sessionConfigFp(base));
+  });
+});
+

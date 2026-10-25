@@ -32,6 +32,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 const { AgentManager } = await import("../../src/agent/manager");
 const Sessions = await import("../../src/db/sessions");
 const Sandbox = await import("../../src/db/sandbox");
+const Workflow = await import("../../src/db/workflow");
 
 // ---------------------------------------------------------------------------
 // Fake SDK session
@@ -702,3 +703,40 @@ describe("local execution off (SLAUDE_LOCAL_EXEC=off)", () => {
     await shutdown(mgr, row.id);
   }));
 });
+
+describe("ticket workflow prompt block", () => {
+  const withWorkflow = async (fn: () => Promise<void>) => {
+    process.env.SLAUDE_WORKFLOW = "1";
+    process.env.SLAUDE_WORKFLOW_SERVICE_URL = "https://factory.test";
+    try { await fn(); } finally { delete process.env.SLAUDE_WORKFLOW; delete process.env.SLAUDE_WORKFLOW_SERVICE_URL; }
+  };
+
+  it("a thread with a running workflow gets the <workflow> block naming the run and starter", () => withWorkflow(async () => {
+    const mgr = new AgentManager();
+    const t = thread();
+    await Workflow.start({ channelId: t.channel_id, threadTs: t.thread_ts, sessionId: "S", runId: `run-${t.channel_id}-${t.thread_ts}`, pipeline: "ticket", ticketRef: "PL-7", starter: "U_A" });
+    const row = await mgr.ensureSession(t);
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    const append: string = fs.options.systemPrompt.append;
+    expect(append).toContain("<workflow>");
+    expect(append).toContain("`ticket` for PL-7");
+    expect(append).toContain("started by <@U_A>");
+    expect(append).toContain("request_stage_approval");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("no block with workflows off, or when the resolver says there is none", async () => {
+    const mgr = new AgentManager();
+    const t = thread();
+    await Workflow.start({ channelId: t.channel_id, threadTs: t.thread_ts, sessionId: "S", runId: `run-${t.channel_id}-${t.thread_ts}`, pipeline: "ticket", starter: "U_A" });
+    const row = await mgr.ensureSession(t);
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.systemPrompt.append).not.toContain("<workflow>");
+    await shutdown(mgr, row.id);
+  });
+});
+

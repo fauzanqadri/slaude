@@ -47,7 +47,7 @@ import { makeNodePermissionResolver } from "./shims/permission";
 import { JOB_TOKEN_TTL_SEC } from "../gateway/api/auth";
 import type { RuntimeBundle } from "../gateway/api/tenants";
 import { decodeClaims, makeRemoteFactory, makeRemoteResolver } from "./remote";
-import { lockFromClaims, sandboxFromClaims } from "./session-lock";
+import { lockFromClaims, sandboxFromClaims, workflowFromClaims } from "./session-lock";
 import { type NodeManifest, loadNodeManifest, makeNodeLocalMcpResolver } from "./manifest";
 import { ChildEnvPatch } from "../agent/child-env";
 import { VoiceCalls } from "../voice/call";
@@ -638,6 +638,7 @@ export async function startNodeWorker(opts: NodeWorkerOpts = {}): Promise<NodeWo
   agent.setSessionLockResolver(async (sessionId) => lockFromClaims(store, sessionId));
   // The /sandbox switch, from the same token.
   agent.setSandboxResolver(async (sessionId) => sandboxFromClaims(store, sessionId));
+  agent.setWorkflowResolver(async (sessionId) => workflowFromClaims(store, sessionId));
 
   /**
    * A 401 for this node's own credential (revoked or expired) PAUSES every

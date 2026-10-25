@@ -38,6 +38,8 @@ import { dbSessionStore, type SessionStore } from "./session-store";
 import * as OneOnOne from "../db/one-on-one";
 import type { OneOnOneLockRow } from "../db/one-on-one";
 import * as Sandbox from "../db/sandbox";
+import * as Workflow from "../db/workflow";
+import type { WorkflowInfo } from "./session-mode";
 import { memory } from "../memory";
 import type { MemoryProvider } from "../memory/provider";
 import { ChildEnvPatch, scrubChildEnv, withoutKeys } from "./child-env";
@@ -563,6 +565,22 @@ export class AgentManager extends EventEmitter {
     this.#lockResolver = fn;
   }
 
+  #workflowResolver: ((sessionId: string) => Promise<WorkflowInfo | null | undefined>) | null = null;
+
+  /** Where a session's running ticket workflow comes from: a node reads the job-token
+   *  claim; undefined falls back to the database. Unset = the database (mono, gateway). */
+  setWorkflowResolver(fn: ((sessionId: string) => Promise<WorkflowInfo | null | undefined>) | null) {
+    this.#workflowResolver = fn;
+  }
+
+  async #workflowFor(sessionId: string, channel: string | null, threadTs: string | null): Promise<WorkflowInfo | null> {
+    const supplied = this.#workflowResolver ? await this.#workflowResolver(sessionId) : undefined;
+    if (supplied !== undefined) return supplied;
+    if (!env.workflow.active() || !channel || !threadTs) return null;
+    const row = await Workflow.running(channel, threadTs);
+    return row ? { runId: row.run_id, pipeline: row.pipeline, ticketRef: row.ticket_ref, starter: row.starter_user_id } : null;
+  }
+
   #sandboxResolver: ((sessionId: string) => Promise<boolean | undefined>) | null = null;
 
   /** Install where a session's sandbox switch comes from, like the lock: a node
@@ -907,6 +925,7 @@ export class AgentManager extends EventEmitter {
       localExecOff?: boolean;
       /** A sandbox server is configured but this thread is not in it. */
       sandboxAvailable?: boolean;
+      workflow?: WorkflowInfo | null;
       mcpServers?: Record<string, unknown>;
       /** The CLI reads no MCP source but mcpServers (a node): the block is
        *  the whole list. */
@@ -929,7 +948,7 @@ export class AgentManager extends EventEmitter {
     return [
       soulSystemBlock(soul.soulMd),
       channelMandateBlock(ctx.channelId, soul.soulJson, sessionId, personaName),
-      sessionModeBlock(ctx.lock ?? null, ctx.remote, ctx.sandbox, ctx.localExecOff, ctx.sandboxAvailable),
+      sessionModeBlock(ctx.lock ?? null, ctx.remote, ctx.sandbox, ctx.localExecOff, ctx.sandboxAvailable, ctx.workflow ?? null),
       mcpServers
         ? `<mcp-servers>\nMCP server namespaces mounted this session. Call tools as \`mcp__<server>__<tool>\`.\n${Object.keys(mcpServers)
             .map((n) => `- ${n}`)
@@ -1142,6 +1161,7 @@ export class AgentManager extends EventEmitter {
       sandbox: !!sandboxUrl,
       localExecOff,
       sandboxAvailable: !remoteTarget && !sandboxUrl && !!env.sandbox.activeUrl(),
+      workflow: await this.#workflowFor(sessionId, row.slack_channel_id, row.slack_thread_ts),
       mcpServers: strictNames ? (Object.keys(strictNames).length > 0 ? strictNames : undefined) : mcpServers,
       strictMcp: !!localMcp,
       memBlock,

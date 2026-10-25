@@ -8,6 +8,7 @@
  */
 import * as OneOnOne from "../../db/one-on-one";
 import * as Sandbox from "../../db/sandbox";
+import * as Workflow from "../../db/workflow";
 import { activeRemoteTarget } from "../../remote/active";
 import { env } from "../../config/env";
 
@@ -20,6 +21,8 @@ export interface ThreadIdentity {
   remote: { addr: string; dir: string } | undefined;
   /** /sandbox on for this thread (only when a sandbox server is configured). */
   sandbox: boolean;
+  /** The thread's running ticket workflow, when workflows are on. */
+  workflow?: { runId: string; pipeline: string; ticketRef?: string | null; starter: string };
 }
 
 export async function threadIdentity(
@@ -36,5 +39,12 @@ export async function threadIdentity(
     lock: lockRow ? { user: lockRow.locked_user, openScope: lockRow.open_scope } : null,
     remote: target && target.userId === runAsUser ? { addr: target.addr, dir: target.dir } : undefined,
     sandbox: env.sandbox.activeUrl() ? !!(await Sandbox.find(channel, thread)) : false,
+    ...(await workflowOf(channel, thread)),
   };
+}
+
+async function workflowOf(channel: string, thread: string): Promise<Pick<ThreadIdentity, "workflow">> {
+  if (!env.workflow.active()) return {};
+  const row = await Workflow.running(channel, thread);
+  return row ? { workflow: { runId: row.run_id, pipeline: row.pipeline, ticketRef: row.ticket_ref, starter: row.starter_user_id } } : {};
 }

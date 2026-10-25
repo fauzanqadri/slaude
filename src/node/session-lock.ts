@@ -35,3 +35,12 @@ export function sandboxFromClaims(store: TokenSource, sessionId: string): boolea
   if (!c || c.session !== sessionId) return undefined;
   return c.sandbox === true;
 }
+
+/** The thread's ticket workflow from the same token: null when the claim is absent,
+ *  undefined when there is no token for this session. */
+export function workflowFromClaims(store: TokenSource, sessionId: string): { runId: string; pipeline: string; ticketRef?: string | null; starter: string } | null | undefined {
+  const token = store.tokenFor(sessionId);
+  const c = token ? decodeClaims(token) : null;
+  if (!c || c.session !== sessionId) return undefined;
+  return c.workflow ?? null;
+}
