@@ -43,6 +43,11 @@ export type SlashHit =
   | { kind: "one-on-one"; action: "lock" }
   | { kind: "remote"; action: "on"; addr: string; dir?: string }
   | { kind: "remote"; action: "off" | "status" | "key" }
+  | { kind: "sandbox"; action: "on" | "off" | "status" }
+  | { kind: "workflow"; action: "start"; pipeline: string; ticketRef?: string; request: string }
+  | { kind: "workflow"; action: "status" | "cancel" | "usage" }
+  | { kind: "participant"; action: "add" | "remove"; userIds: string[] }
+  | { kind: "participant"; action: "list" }
   | { kind: "mention-only"; action: "on" | "off" }
   | { kind: "mcp"; action: "status" | "connect" | "disconnect"; server?: string }
   | { kind: "soul"; field: "trust" | "allow" | "dm" | "block"; action: "add" | "remove"; value: string }
@@ -62,6 +67,9 @@ export const AGENT_COMMANDS: SlashSpec[] = [
   { usage: "/abort", summary: "cancel the current turn" },
   { usage: "/1on1 [lock | off]", summary: "start a private 1on1 (locked to you); `lock` re-restricts after open; `off` releases — to open to guests, ask the agent directly" },
   { usage: "/remote [<addr> [dir] | off | key]", summary: "run this thread's shell + file tools on your own machine over tailcat (locks the thread to you); no arg shows status" },
+  { usage: "/workflow start <pipeline> [TICKET-123 | text]", summary: "start a ticket workflow in this thread (you become the starter); `status`, `cancel`" },
+  { usage: "/participant add|remove @user… | list", summary: "who may approve this thread's workflow stages (starter + participants); add/remove: starter or manager" },
+  { usage: "/sandbox [on | off]", summary: "run this thread's shell + file tools in its own sandbox (for code work; allowlisted users); `off` destroys it; no arg shows status" },
   { usage: "/mention-only [off]", summary: "reply only when @-mentioned in this thread; `off` restores normal" },
   { usage: "/mcp [connect|disconnect <server>]", summary: "list/connect/disconnect OAuth HTTP MCP servers — in 1on1: as you; outside 1on1: manager manages the agent's shared identity" },
   { usage: "/ignore @user [dur]", summary: "ignore a user (optional duration, e.g. 1h, 30m)" },
@@ -214,6 +222,32 @@ export function parseSlashCommand(text: string): SlashHit | null {
     if (sub === "key") return { kind: "remote", action: "key" };
     const dir = rest.slice(1).join(" ").trim();
     return dir ? { kind: "remote", action: "on", addr: rest[0], dir } : { kind: "remote", action: "on", addr: rest[0] };
+  }
+  if (cmd === "workflow") {
+    const sub = (rest[0] ?? "").toLowerCase();
+    if (sub === "status" || !rest[0]) return { kind: "workflow", action: "status" };
+    if (sub === "cancel") return { kind: "workflow", action: "cancel" };
+    if (sub !== "start") return { kind: "workflow", action: "usage" };
+    const pipeline = rest[1] ?? "";
+    if (!pipeline) return { kind: "workflow", action: "usage" };
+    const tail = rest.slice(2);
+    const ticketRef = tail[0] && /^[A-Z][A-Z0-9]+-\d+$/.test(tail[0]) ? tail[0] : undefined;
+    const request = (ticketRef ? tail.slice(1) : tail).join(" ").trim();
+    return { kind: "workflow", action: "start", pipeline, ...(ticketRef ? { ticketRef } : {}), request };
+  }
+  if (cmd === "participant" || cmd === "participants") {
+    const sub = (rest[0] ?? "").toLowerCase();
+    if (!rest[0] || sub === "list") return { kind: "participant", action: "list" };
+    if (sub !== "add" && sub !== "remove") return null;
+    const userIds = [...t.matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)].map((m) => m[1]!);
+    if (userIds.length === 0) return null;
+    return { kind: "participant", action: sub, userIds: [...new Set(userIds)] };
+  }
+  if (cmd === "sandbox") {
+    const sub = (rest[0] ?? "").toLowerCase();
+    if (!rest[0] || sub === "status") return { kind: "sandbox", action: "status" };
+    if (sub === "on" || sub === "off") return { kind: "sandbox", action: sub };
+    return null;
   }
   if (cmd === "mention-only") {
     return { kind: "mention-only", action: arg === "off" ? "off" : "on" };

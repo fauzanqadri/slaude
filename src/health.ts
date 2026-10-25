@@ -16,6 +16,10 @@ export type HealthDeps = {
    *  Mounted for mono and gateway, never node (see brainImportHandlerForRole); it
    *  404s every path while SLAUDE_BRAIN_IMPORT_TOKEN is unset. */
   brainImport?: (req: Request) => Promise<Response | null>;
+  /** Optional ticket-workflow callbacks (GatewayHandle.fetchWorkflow). Mounted for
+   *  mono and gateway, never node; 404s every path while workflows are off or
+   *  SLAUDE_WORKFLOW_CALLBACK_TOKEN is unset. */
+  workflow?: (req: Request) => Promise<Response | null>;
   /** Optional operator control-panel handler (GatewayHandle.fetchPanel).
    *  Mounted only when provided — src/server.ts passes it for mono/gateway
    *  roles with SLAUDE_PANEL enabled, and omits it otherwise. Returns null for
@@ -104,6 +108,10 @@ export function healthRoutes(deps: HealthDeps, startedAt = Date.now()) {
     }
     if (deps.brainImport && (url.pathname === "/brain-import" || url.pathname.startsWith("/brain-import/"))) {
       const res = await deps.brainImport(req);
+      if (res) return res;
+    }
+    if (deps.workflow && (url.pathname === "/workflow" || url.pathname.startsWith("/workflow/"))) {
+      const res = await deps.workflow(req);
       if (res) return res;
     }
     if (deps.panel && (url.pathname === "/panel" || url.pathname.startsWith("/panel/"))) {

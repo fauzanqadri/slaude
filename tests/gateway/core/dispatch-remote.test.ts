@@ -5,6 +5,8 @@ import { makeQueueDispatch } from "../../../src/gateway/core/dispatch";
 import { db, type SessionRow } from "../../../src/db/schema";
 import * as OneOnOne from "../../../src/db/one-on-one";
 import * as Remote from "../../../src/db/remote";
+import * as Sandbox from "../../../src/db/sandbox";
+import * as Workflow from "../../../src/db/workflow";
 import { sessionConfigFp } from "../../../src/remote/fingerprint";
 
 function harness(lockOwner: string | undefined | Error) {
@@ -112,6 +114,55 @@ describe("dispatch remote claims", () => {
     expect(h.claims().remote).toBeUndefined();
     expect(h.claims().sessionConfigFp).toBe(sessionConfigFp({ runAs: null, lock: null, remote: null }));
     await h.dispatch.close();
+  });
+
+  it("/sandbox on: sandbox claim and a fingerprint that differs from off; ignored when no server is configured", async () => {
+    await Sandbox._wipeForTests();
+    await Sandbox.set({ channelId: "C1", threadTs: "1.1", createdBy: "UTESTA" });
+    try {
+      const off = harness(undefined);
+      await off.dispatch.dispatch(SESSION, "hi", { ...META, userId: "UTESTA" });
+      expect(off.claims().sandbox).toBeUndefined();
+      expect(off.claims().sessionConfigFp).toBe(sessionConfigFp({ runAs: null, lock: null, remote: null }));
+      await off.dispatch.close();
+
+      process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+
+      process.env.SLAUDE_SANDBOX = "1";
+      const on = harness(undefined);
+      await on.dispatch.dispatch(SESSION, "hi", { ...META, userId: "UTESTA" });
+      expect(on.claims().sandbox).toBe(true);
+      expect(on.claims().sessionConfigFp).toBe(sessionConfigFp({ runAs: null, lock: null, remote: null, sandbox: true }));
+      expect(on.claims().sessionConfigFp).not.toBe(sessionConfigFp({ runAs: null, lock: null, remote: null }));
+      await on.dispatch.close();
+    } finally {
+      delete process.env.SLAUDE_SANDBOX_MCP_URL;
+      delete process.env.SLAUDE_SANDBOX;
+      await Sandbox._wipeForTests();
+    }
+  });
+
+  it("a running workflow rides the token and the fingerprint; none when workflows are off", async () => {
+    await Workflow._wipeForTests();
+    await Workflow.start({ channelId: "C1", threadTs: "1.1", sessionId: "s", runId: "run-C1-1.1", pipeline: "ticket", ticketRef: "PL-1", starter: "UTESTA" });
+    try {
+      const off = harness(undefined);
+      await off.dispatch.dispatch(SESSION, "hi", { ...META, userId: "UTESTA" });
+      expect(off.claims().workflow).toBeUndefined();
+      await off.dispatch.close();
+
+      process.env.SLAUDE_WORKFLOW = "1";
+      process.env.SLAUDE_WORKFLOW_SERVICE_URL = "https://factory.test";
+      const on = harness(undefined);
+      await on.dispatch.dispatch(SESSION, "hi", { ...META, userId: "UTESTA" });
+      expect(on.claims().workflow).toEqual({ runId: "run-C1-1.1", pipeline: "ticket", ticketRef: "PL-1", starter: "UTESTA" });
+      expect(on.claims().sessionConfigFp).toBe(sessionConfigFp({ runAs: null, lock: null, remote: null, workflowRunId: "run-C1-1.1" }));
+      await on.dispatch.close();
+    } finally {
+      delete process.env.SLAUDE_WORKFLOW;
+      delete process.env.SLAUDE_WORKFLOW_SERVICE_URL;
+      await Workflow._wipeForTests();
+    }
   });
 
   // The fingerprint is what reboots a warm node session when the /1on1 lock

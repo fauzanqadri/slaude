@@ -33,6 +33,12 @@ export interface SurfaceMcpOpts {
    *  surface-mcp stays decoupled from the db). When present, the set_mention_only
    *  tool is mounted. */
   setMentionOnly?: (active: boolean) => Promise<string>;
+  /** Switch the current thread to sandbox mode (gateway injects the engine, which
+   *  checks SLAUDE_SANDBOX_AUTO_USERS). When present, enter_sandbox is mounted. */
+  enterSandbox?: () => Promise<string>;
+  /** Ticket workflows (gateway injects the engines; mounted only when SLAUDE_WORKFLOW is active). */
+  startWorkflow?: (i: { pipeline: string; ticketRef?: string; request: string }) => Promise<string>;
+  requestStageApproval?: (i: { stage: string; summary: string; next?: string; outcome?: string }) => Promise<string>;
 }
 
 /** Build the agent-facing interaction tools for a Surface. Core tools are always present;
@@ -132,6 +138,39 @@ export function surfaceTools(surface: Surface, opts: SurfaceMcpOpts = {}): Surfa
       handler: async ({ active }) => {
         try { return ok(await setMentionOnly(active)); }
         catch (e: any) { return fail(`set_mention_only failed: ${e?.message ?? String(e)}`); }
+      },
+    });
+  }
+
+  if (opts.startWorkflow) {
+    const startWorkflow = opts.startWorkflow;
+    defs.push({
+      ...c.start_workflow,
+      handler: async ({ pipeline, ticket_ref, request }) => {
+        try { return ok(await startWorkflow({ pipeline, ticketRef: ticket_ref, request })); }
+        catch (e: any) { return fail(`start_workflow failed: ${e?.message ?? String(e)}`); }
+      },
+    });
+  }
+
+  if (opts.requestStageApproval) {
+    const requestStageApproval = opts.requestStageApproval;
+    defs.push({
+      ...c.request_stage_approval,
+      handler: async ({ stage, summary, next, outcome }) => {
+        try { return ok(await requestStageApproval({ stage, summary, next, outcome })); }
+        catch (e: any) { return fail(`request_stage_approval failed: ${e?.message ?? String(e)}`); }
+      },
+    });
+  }
+
+  if (opts.enterSandbox) {
+    const enterSandbox = opts.enterSandbox;
+    defs.push({
+      ...c.enter_sandbox,
+      handler: async () => {
+        try { return ok(await enterSandbox()); }
+        catch (e: any) { return fail(`enter_sandbox failed: ${e?.message ?? String(e)}`); }
       },
     });
   }

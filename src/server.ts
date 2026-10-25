@@ -151,6 +151,7 @@ async function main() {
         v1: role !== "node" ? (req: Request) => slack.fetchV1(req) : undefined,
         deploy: deployHandlerForRole(role, (req) => slack.fetchDeploy?.(req) ?? Promise.resolve(null)),
         brainImport: brainImportHandlerForRole(role, (req) => slack.fetchBrainImport?.(req) ?? Promise.resolve(null)),
+        workflow: brainImportHandlerForRole(role, (req) => slack.fetchWorkflow?.(req) ?? Promise.resolve(null)),
         panel: panelMounted ? (req: Request) => slack.fetchPanel(req) : undefined,
         portal: role !== "node" ? (req: Request) => slack.fetchPortal(req) : undefined,
       },
@@ -163,6 +164,7 @@ async function main() {
       v1: role !== "node" ? (req) => slack.fetchV1(req) : undefined,
       deploy: deployHandlerForRole(role, (req) => slack.fetchDeploy?.(req) ?? Promise.resolve(null)),
       brainImport: brainImportHandlerForRole(role, (req) => slack.fetchBrainImport?.(req) ?? Promise.resolve(null)),
+      workflow: brainImportHandlerForRole(role, (req) => slack.fetchWorkflow?.(req) ?? Promise.resolve(null)),
       panel: panelMounted ? (req) => slack.fetchPanel(req) : undefined,
       portal: role !== "node" ? (req) => slack.fetchPortal(req) : undefined,
     });

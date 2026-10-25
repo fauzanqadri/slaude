@@ -31,6 +31,8 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 // specifier means coverage is attributed to src/agent/manager.ts.
 const { AgentManager } = await import("../../src/agent/manager");
 const Sessions = await import("../../src/db/sessions");
+const Sandbox = await import("../../src/db/sandbox");
+const Workflow = await import("../../src/db/workflow");
 
 // ---------------------------------------------------------------------------
 // Fake SDK session
@@ -538,3 +540,203 @@ describe("remote handle disposal bound and fail-closed", () => {
     expect(log).toEqual(["release"]);
   });
 });
+
+describe("sandbox mode (SLAUDE_SANDBOX_MCP_URL)", () => {
+  const withSandbox = async (fn: () => Promise<void>) => {
+    process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+    process.env.SLAUDE_SANDBOX = "1";
+    process.env.SLAUDE_SANDBOX_MCP_TOKEN = "tok";
+    try { await fn(); } finally {
+      delete process.env.SLAUDE_SANDBOX_MCP_URL;
+      delete process.env.SLAUDE_SANDBOX;
+      delete process.env.SLAUDE_SANDBOX_MCP_TOKEN;
+    }
+  };
+
+  it("no /remote target: HTTP remote server keyed by session, aliases, guard, sandbox block, gated tools", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    const asked: string[] = [];
+    mgr.setPermissionResolver(async (_sid, toolName, input) => { asked.push(toolName); return { behavior: "allow", updatedInput: input } as any; });
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    mgr.setSandboxResolver(async () => true);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers.remote).toEqual({
+      type: "http",
+      url: "https://sandbox.test/mcp",
+      headers: { "X-Sandbox-Session": row.id, Authorization: "Bearer tok" },
+    });
+    expect(fs.options.toolAliases.Bash).toBe("mcp__remote__bash");
+    expect(fs.options.disallowedTools).toContain("NotebookEdit");
+    expect(fs.options.hooks.PreToolUse).toHaveLength(1);
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-mode>");
+    expect(fs.options.systemPrompt.append).not.toContain("<remote-mode>");
+    const sig = { signal: new AbortController().signal };
+    expect((await fs.options.canUseTool("mcp__remote__read", { file_path: "a" }, sig)).behavior).toBe("allow");
+    await fs.options.canUseTool("mcp__remote__bash", { command: "ls" }, sig);
+    expect(asked).toEqual(["Bash"]);
+    await shutdown(mgr, row.id);
+  }));
+
+  it("a /remote target wins over the sandbox", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setSandboxResolver(async () => true);
+    mgr.setRemote(
+      async () => ({ teamId: "T1", userId: "U_A", addr: "tcA", dir: "/r" }),
+      () => ({ exec: noopExec, release: async () => {}, dispose: async () => {} }),
+    );
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers.remote.type).not.toBe("http");
+    expect(fs.options.systemPrompt.append).toContain("<remote-mode>");
+    expect(fs.options.systemPrompt.append).not.toContain("<sandbox-mode>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("a thread not switched on runs locally, with the sandbox-available hint", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers?.remote).toBeUndefined();
+    expect(fs.options.toolAliases).toBeUndefined();
+    expect(fs.options.systemPrompt.append).not.toContain("<sandbox-mode>");
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-available>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("with no resolver, a /sandbox row in the database switches the thread on", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    const t = thread();
+    await Sandbox.set({ channelId: t.channel_id, threadTs: t.thread_ts, createdBy: "U_A" });
+    const row = await mgr.ensureSession(t);
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers.remote.type).toBe("http");
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-mode>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("SLAUDE_SANDBOX off with the URL set: no sandbox server and no hint, even with a /sandbox row", async () => {
+    process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+    delete process.env.SLAUDE_SANDBOX;
+    try {
+      const mgr = new AgentManager();
+      mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+      const t = thread();
+      await Sandbox.set({ channelId: t.channel_id, threadTs: t.thread_ts, createdBy: "U_A" });
+      const row = await mgr.ensureSession(t);
+      const fs = plan();
+      await mgr.sendMessage(row.id, "hello");
+      await until(() => fs.options !== null, 3000, "boot");
+      expect(fs.options.mcpServers?.remote).toBeUndefined();
+      expect(fs.options.systemPrompt.append).not.toContain("sandbox-");
+      await shutdown(mgr, row.id);
+    } finally {
+      delete process.env.SLAUDE_SANDBOX_MCP_URL;
+    }
+  });
+
+  it("no sandbox server configured: no hint, even with a stale row", async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    mgr.setSandboxResolver(async () => true);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers?.remote).toBeUndefined();
+    expect(fs.options.systemPrompt.append).not.toContain("sandbox-");
+    await shutdown(mgr, row.id);
+  });
+});
+
+describe("local execution off (SLAUDE_LOCAL_EXEC=off)", () => {
+  const withOff = async (fn: () => Promise<void>) => {
+    process.env.SLAUDE_LOCAL_EXEC = "off";
+    try { await fn(); } finally { delete process.env.SLAUDE_LOCAL_EXEC; }
+  };
+
+  it("no /remote target and no sandbox: shell and write tools are removed, hook denies, prompt says so", () => withOff(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.toolAliases).toBeUndefined();
+    expect(fs.options.mcpServers?.remote).toBeUndefined();
+    for (const t of ["Bash", "Write", "Edit", "NotebookEdit", "Monitor"]) expect(fs.options.disallowedTools).toContain(t);
+    for (const t of ["Read", "Glob", "Grep"]) expect(fs.options.disallowedTools).not.toContain(t);
+    expect(fs.options.hooks.PreToolUse).toHaveLength(1);
+    const sig = { signal: new AbortController().signal };
+    const ev = (tool: string) => ({ hook_event_name: "PreToolUse", tool_name: tool }) as any;
+    const [hook] = fs.options.hooks.PreToolUse[0].hooks;
+    expect((await hook(ev("Bash"), undefined, sig)).hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(await hook(ev("Read"), undefined, sig)).toEqual({});
+    expect(fs.options.systemPrompt.append).toContain("<local-exec-off>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("a /remote target lifts it: the remote tools run, nothing local is disallowed beyond remote mode", () => withOff(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(
+      async () => ({ teamId: "T1", userId: "U_A", addr: "tcA", dir: "/r" }),
+      () => ({ exec: noopExec, release: async () => {}, dispose: async () => {} }),
+    );
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.toolAliases.Bash).toBe("mcp__remote__bash");
+    expect(fs.options.disallowedTools).not.toContain("Bash");
+    expect(fs.options.systemPrompt.append).toContain("<remote-mode>");
+    expect(fs.options.systemPrompt.append).not.toContain("<local-exec-off>");
+    await shutdown(mgr, row.id);
+  }));
+});
+
+describe("ticket workflow prompt block", () => {
+  const withWorkflow = async (fn: () => Promise<void>) => {
+    process.env.SLAUDE_WORKFLOW = "1";
+    process.env.SLAUDE_WORKFLOW_SERVICE_URL = "https://factory.test";
+    try { await fn(); } finally { delete process.env.SLAUDE_WORKFLOW; delete process.env.SLAUDE_WORKFLOW_SERVICE_URL; }
+  };
+
+  it("a thread with a running workflow gets the <workflow> block naming the run and starter", () => withWorkflow(async () => {
+    const mgr = new AgentManager();
+    const t = thread();
+    await Workflow.start({ channelId: t.channel_id, threadTs: t.thread_ts, sessionId: "S", runId: `run-${t.channel_id}-${t.thread_ts}`, pipeline: "ticket", ticketRef: "PL-7", starter: "U_A" });
+    const row = await mgr.ensureSession(t);
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    const append: string = fs.options.systemPrompt.append;
+    expect(append).toContain("<workflow>");
+    expect(append).toContain("`ticket` for PL-7");
+    expect(append).toContain("started by <@U_A>");
+    expect(append).toContain("request_stage_approval");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("no block with workflows off, or when the resolver says there is none", async () => {
+    const mgr = new AgentManager();
+    const t = thread();
+    await Workflow.start({ channelId: t.channel_id, threadTs: t.thread_ts, sessionId: "S", runId: `run-${t.channel_id}-${t.thread_ts}`, pipeline: "ticket", starter: "U_A" });
+    const row = await mgr.ensureSession(t);
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.systemPrompt.append).not.toContain("<workflow>");
+    await shutdown(mgr, row.id);
+  });
+});
+
