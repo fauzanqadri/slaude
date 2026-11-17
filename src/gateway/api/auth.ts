@@ -44,6 +44,11 @@ export interface JobClaims {
   remote?: { addr: string; dir: string };
   /** Hash of (lock owner, remote target). A node reboots a warm session when it changes. */
   sessionConfigFp?: string;
+  /** The thread's /sandbox switch at dispatch: true = tools run on the sandbox MCP
+   *  server. Absent = off, or a gateway that predates the claim. */
+  sandbox?: boolean;
+  /** The thread's running ticket workflow at dispatch (prompt context only). */
+  workflow?: { runId: string; pipeline: string; ticketRef?: string | null; starter: string };
   /** Slack app (api_app_id) the turn's event belongs to. With `team` it names
    *  the registered app the /v1 tool plane posts as (D1.2). Optional: tokens
    *  from an older gateway, and turns with no inbound app, resolve it from the

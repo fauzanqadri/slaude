@@ -581,6 +581,73 @@ export const env = {
       const raw = opt("SLAUDE_REMOTE", "0").toLowerCase();
       return raw === "1" || raw === "true" || raw === "yes";
     },
+    /** `SLAUDE_LOCAL_EXEC=off`: a session with no `/remote` target and no sandbox
+     *  gets no local Bash, Write or Edit (nor the other local-only tools) instead
+     *  of running them on this host. Read, Glob and Grep stay, for the knowledge
+     *  base. Fail-safe for deployments whose agent must never execute in its own
+     *  pod. Default on (upstream behaviour). */
+    localExec: () => {
+      const raw = opt("SLAUDE_LOCAL_EXEC", "on").toLowerCase();
+      return !(raw === "off" || raw === "0" || raw === "false" || raw === "no");
+    },
+  },
+  sandbox: {
+    /** Sandbox mode: the streamable-HTTP MCP server (same six tools as `/remote`)
+     *  that a thread's shell and file tools run on once the thread is switched
+     *  on with `/sandbox on` or `enter_sandbox`. Other threads run locally.
+     *  A `/remote` target takes precedence. Empty = the feature is off. */
+    mcpUrl: () => opt("SLAUDE_SANDBOX_MCP_URL").trim(),
+    /** `SLAUDE_SANDBOX=1`: the switch for the whole feature, so the connection can be
+     *  turned off without removing the URL (which comes from a secret store). Default off. */
+    enabled: (): boolean => {
+      const raw = opt("SLAUDE_SANDBOX", "0").toLowerCase();
+      return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+    },
+    /** The sandbox MCP URL when the feature is on, else "". Every caller goes through this. */
+    activeUrl: (): string => {
+      const raw = opt("SLAUDE_SANDBOX", "0").toLowerCase();
+      const on = raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+      return on ? opt("SLAUDE_SANDBOX_MCP_URL").trim() : "";
+    },
+    /** Bearer token sent to the sandbox MCP server. Empty = no Authorization header. */
+    mcpToken: () => opt("SLAUDE_SANDBOX_MCP_TOKEN").trim(),
+    /** Slack user ids allowed to switch sandbox mode: `/sandbox on|off`, and the
+     *  agent's `enter_sandbox` on their turns (comma-separated). Unset, empty or
+     *  `*` = everyone (no allowlist). `/sandbox` status is always open. */
+    autoUsers: () => csv(opt("SLAUDE_SANDBOX_AUTO_USERS")),
+    autoAllowed: (userId: string | undefined): boolean => {
+      const list = csv(opt("SLAUDE_SANDBOX_AUTO_USERS"));
+      return list.length === 0 || list.includes("*") || (!!userId && list.includes(userId));
+    },
+  },
+  workflow: {
+    /** `SLAUDE_WORKFLOW=1`: ticket workflows on the factory framework (/workflow,
+     *  /participant, stage approval cards, the /workflow/v1 callbacks). Default off. */
+    enabled: (): boolean => {
+      const raw = opt("SLAUDE_WORKFLOW", "0").toLowerCase();
+      return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+    },
+    /** Base URL of the factory API (an app built on the factory framework). */
+    serviceUrl: () => opt("SLAUDE_WORKFLOW_SERVICE_URL").trim(),
+    /** Bearer slaude sends to the factory API (the app's FACTORY_API_TOKEN). */
+    serviceToken: () => opt("SLAUDE_WORKFLOW_SERVICE_TOKEN").trim(),
+    /** Bearer the factory sends to /workflow/v1 (the app's FACTORY_CALLBACK_TOKEN). Empty = routes 404. */
+    callbackToken: () => opt("SLAUDE_WORKFLOW_CALLBACK_TOKEN").trim(),
+    /** On and pointed at a factory: the feature exists for users. */
+    active: (): boolean => {
+      const raw = opt("SLAUDE_WORKFLOW", "0").toLowerCase();
+      return (raw === "1" || raw === "true" || raw === "yes" || raw === "on") && !!opt("SLAUDE_WORKFLOW_SERVICE_URL").trim();
+    },
+  },
+  gitPush: {
+    /** Remotes `git_push` may push a factory/* branch to, exactly as given
+     *  (comma-separated URLs). Empty = the tool refuses every call. */
+    remotes: () => csv(opt("SLAUDE_GIT_PUSH_REMOTES")),
+    /** Optional HTTPS token for those remotes, sent as Basic auth by the git
+     *  child slaude runs. SSH remotes use slaude's own SSH setup instead. */
+    token: () => opt("SLAUDE_GIT_PUSH_TOKEN").trim(),
+    /** Basic-auth user paired with the token (GitHub: x-access-token, Bitbucket: x-token-auth). */
+    tokenUser: () => opt("SLAUDE_GIT_PUSH_TOKEN_USER", "x-access-token").trim(),
   },
   /** Static Prometheus labels applied to every metric, e.g.
    *  `SLAUDE_METRICS_LABELS="agent=hermes,env=prod"`. Malformed entries are

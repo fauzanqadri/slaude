@@ -196,6 +196,42 @@ CREATE TABLE IF NOT EXISTS mention_only_threads (
   PRIMARY KEY (channel_id, thread_ts)
 );
 
+CREATE TABLE IF NOT EXISTS sandbox_threads (
+  channel_id TEXT    NOT NULL,
+  thread_ts  TEXT    NOT NULL,
+  created_by TEXT    NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, thread_ts)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_threads (
+  channel_id      TEXT    NOT NULL,
+  thread_ts       TEXT    NOT NULL,
+  session_id      TEXT    NOT NULL,
+  run_id          TEXT    NOT NULL,
+  pipeline        TEXT    NOT NULL,
+  ticket_ref      TEXT,
+  starter_user_id TEXT    NOT NULL,
+  stage           TEXT,
+  attempt         INTEGER NOT NULL DEFAULT 0,
+  status          TEXT    NOT NULL DEFAULT 'running',
+  last_request_id TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, thread_ts)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS workflow_threads_run ON workflow_threads (run_id);
+
+CREATE TABLE IF NOT EXISTS workflow_participants (
+  channel_id TEXT    NOT NULL,
+  thread_ts  TEXT    NOT NULL,
+  user_id    TEXT    NOT NULL,
+  added_by   TEXT    NOT NULL,
+  added_at   INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, thread_ts, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS soul_overrides (
   field      TEXT    NOT NULL CHECK(field IN
               ('trustedChannels','allowedChannels','dmAllowedUsers','blockedUsers')),

@@ -53,6 +53,32 @@ describe("surfaceTools — capability gating", () => {
     expect(r.content[0].text).toBe("on");
   });
 
+  test("start_workflow and request_stage_approval mount only with their opts and pass the inputs", async () => {
+    const names = surfaceTools(fakeSurface([])).map((t) => t.name);
+    expect(names).not.toContain("start_workflow");
+    expect(names).not.toContain("request_stage_approval");
+    const seen: any[] = [];
+    const defs = surfaceTools(fakeSurface([]), {
+      startWorkflow: async (i) => { seen.push(i); return "started"; },
+      requestStageApproval: async (i) => { seen.push(i); return "posted"; },
+    });
+    const start: any = await defs.find((t) => t.name === "start_workflow")!.handler({ pipeline: "ticket", ticket_ref: "PL-1", request: "fix" });
+    const card: any = await defs.find((t) => t.name === "request_stage_approval")!.handler({ stage: "triage", summary: "s", outcome: "code" });
+    expect([start.content[0].text, card.content[0].text]).toEqual(["started", "posted"]);
+    expect(seen).toEqual([{ pipeline: "ticket", ticketRef: "PL-1", request: "fix" }, { stage: "triage", summary: "s", next: undefined, outcome: "code" }]);
+  });
+
+  test("enter_sandbox mounts only when the opt is provided + handler calls the engine", async () => {
+    expect(surfaceTools(fakeSurface([])).map((t) => t.name)).not.toContain("enter_sandbox");
+    let calls = 0;
+    const defs = surfaceTools(fakeSurface([]), { enterSandbox: async () => { calls++; return "on next turn"; } });
+    const def = defs.find((t) => t.name === "enter_sandbox")!;
+    expect(def).toBeDefined();
+    const r: any = await def.handler({});
+    expect(calls).toBe(1);
+    expect(r.content[0].text).toBe("on next turn");
+  });
+
   test("unreact rides on the react capability", () => {
     const reactNames = surfaceTools(fakeSurface(["react"])).map((t) => t.name);
     expect(reactNames).toContain("react");

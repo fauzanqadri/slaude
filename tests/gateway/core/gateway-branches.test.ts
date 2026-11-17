@@ -11,6 +11,7 @@ import * as OneOnOne from "../../../src/db/one-on-one";
 import * as Remote from "../../../src/db/remote";
 import { __resetMasterKeyCache } from "../../../src/db/crypto";
 import * as MentionOnly from "../../../src/db/mention-only";
+import * as Sandbox from "../../../src/db/sandbox";
 import * as SO from "../../../src/db/soul-overrides";
 import { writeSoulFixture, WORLD } from "../../../src/gateway/sim/soul-fixture";
 import { __resetModelCache } from "../../../src/agent/models";
@@ -676,6 +677,45 @@ describe("gateway uncovered branches", () => {
 
       // unknown session → no active thread
       expect(await g.h.__agentOneOnOne("no-such-session", "lock")).toContain("no active thread");
+    });
+
+    it("agent sandbox switch (agentEnterSandbox): allowlist gates it, /remote blocks it, unknown session", async () => {
+      writeSoulFixture(WORLD);
+      const g = makeGw();
+      const ts = nextTs();
+      await g.emit("message", dmArgs(g, "hi", { ts }));
+      const session = await g.agent.ensureSession({ team_id: "T", channel_id: "D_MGR", thread_ts: ts });
+      await Sandbox._wipeForTests();
+      try {
+        // not configured
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("not enabled");
+        process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+        process.env.SLAUDE_SANDBOX = "1";
+        // an allowlist without this user → refused, and told not to do the work here
+        process.env.SLAUDE_SANDBOX_AUTO_USERS = "U0OTHER";
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("not on the sandbox allowlist");
+        expect(await Sandbox.find("D_MGR", ts)).toBeNull();
+        // a /remote target → refused even when allowed
+        process.env.SLAUDE_SANDBOX_AUTO_USERS = "*";
+        await Remote.setTarget({ channelId: "D_MGR", threadTs: ts, teamId: "T", userId: WORLD.manager, addr: "tcA", dir: "/r", lockByRemote: false });
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("/remote");
+        await Remote.clearTarget("D_MGR", ts);
+        // the turn's user listed → on, recorded as that user
+        process.env.SLAUDE_SANDBOX_AUTO_USERS = `U0OTHER, ${WORLD.manager}`;
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("next turn");
+        expect((await Sandbox.find("D_MGR", ts))?.created_by).toBe(WORLD.manager);
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("already on");
+        // no allowlist at all → everyone
+        await Sandbox._wipeForTests();
+        delete process.env.SLAUDE_SANDBOX_AUTO_USERS;
+        expect(await g.h.__agentEnterSandbox(session.id)).toContain("next turn");
+        expect(await g.h.__agentEnterSandbox("no-such-session")).toContain("no active thread");
+      } finally {
+        delete process.env.SLAUDE_SANDBOX_MCP_URL;
+        delete process.env.SLAUDE_SANDBOX;
+        delete process.env.SLAUDE_SANDBOX_AUTO_USERS;
+        await Sandbox._wipeForTests();
+      }
     });
 
     describe("remote mode invariants", () => {

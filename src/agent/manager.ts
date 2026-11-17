@@ -37,6 +37,9 @@ import type { ThreadKey } from "../db/sessions";
 import { dbSessionStore, type SessionStore } from "./session-store";
 import * as OneOnOne from "../db/one-on-one";
 import type { OneOnOneLockRow } from "../db/one-on-one";
+import * as Sandbox from "../db/sandbox";
+import * as Workflow from "../db/workflow";
+import type { WorkflowInfo } from "./session-mode";
 import { memory } from "../memory";
 import type { MemoryProvider } from "../memory/provider";
 import { ChildEnvPatch, scrubChildEnv, withoutKeys } from "./child-env";
@@ -46,7 +49,7 @@ import { sessionModeBlock } from "./session-mode";
 import { formatSessionNotes } from "./session-notes";
 import { BootFailure, type FailureCode } from "../gateway/core/failure-codes";
 import { redactSecrets } from "../gateway/core/status-text";
-import { REMOTE_DENIED_LOCAL_TOOLS, REMOTE_MCP_NAME, REMOTE_TOOL_ALIASES, createRemoteMcp, denyLocalBuiltins, makeRemoteCanUseTool } from "../remote/mcp";
+import { LOCAL_EXEC_TOOLS, REMOTE_DENIED_LOCAL_TOOLS, REMOTE_MCP_NAME, REMOTE_TOOL_ALIASES, createRemoteMcp, denyLocalBuiltins, denyLocalExec, gitPushGuard, makeRemoteCanUseTool, sandboxMcpServer } from "../remote/mcp";
 import { voiceCallActive } from "../voice/turn-flags";
 import { RemoteError, type RemoteHandle, type RemoteTarget } from "../remote/types";
 
@@ -562,6 +565,37 @@ export class AgentManager extends EventEmitter {
     this.#lockResolver = fn;
   }
 
+  #workflowResolver: ((sessionId: string) => Promise<WorkflowInfo | null | undefined>) | null = null;
+
+  /** Where a session's running ticket workflow comes from: a node reads the job-token
+   *  claim; undefined falls back to the database. Unset = the database (mono, gateway). */
+  setWorkflowResolver(fn: ((sessionId: string) => Promise<WorkflowInfo | null | undefined>) | null) {
+    this.#workflowResolver = fn;
+  }
+
+  async #workflowFor(sessionId: string, channel: string | null, threadTs: string | null): Promise<WorkflowInfo | null> {
+    const supplied = this.#workflowResolver ? await this.#workflowResolver(sessionId) : undefined;
+    if (supplied !== undefined) return supplied;
+    if (!env.workflow.active() || !channel || !threadTs) return null;
+    const row = await Workflow.running(channel, threadTs);
+    return row ? { runId: row.run_id, pipeline: row.pipeline, ticketRef: row.ticket_ref, starter: row.starter_user_id } : null;
+  }
+
+  #sandboxResolver: ((sessionId: string) => Promise<boolean | undefined>) | null = null;
+
+  /** Install where a session's sandbox switch comes from, like the lock: a node
+   *  reads the claim the gateway signed into the job token; undefined (an older
+   *  gateway) falls back to the database. Unset = the database (mono, gateway). */
+  setSandboxResolver(fn: ((sessionId: string) => Promise<boolean | undefined>) | null) {
+    this.#sandboxResolver = fn;
+  }
+
+  async #sandboxFor(sessionId: string, channel: string | null, threadTs: string | null): Promise<boolean> {
+    const supplied = this.#sandboxResolver ? await this.#sandboxResolver(sessionId) : undefined;
+    if (supplied !== undefined) return supplied;
+    return !!channel && !!threadTs && !!(await Sandbox.find(channel, threadTs));
+  }
+
   async #lockFor(sessionId: string, channel: string, threadTs: string): Promise<OneOnOneLockRow | null> {
     const supplied = this.#lockResolver ? await this.#lockResolver(sessionId) : undefined;
     if (supplied !== undefined) return supplied;
@@ -886,6 +920,12 @@ export class AgentManager extends EventEmitter {
       channelId?: string | null;
       lock?: OneOnOneLockRow | null;
       remote?: { userId: string; dir: string } | null;
+      sandbox?: boolean;
+      /** SLAUDE_LOCAL_EXEC=off and neither a remote nor a sandbox: no shell here. */
+      localExecOff?: boolean;
+      /** A sandbox server is configured but this thread is not in it. */
+      sandboxAvailable?: boolean;
+      workflow?: WorkflowInfo | null;
       mcpServers?: Record<string, unknown>;
       /** The CLI reads no MCP source but mcpServers (a node): the block is
        *  the whole list. */
@@ -908,7 +948,7 @@ export class AgentManager extends EventEmitter {
     return [
       soulSystemBlock(soul.soulMd),
       channelMandateBlock(ctx.channelId, soul.soulJson, sessionId, personaName),
-      sessionModeBlock(ctx.lock ?? null, ctx.remote),
+      sessionModeBlock(ctx.lock ?? null, ctx.remote, ctx.sandbox, ctx.localExecOff, ctx.sandboxAvailable, ctx.workflow ?? null),
       mcpServers
         ? `<mcp-servers>\nMCP server namespaces mounted this session. Call tools as \`mcp__<server>__<tool>\`.\n${Object.keys(mcpServers)
             .map((n) => `- ${n}`)
@@ -1102,13 +1142,26 @@ export class AgentManager extends EventEmitter {
     const baseMcpServers = localMcp ? mergeLocalMcp(sessionId, localMcp, mcpServers) : mcpServers;
     // Remote mode: tools for this session run on the lock owner's machine.
     const remoteTarget = this.#remoteResolver ? await this.#remoteResolver(sessionId) : null;
+    // Sandbox mode: the same six tools, served by an HTTP MCP server keyed by
+    // session, for threads switched on with /sandbox or enter_sandbox. A /remote
+    // target wins: the user picked their own machine.
+    const sandboxOn = !remoteTarget && !!env.sandbox.activeUrl()
+      && (await this.#sandboxFor(sessionId, row.slack_channel_id, row.slack_thread_ts));
+    const sandboxUrl = sandboxOn ? env.sandbox.activeUrl() : "";
     const model = await this.#sessionModel(sessionId, row.model, personaName);
+    // Fail-safe: with local execution off, a thread that has neither a /remote
+    // target nor a sandbox gets no shell or file-writing tools at all.
+    const localExecOff = !remoteTarget && !sandboxUrl && !env.remote.localExec();
     // Strict (node): the prompt lists exactly what the CLI will mount.
-    const strictNames = localMcp ? { ...baseMcpServers, ...(remoteTarget ? { [REMOTE_MCP_NAME]: true } : {}) } : null;
+    const strictNames = localMcp ? { ...baseMcpServers, ...(remoteTarget || sandboxUrl ? { [REMOTE_MCP_NAME]: true } : {}) } : null;
     const systemAppend = await this.#buildSystemAppend(sessionId, personaName, {
       channelId: row.slack_channel_id,
       lock,
       remote: remoteTarget ? { userId: remoteTarget.userId, dir: remoteTarget.dir } : null,
+      sandbox: !!sandboxUrl,
+      localExecOff,
+      sandboxAvailable: !remoteTarget && !sandboxUrl && !!env.sandbox.activeUrl(),
+      workflow: await this.#workflowFor(sessionId, row.slack_channel_id, row.slack_thread_ts),
       mcpServers: strictNames ? (Object.keys(strictNames).length > 0 ? strictNames : undefined) : mcpServers,
       strictMcp: !!localMcp,
       memBlock,
@@ -1181,10 +1234,12 @@ export class AgentManager extends EventEmitter {
     const baseCanUse: CanUseTool | undefined = resolver
       ? (toolName, input, ctx) => resolver(sessionId, toolName, input, ctx)
       : undefined;
-    const canUseTool: CanUseTool | undefined = remoteHandle
+    // Built-ins rerouted to mcp__remote__*: by a /remote handle or the sandbox server.
+    const aliased = !!remoteHandle || !!sandboxUrl;
+    const canUseTool: CanUseTool | undefined = aliased
       ? makeRemoteCanUseTool(baseCanUse, () => this.#live.get(sessionId)?.mode ?? mode)
       : baseCanUse;
-    if (remoteHandle && localMcp && Object.hasOwn(localMcp, REMOTE_MCP_NAME)) {
+    if (aliased && localMcp && Object.hasOwn(localMcp, REMOTE_MCP_NAME)) {
       console.warn(
         `[node] session=${sessionId} MCP server '${REMOTE_MCP_NAME}' is in the node manifest; this session runs remotely, so the remote tools replace it`,
       );
@@ -1197,6 +1252,7 @@ export class AgentManager extends EventEmitter {
         ...(remoteHandle && remoteTarget
           ? { [REMOTE_MCP_NAME]: createRemoteMcp({ exec: remoteHandle.exec, root: remoteTarget.dir, sessionKey: sessionId }) }
           : {}),
+        ...(sandboxUrl ? { [REMOTE_MCP_NAME]: sandboxMcpServer(sandboxUrl, sessionId) } : {}),
       };
       const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
       options = {
@@ -1214,7 +1270,8 @@ export class AgentManager extends EventEmitter {
         plugins: allPlugins,
         // The aliased built-ins stay enabled (an alias needs its source tool, spike §8);
         // local-only tools with no remote counterpart are removed outright.
-        ...(remoteHandle ? { toolAliases: REMOTE_TOOL_ALIASES, disallowedTools: [...REMOTE_DENIED_LOCAL_TOOLS] } : {}),
+        ...(aliased ? { toolAliases: REMOTE_TOOL_ALIASES, disallowedTools: [...REMOTE_DENIED_LOCAL_TOOLS] } : {}),
+        ...(localExecOff ? { disallowedTools: [...LOCAL_EXEC_TOOLS] } : {}),
         permissionMode: mode,
         ...(mode === "bypassPermissions"
           ? { allowDangerouslySkipPermissions: true }
@@ -1223,7 +1280,8 @@ export class AgentManager extends EventEmitter {
           PreCompact: [{ hooks: [preCompact] }],
           Stop: [{ hooks: [stopHook] }],
           UserPromptSubmit: [{ hooks: [userPromptHook] }],
-          ...(remoteHandle ? { PreToolUse: [{ hooks: [denyLocalBuiltins] }] } : {}),
+          ...(aliased ? { PreToolUse: [{ hooks: [denyLocalBuiltins, gitPushGuard(() => this.#live.get(sessionId)?.mode ?? mode)] }] } : {}),
+          ...(localExecOff ? { PreToolUse: [{ hooks: [denyLocalExec] }] } : {}),
         },
         systemPrompt: {
           type: "preset",

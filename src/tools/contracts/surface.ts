@@ -87,6 +87,33 @@ export const surfaceContract = {
         scope: z.string().optional().describe('Guest constraint description for action="open". Free text — you interpret and enforce it for non-initiator users.'),
       },
     },
+    enter_sandbox: {
+      name: "enter_sandbox",
+      description:
+        "Move THIS thread into its own sandbox before changing code: clone, build, test, commit. From the next turn your shell and file tools run in the sandbox (repos under /workspace, no credentials; publish with git_push). Only allowed when the user who started this turn is on the deployment's sandbox allowlist (the same users who may type `/sandbox on`); otherwise the result says so. Returns a short status to relay.",
+      schema: {},
+    },
+    start_workflow: {
+      name: "start_workflow",
+      description:
+        "Start a ticket workflow in THIS thread when the user asks you to work a ticket or request through the lifecycle (intake, triage, planning, building, review). The user who sent this turn becomes the starter; only the starter and participants they add (/participant add) may approve stages. Returns the run id or why it could not start.",
+      schema: {
+        pipeline: z.string().describe('Pipeline name registered in the factory app, e.g. "ticket", "support", "request".'),
+        ticket_ref: z.string().optional().describe("Ticket key such as PL-1234, when there is one."),
+        request: z.string().describe("One or two sentences: what the user asked for."),
+      },
+    },
+    request_stage_approval: {
+      name: "request_stage_approval",
+      description:
+        "End the current workflow stage: post an Approve / Reject card for the starter and participants, then stop and wait. Never start the next stage yourself; the workflow sends the next turn after an approval. Returns at once.",
+      schema: {
+        stage: z.string().describe("The stage you just finished (the workflow turn named it)."),
+        summary: z.string().describe("What you did and what you propose, in a few lines."),
+        next: z.string().optional().describe("What happens after approval, in a few words."),
+        outcome: z.string().optional().describe('Triage only: "code", "data_fix", "answer" or "not_ours".'),
+      },
+    },
     set_mention_only: {
       name: "set_mention_only",
       description:

@@ -85,6 +85,9 @@ const FIXTURES: Record<string, Record<string, Fixture>> = {
     typing: { input: { on: true }, expect: "not_mounted" }, // SlackSurface has no "typing" capability
     set_one_on_one: { input: { action: "off" } },
     set_mention_only: { input: { active: false } },
+    start_workflow: { input: { pipeline: "ticket", request: "x" }, expect: "not_mounted" }, // mounted only when SLAUDE_WORKFLOW is active
+    request_stage_approval: { input: { stage: "intake", summary: "x" }, expect: "not_mounted" },
+    enter_sandbox: { input: {}, expect: "not_mounted" }, // mounted only when SLAUDE_SANDBOX=1 and SLAUDE_SANDBOX_MCP_URL is set
     soul_override: { input: { field: "trust", action: "list" } },
   },
   slack: {

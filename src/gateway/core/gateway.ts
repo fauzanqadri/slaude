@@ -30,6 +30,11 @@ import { createSurfaceMcp, SURFACE_MCP_NAME } from "./surface-mcp";
 import { humanizeToolStatus, redactSecrets } from "./status-text";
 import * as Remote from "../../db/remote";
 import { handleRemoteCommand, endRemoteForThread, remoteStatusOn } from "./remote-command";
+import { handleSandboxCommand } from "./sandbox-command";
+import { handleParticipantCommand, handleWorkflowCommand, startWorkflow } from "./workflow-command";
+import { StageGate } from "../slack/stage-gate";
+import { createWorkflowApi } from "../../workflow/api";
+import type { WorkflowThreadRow } from "../../db/workflow";
 import { activeRemoteTarget } from "../../remote/active";
 import { HelperClient } from "../../remote/helper-client";
 import { cleanupCommand } from "../../remote/tools/bash";
@@ -103,6 +108,7 @@ import * as Ignores from "../../db/ignores";
 import * as CronJobs from "../../db/cron-jobs";
 import * as OneOnOne from "../../db/one-on-one";
 import * as MentionOnly from "../../db/mention-only";
+import * as Sandbox from "../../db/sandbox";
 import { CronScheduler } from "../slack/cron-scheduler";
 import { startCronLeader } from "./cron-leader";
 import type { LeaderHandle } from "../../queue/locks";
@@ -130,6 +136,8 @@ export interface GatewayHandle {
   /** `/brain-import/*` — persona memory migration (own token). Optional so
    *  test doubles needn't implement it. */
   fetchBrainImport?(req: Request): Promise<Response | null>;
+  /** Ticket-workflow callbacks from the factory (/workflow/v1). */
+  fetchWorkflow?(req: Request): Promise<Response | null>;
   /** TEST/SIM SEAM ONLY. The pending-gate source behind /v1/pending. */
   __pendingSource(): PendingSource;
   /** TEST/SIM SEAM ONLY. Live per-session MCP contexts built by the resolver.
@@ -151,6 +159,9 @@ export interface GatewayHandle {
   /** TEST/SIM SEAM ONLY. Drive the agent-facing mention-only toggle
    *  (mcp__slaude_surface__set_mention_only) for a live session. */
   __agentMentionOnly(sessionId: string, active: boolean): Promise<string>;
+  /** TEST/SIM SEAM ONLY. Drive the agent-facing sandbox switch
+   *  (mcp__slaude_surface__enter_sandbox) for a live session. */
+  __agentEnterSandbox(sessionId: string): Promise<string>;
 }
 
 const REACT_RECEIVED = "eyes";
@@ -561,6 +572,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     return botClientFor(route ? appOf(route.ctx) : undefined);
   });
   const permissions = new PermissionGate(t);
+  const stageGate = new StageGate(t);
   const approvals = new ApprovalGate(t, env.slack.approvers(), {
     timeoutSeconds: () => soulData().approvalTimeoutSeconds || 300,
   });
@@ -912,6 +924,8 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         initiator: () => route.ctx.userId,
         setOneOnOne: (action, scope) => agentOneOnOne(sessionId, route.ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(route.ctx, active),
+        ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(sessionId, route.ctx) } : {}),
+        ...(env.workflow.active() ? workflowTools(sessionId, route.ctx) : {}),
       }),
       [RUNTIME_MCP_NAME]: createRuntimeMcp(route.ctx),
       [CONNECT_MCP_NAME]: createConnectMcp({ connect: (server) => agentConnect(sessionId, route.ctx, server) }),
@@ -1273,6 +1287,40 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     if (!await MentionOnly.find(ctx.channel, threadTs)) return "This thread isn't in mention-only mode — nothing to change.";
     await MentionOnly.clear(ctx.channel, threadTs);
     return "Mention-only off — I'll follow this thread normally again.";
+  }
+
+  // Ticket-workflow tools for one session: the starter is the turn's Slack user, and
+  // the stage card goes into the session's thread (gateway-side, so mono and split agree).
+  function workflowTools(sessionId: string, ctx: SlackContext) {
+    const threadTs = ctx.threadTs ?? ctx.inboundTs ?? "";
+    return {
+      startWorkflow: async (i: { pipeline: string; ticketRef?: string; request: string }) => {
+        const r = await startWorkflow({ channelId: ctx.channel, threadTs, sessionId, starter: ctx.userId ?? "", pipeline: i.pipeline, ticketRef: i.ticketRef, request: i.request });
+        return r.ok
+          ? `Workflow ${i.pipeline}@${r.pipelineVersion} started (run ${r.runId}); <@${ctx.userId}> is the starter. The first stage arrives as the next turn.`
+          : r.message;
+      },
+      requestStageApproval: async (i: { stage: string; summary: string; next?: string; outcome?: string }) => {
+        const r = await stageGate.post({ channel: ctx.channel, threadTs, app: appOf(ctx), sessionId, ...i });
+        return "error" in r ? r.error : `Approval card posted for stage "${i.stage}". Stop here; the workflow sends the next turn after a decision.`;
+      },
+    };
+  }
+
+  // Agent-facing sandbox switch — the /sandbox on engine, gated on the turn's
+  // Slack user being in SLAUDE_SANDBOX_AUTO_USERS. It never replaces /remote:
+  // taking a thread off someone's machine is the human's call. Takes effect on
+  // the next turn (reloadAfterTurn here; the fingerprint on a split deploy).
+  async function agentEnterSandbox(sessionId: string, ctx: SlackContext): Promise<string> {
+    const threadTs = ctx.threadTs ?? ctx.inboundTs ?? "";
+    const ask = "Ask the user to type `/sandbox on` in this thread.";
+    if (!env.sandbox.activeUrl()) return "Sandbox mode is not enabled on this deployment.";
+    if (await Sandbox.find(ctx.channel, threadTs)) return "Sandbox mode is already on in this thread.";
+    if (await Remote.findTarget(ctx.channel, threadTs)) return `This thread runs on the user's own machine (/remote). ${ask}`;
+    if (!env.sandbox.autoAllowed(ctx.userId)) return "This user is not on the sandbox allowlist, so the thread stays here; tell them to ask the manager for access. Do not do the code work on this server.";
+    await Sandbox.set({ channelId: ctx.channel, threadTs, createdBy: ctx.userId ?? "" });
+    agent.reloadAfterTurn(sessionId);
+    return "Sandbox mode on from the next turn: finish this reply, tell the user their next message continues in the sandbox, and do no code work here.";
   }
 
   t.action(/^slaude_mcp:connect:.+$/, async ({ ack, action, body }) => {
@@ -1795,6 +1843,30 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             await reply(":warning: `/remote` setup needs a surface that supports private replies.");
           },
           reload: () => { agent.reload(session.id); },
+          note: (text) => agent.noteSessionEvent(session.id, text),
+        });
+        return;
+      }
+      if (slash.kind === "workflow" || slash.kind === "participant") {
+        const soul = soulData();
+        const wctx = {
+          channelId, threadTs, userId, sessionId: session.id,
+          isManager: userId === soul.manager.userId || userId === soul.backupManager.userId,
+          reply,
+        };
+        if (slash.kind === "workflow") await handleWorkflowCommand(slash, wctx);
+        else await handleParticipantCommand(slash, wctx);
+        return;
+      }
+      if (slash.kind === "sandbox") {
+        const soul = soulData();
+        await handleSandboxCommand(slash, {
+          channelId, threadTs, userId, sessionId: session.id,
+          isManager: userId === soul.manager.userId || userId === soul.backupManager.userId,
+          reply,
+          reloadAfterTurn: () => { agent.reloadAfterTurn(session.id); },
+          // ponytail: in-memory on this process; on a split deploy the node never sees it.
+          note: (text) => agent.noteSessionEvent(session.id, text),
         });
         return;
       }
@@ -3074,6 +3146,8 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         initiator: () => ctx.userId,
         setOneOnOne: (action, scope) => agentOneOnOne(claims.session, ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(ctx, active),
+        ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(claims.session, ctx) } : {}),
+        ...(env.workflow.active() ? workflowTools(claims.session, ctx) : {}),
       }),
       connect: (claims, ctx, server) => agentConnect(claims.session, ctx, server),
       brainDeps: brainDepsFor,
@@ -3168,6 +3242,48 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   });
 
   const brainImportApi = createBrainImportApi();
+  // Ticket workflows: a factory callback runs a stage as a turn in the run's session.
+  // The route is registered the way a cron run's is, so replies reach the thread
+  // after a restart or on another replica.
+  const workflowRoute = (session: SessionRow, userId: string) => {
+    if (routes.get(session.id)) return;
+    const personaId = session.persona_id && session.persona_id !== "default" ? session.persona_id : undefined;
+    const app: AppRef = { apiAppId: session.slack_app_id ?? undefined, teamId: session.slack_team_id ?? undefined };
+    const ctx: SlackContext = {
+      client: outClientForPersona(personaId, app),
+      apiAppId: app.apiAppId,
+      resolveBotToken: () => t.botTokenFor?.(app),
+      channel: session.slack_channel_id ?? "",
+      threadTs: session.slack_thread_ts ?? "",
+      inboundTs: String(Date.now() / 1000),
+      userId,
+      teamId: app.teamId,
+      personaId,
+    };
+    ctx.requestApproval = (req) => approvals.request({ channel: ctx.channel, threadTs: ctx.threadTs, sessionId: session.id, app, ...req });
+    ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
+    routes.set(session.id, { ctx, surface: wrapSurface(surfaceForCtx(ctx), session.id), spoke: false });
+  };
+  const workflowApi = createWorkflowApi({
+    injectTurn: async (row: WorkflowThreadRow, prompt: string) => {
+      const session = await Sessions.findById(row.session_id);
+      if (!session) throw new Error(`session ${row.session_id} for run ${row.run_id} not found`);
+      workflowRoute(session, row.starter_user_id);
+      const eventTs = `${Date.now() / 1000}`;
+      const meta = panelDispatchMeta(session, row.starter_user_id, eventTs);
+      const envelope =
+        `<channel source="workflow" channel_id="${row.channel_id}" thread_ts="${row.thread_ts}" ` +
+        `inbound_ts="${eventTs}" user_id="${row.starter_user_id}" run_id="${escapeAttr(row.run_id)}">\n${prompt}\n</channel>\n\n` +
+        `Post your work in the thread with the \`mcp__${SLACK_MCP_NAME}__reply\` tool. Plain assistant text is not delivered.`;
+      if (queueDispatch) await queueDispatch.dispatch(session, envelope, meta);
+      else await agent.sendMessage(session.id, envelope);
+    },
+    post: async (row: WorkflowThreadRow, text: string) => {
+      const session = await Sessions.findById(row.session_id);
+      const app: AppRef = { apiAppId: session?.slack_app_id ?? undefined, teamId: session?.slack_team_id ?? undefined };
+      await botClientFor(app).chat.postMessage({ channel: row.channel_id, thread_ts: row.thread_ts, text });
+    },
+  });
 
   const panelApi = panelInfra
     ? createPanelApi({
@@ -3223,6 +3339,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     fetchPortal: (req: Request) => portalApi.fetch(req),
     fetchDeploy: (req: Request) => deployApi.fetch(req),
     fetchBrainImport: (req: Request) => brainImportApi.fetch(req),
+    fetchWorkflow: (req: Request) => workflowApi(req),
     __pendingSource: () => v1.pendingSource,
     __sessionCtx: (sessionId: string) => sessionCtx.get(sessionId),
     __resolveMcp: (sessionId: string) => mcpResolver(sessionId),
@@ -3241,6 +3358,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       const route = routes.get(sessionId);
       if (!route) return Promise.resolve("no active thread for this session");
       return agentMentionOnly(route.ctx, active);
+    },
+    __agentEnterSandbox: (sessionId: string) => {
+      const route = routes.get(sessionId);
+      if (!route) return Promise.resolve("no active thread for this session");
+      return agentEnterSandbox(sessionId, route.ctx);
     },
   };
 }
