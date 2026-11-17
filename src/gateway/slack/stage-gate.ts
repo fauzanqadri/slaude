@@ -77,7 +77,7 @@ export class StageGate {
       const decision = m[1] as "approve" | "reject";
       const gateId = m[2]!;
       const userId: string = (body as any).user?.id ?? "unknown";
-      const ephemeral = async (text: string) => { try { await respond({ response_type: "ephemeral", replace_original: false, text }); } catch {} };
+      const ephemeral = async (text: string) => { try { await respond({ response_type: "ephemeral", replace_original: false, text }); } catch {} }; // runtime-ui: workflow stage card or notice
 
       if (!env.workflow.active()) return ephemeral(":no_entry: Workflows are disabled on this deployment; this card stays pending.");
       const row = await PendingGates.get(gateId);
@@ -101,7 +101,7 @@ export class StageGate {
       const resolved = await PendingGates.resolve(gateId, decision === "approve" ? "approved" : "denied", userId);
       if (!resolved) return ephemeral(":lock: This stage was already decided.");
       try {
-        await respond({
+        await respond({ // runtime-ui: workflow stage card or notice
           replace_original: true,
           text: `Stage *${p.stage}* (attempt ${p.attempt ?? 1}) → ${decision === "approve" ? "*Approved*" : "*Rejected*"} by <@${userId}>`,
           blocks: [],
@@ -138,7 +138,7 @@ export class StageGate {
     });
     try {
       if (!inline) {
-        for (const part of chunkText(artifact.content)) await client.chat.postMessage({ channel: req.channel, thread_ts: req.threadTs, text: part });
+        for (const part of chunkText(artifact.content)) await client.chat.postMessage({ channel: req.channel, thread_ts: req.threadTs, text: part }); // runtime-ui: workflow stage card or notice
       }
       const blocks: any[] = [
         { type: "section", text: { type: "mrkdwn", text: `:page_facing_up: *${artifact.name}* from stage *${req.stage}* (attempt ${attempt})${artifact.outcome ? `, outcome *${artifact.outcome}*` : ""}${inline ? `\n${artifact.content}` : "\nThe full text is in the messages above."}` } },
@@ -154,7 +154,7 @@ export class StageGate {
       if (!questions.length) {
         blocks.push({ type: "actions", elements: [{ type: "button", style: "primary", text: { type: "plain_text", text: "Approve" }, action_id: `${PREFIX}:approve:${gateId}` }] });
       }
-      await client.chat.postMessage({ channel: req.channel, thread_ts: req.threadTs, text: `:white_check_mark: Stage "${req.stage}" produced ${artifact.name}`, blocks });
+      await client.chat.postMessage({ channel: req.channel, thread_ts: req.threadTs, text: `:white_check_mark: Stage "${req.stage}" produced ${artifact.name}`, blocks }); // runtime-ui: workflow stage card or notice
     } catch (e) {
       await PendingGates.resolve(gateId, "cancelled", "system").catch(() => {});
       return { error: `Could not post the approval card: ${(e as Error).message}` };
@@ -178,7 +178,7 @@ export class StageGate {
       payload: { type: "stage", runId: run.run_id, stage: req.stage, attempt, channel: req.channel, threadTs: req.threadTs, outcome: req.outcome ?? null },
     });
     try {
-      await clientForApp(this.#transport, req.app).chat.postMessage({
+      await clientForApp(this.#transport, req.app).chat.postMessage({ // runtime-ui: workflow stage card or notice
         channel: req.channel,
         thread_ts: req.threadTs,
         text: `:white_check_mark: Stage "${req.stage}" is ready for approval`,

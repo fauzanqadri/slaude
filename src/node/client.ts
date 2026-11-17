@@ -12,7 +12,10 @@
 import type { NodeCredential } from "../gateway/api/mcp-credentials";
 import { GATE_DENIED_CODE, JOB_HEADER, LABEL_MISMATCH_CODE, NODE_UNAUTHORIZED_CODE } from "../gateway/api/auth";
 import type { RuntimeBundle } from "../gateway/api/tenants";
+import type { ConnectInfo } from "../remote/transport";
 import { BootFailure } from "../gateway/core/failure-codes";
+import { AGENT_DEFINITION_CAPABILITY, CAPABILITIES_HEADER, CHANNEL_SESSION_CAPABILITY, GUARDRAILS_CAPABILITY } from "../guardrails/capability";
+import type { PluginReport } from "../config/plugin-inventory";
 
 export interface NodeClientOpts {
   /** Gateway base URL (SLAUDE_GATEWAY_URL), e.g. http://gateway:8080 */
@@ -32,6 +35,8 @@ export interface NodeClientOpts {
 /** A memory call waits at most this long; longer than the gateway's own bound
  *  on the brain (GATEWAY_MEMORY_TIMEOUT_MS), so the gateway answers first. */
 export const MEMORY_TIMEOUT_MS = 3000;
+/** Bound on one skill-check budget call (it runs after the turn, off its path). */
+export const BACKGROUND_TIMEOUT_MS = 10_000;
 
 /** A memory call gave up at its bound. */
 export class MemoryTimeoutError extends Error {
@@ -95,6 +100,16 @@ export function bundleFetchFailure(e: unknown): BootFailure {
   if (e instanceof GateDenied) return labelMismatchBoot(e);
   let transient = true;
   if (e instanceof NodeApiError) {
+    const code = (() => {
+      try {
+        return (JSON.parse(e.body) as { code?: unknown }).code;
+      } catch {
+        return undefined;
+      }
+    })();
+    if (code === "GUARDRAILS_UNAVAILABLE" || code === "GUARDRAILS_UNSUPPORTED" || code === "SHARED_ENV_UNSUPPORTED") {
+      return new BootFailure(code, `the gateway refused the runtime bundle: ${code}`, { cause: e, transient: false });
+    }
     if (e.status === 503) {
       try {
         transient = (JSON.parse(e.body) as { transient?: unknown }).transient === true;
@@ -221,7 +236,7 @@ export class NodeClient {
   /** Low-level request with bearer + optional job token + retry policy. */
   async request(
     path: string,
-    o: { method?: string; body?: unknown; jobToken?: string; headers?: Record<string, string>; retry?: boolean; signal?: AbortSignal } = {},
+    o: { method?: string; body?: unknown; jobToken?: string; headers?: Record<string, string>; retry?: boolean; signal?: AbortSignal; noTimeout?: boolean } = {},
   ): Promise<Response> {
     const headers: Record<string, string> = {
       authorization: `Bearer ${this.#token}`,
@@ -239,6 +254,8 @@ export class NodeClient {
           headers,
           ...(o.body !== undefined ? { body: JSON.stringify(o.body) } : {}),
           ...(o.signal ? { signal: o.signal } : {}),
+          // Bun's own fetch limit (300 s), not part of RequestInit's type.
+          ...(o.noTimeout ? ({ timeout: false } as RequestInit) : {}),
         });
         // 5xx: transient server trouble — retry. Everything else returns.
         if (res.status >= 500 && retry && attempt < this.#attempts - 1) {
@@ -274,6 +291,24 @@ export class NodeClient {
     return this.#json<NodeWhoami>(res);
   }
 
+  /**
+   * Send this process's plugin report (design: plugin inventory). "unsupported":
+   * a gateway that predates the route (404); "too-large": the gateway's 413;
+   * "duplicate": it already holds a report for this process (409, first wins);
+   * "too-many": this credential is at its row cap (429).
+   * Node-authenticated: the gateway takes the node id and labels from the
+   * credential. Transient failures throw after the usual retries.
+   */
+  async putPlugins(report: PluginReport): Promise<"ok" | "unsupported" | "too-large" | "duplicate" | "too-many"> {
+    const res = await this.request("/v1/node/plugins", { method: "PUT", body: report, signal: AbortSignal.timeout(BACKGROUND_TIMEOUT_MS) });
+    if (res.status === 404) return "unsupported";
+    if (res.status === 413) return "too-large";
+    if (res.status === 409) return "duplicate";
+    if (res.status === 429) return "too-many";
+    await this.#json<unknown>(res);
+    return "ok";
+  }
+
   async getSession(id: string, jobToken: string): Promise<SessionView | null> {
     const res = await this.request(`/v1/sessions/${id}`, { jobToken });
     if (res.status === 404) return null;
@@ -299,7 +334,9 @@ export class NodeClient {
     const cached = this.#runtimeCache.get(key);
     const res = await this.request(
       `/v1/tenants/${encodeURIComponent(tenantId)}/personas/${encodeURIComponent(personaId)}/runtime`,
-      { jobToken, headers: cached ? { "if-none-match": cached.etag } : {} },
+      // The capability header: the gateway refuses an agent with enforced
+      // owner guardrails to a node that does not send it.
+      { jobToken, headers: { [CAPABILITIES_HEADER]: `${GUARDRAILS_CAPABILITY},${AGENT_DEFINITION_CAPABILITY},${CHANNEL_SESSION_CAPABILITY}`, ...(cached ? { "if-none-match": cached.etag } : {}) } },
     );
     if (res.status === 304 && cached) return cached.bundle;
     const bundle = await this.#json<RuntimeBundle>(res);
@@ -327,6 +364,14 @@ export class NodeClient {
     const body = await this.#json<{ privateKey?: string }>(res);
     if (!body.privateKey) throw new NodeApiError(502, "", "gateway returned no remote key");
     return body.privateKey;
+  }
+
+  /** How to reach the turn's environment: transport + key (never cached on disk). */
+  async getRemoteEnv(tenantId: string, jobToken: string): Promise<ConnectInfo> {
+    const res = await this.request(`/v1/tenants/${encodeURIComponent(tenantId)}/remote-env`, { jobToken });
+    const body = await this.#json<Partial<ConnectInfo>>(res);
+    if (!body.transport || !body.privateKey) throw new NodeApiError(502, "", "gateway returned no environment");
+    return { transport: body.transport, privateKey: body.privateKey };
   }
 
   /**
@@ -372,6 +417,15 @@ export class NodeClient {
    * long-poll IS the retry loop, and a network error should surface to the
    * caller's loop rather than double-wait.
    */
+  /** Cancel a poll row this session opened (an owner card the node stopped waiting on). Best effort: never throws. */
+  async cancelPending(id: string, jobToken: string): Promise<void> {
+    try {
+      await this.request(`/v1/pending/${id}`, { method: "DELETE", jobToken, retry: false });
+    } catch {
+      /* the row expires at its own deadline anyway */
+    }
+  }
+
   async getPending(id: string, jobToken?: string): Promise<PendingView | "timeout" | "notfound"> {
     // The job token binds the poll to this turn's session (node labels spec
     // §4.4); only a legacy node may poll without one, and only for a while.
@@ -386,14 +440,73 @@ export class NodeClient {
    * (unknown tool / not mounted on this deployment) is folded into an
    * MCP-shaped isError result so shim handlers can hand it to the model
    * as-is; other non-200s throw.
+   *
+   * Sent once, with no time limit but the turn's own abort: a call can wait
+   * minutes behind an approval card, whose expiry answers it. A resend would
+   * post a second card and lose the answer to the first, and the gateway may
+   * already have acted on the call.
    */
-  async postTool(server: string, tool: string, body: unknown, jobToken: string): Promise<ToolResult> {
-    const res = await this.request(`/v1/tools/${server}/${tool}`, { method: "POST", body, jobToken });
+  async postTool(server: string, tool: string, body: unknown, jobToken: string, signal?: AbortSignal): Promise<ToolResult> {
+    const res = await this.request(`/v1/tools/${server}/${tool}`, {
+      method: "POST",
+      body,
+      jobToken,
+      retry: false,
+      noTimeout: true,
+      ...(signal ? { signal } : {}),
+    });
     if (res.status === 404) {
       const text = await res.text().catch(() => "");
       return { content: [{ type: "text", text: `tool unavailable: ${text.slice(0, 200)}` }], isError: true };
     }
     return this.#json<ToolResult>(res);
+  }
+
+  /**
+   * The first half of a direct upload (surface/upload_begin): the gateway asks
+   * Slack for a presigned URL for a file of this name and size. `unavailable`
+   * says the gateway cannot serve it: "old-gateway" (it predates the tool) or
+   * "no-capability" (it has the tool but this surface cannot upload); the caller
+   * falls back to the path call. Any other refusal (too large, rate limit, a
+   * Slack error) is `error`, text for the agent. The URL and handle returned are
+   * credentials for one file: never log them.
+   */
+  async uploadBegin(
+    a: { filename: string; size: number; alt_text?: string },
+    jobToken: string,
+    signal?: AbortSignal,
+  ): Promise<
+    | { ok: true; uploadUrl: string; fileId: string; handle: string }
+    | { ok: false; unavailable?: "old-gateway" | "no-capability"; error: string }
+  > {
+    const r = await this.postTool("surface", "upload_begin", a, jobToken, signal);
+    const t = r.content[0]?.text ?? "";
+    if (r.isError) {
+      if (t.startsWith("tool unavailable:")) {
+        return { ok: false, unavailable: t.includes("not mounted") ? "no-capability" : "old-gateway", error: "upload is not available on this gateway" };
+      }
+      return { ok: false, error: t };
+    }
+    try {
+      const b = JSON.parse(t) as { uploadUrl?: unknown; fileId?: unknown; handle?: unknown };
+      if (typeof b.uploadUrl === "string" && typeof b.fileId === "string" && typeof b.handle === "string") {
+        return { ok: true, uploadUrl: b.uploadUrl, fileId: b.fileId, handle: b.handle };
+      }
+    } catch { /* falls through */ }
+    return { ok: false, error: "upload failed: the gateway's answer to upload_begin was not understood" };
+  }
+
+  /**
+   * The second half (surface/upload_complete). Sent once, no time limit but the
+   * turn's abort: a held caption waits for an approver here. Returns the
+   * gateway's tool result (an isError result carries text for the agent).
+   */
+  async uploadComplete(
+    a: { handle: string; title?: string; initial_comment?: string },
+    jobToken: string,
+    signal?: AbortSignal,
+  ): Promise<ToolResult> {
+    return this.postTool("surface", "upload_complete", a, jobToken, signal);
   }
 
   /**
@@ -474,6 +587,86 @@ export class NodeClient {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * The post-turn skill check's budget run (POST /v1/background/skill-check/
+   * start|finish). The gateway takes persona, session and scope from the job
+   * token and prices the usage itself. A 404 (a gateway that predates the
+   * routes) and every other non-200 throw: the caller fails closed. `start` is
+   * never retried (a retried start could open a second run); `finish` is, and
+   * a 409 on a retry counts as recorded. Each attempt is bounded by
+   * BACKGROUND_TIMEOUT_MS.
+   */
+  async skillCheckStart(jobToken: string, reportedModel?: string): Promise<{ ok: boolean; runId?: string }> {
+    const res = await this.request("/v1/background/skill-check/start", {
+      method: "POST",
+      body: reportedModel ? { model: reportedModel } : {},
+      jobToken,
+      retry: false,
+      signal: AbortSignal.timeout(BACKGROUND_TIMEOUT_MS),
+    });
+    const b = await this.#json<{ ok?: unknown; runId?: unknown }>(res);
+    return b.ok === true && typeof b.runId === "string" ? { ok: true, runId: b.runId } : { ok: false };
+  }
+
+  /** Finish the job's own background-turn run (POST /v1/background/turn/finish), retried as skillCheckFinish. */
+  turnFinish(
+    body: { runId: string; outcome: "ok" | "error" | "stopped-budget"; usage: Record<string, { input: number; output: number; cache_read: number; cache_write: number }>; stats?: { turns?: number; durationMs?: number; cap?: "usd" | "turns" | "minutes" } },
+    jobToken: string,
+  ): Promise<void> {
+    return this.skillCheckFinish(body, jobToken, "/v1/background/turn/finish");
+  }
+
+  async skillCheckFinish(
+    body: { runId: string; outcome: "ok" | "error" | "stopped-budget"; stats?: { turns?: number; durationMs?: number; cap?: "usd" | "turns" | "minutes" }; usage: Record<string, { input: number; output: number; cache_read: number; cache_write: number }> },
+    jobToken: string,
+    path = "/v1/background/skill-check/finish",
+  ): Promise<void> {
+    // Retried here, not by request(): a retry whose earlier attempt did land
+    // (a timeout or 5xx after the gateway wrote the row) gets a 409, which
+    // then means "already recorded", not a failure.
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < this.#attempts; attempt++) {
+      if (attempt > 0) await sleep(this.#baseDelayMs * 2 ** (attempt - 1));
+      let res: Response;
+      try {
+        res = await this.request(path, {
+          method: "POST",
+          body,
+          jobToken,
+          retry: false,
+          signal: AbortSignal.timeout(BACKGROUND_TIMEOUT_MS),
+        });
+      } catch (e) {
+        lastErr = e;
+        continue;
+      }
+      if (res.status >= 500) {
+        lastErr = new NodeApiError(res.status, await res.text().catch(() => ""));
+        continue;
+      }
+      if (res.status === 409 && attempt > 0) return;
+      await this.#json<unknown>(res);
+      return;
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  }
+
+  /**
+   * One use of a skill (POST /v1/background/skill-usage), counted for the job
+   * token persona's agent. Not retried (a retry could count a use twice);
+   * bounded by BACKGROUND_TIMEOUT_MS. A non-200 throws.
+   */
+  async skillUsage(skill: string, jobToken: string): Promise<void> {
+    const res = await this.request("/v1/background/skill-usage", {
+      method: "POST",
+      body: { skill },
+      jobToken,
+      retry: false,
+      signal: AbortSignal.timeout(BACKGROUND_TIMEOUT_MS),
+    });
+    await this.#json<unknown>(res);
   }
 
   /**

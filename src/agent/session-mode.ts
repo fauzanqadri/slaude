@@ -1,4 +1,5 @@
 import type { OneOnOneLockRow } from "../db/one-on-one";
+import { renderRuntimeFile } from "../soul/runtime/render";
 
 /**
  * System-prompt block telling the model whether this thread is a private `/1on1`
@@ -9,9 +10,17 @@ import type { OneOnOneLockRow } from "../db/one-on-one";
  * Returns "" when the thread is unlocked (ordinary group/channel mode) so the
  * caller can drop it from the appended blocks.
  */
+/** Where a remote session's tools run, as the prompt describes it. */
+export interface RemoteModeInfo {
+  userId: string;
+  dir: string;
+  /** Absent for a pre-environment tailcat claim. */
+  env?: { name: string; kind: string; trust: "user-machine" | "provisioned"; shared?: boolean };
+}
+
 export function sessionModeBlock(
   lock: OneOnOneLockRow | null,
-  remote?: { userId: string; dir: string } | null,
+  remote?: RemoteModeInfo | null,
   sandbox = false,
   localExecOff = false,
   sandboxAvailable = false,
@@ -70,32 +79,16 @@ function lockBlock(lock: OneOnOneLockRow | null): string {
     const scopeLine = lock.open_scope.trim()
       ? `Active scope constraint (applies to all guests — not the session owner <@${lock.locked_user}>): ${lock.open_scope.trim()}`
       : `No additional scope constraint is active — guests may participate freely.`;
-    return [
-      "<session-mode>",
-      `This thread is a 1on1 session owned by <@${lock.locked_user}>, currently open to all participants.`,
-      scopeLine,
-      "The session owner can restrict access again at any time with `/1on1 lock`.",
-      "</session-mode>",
-    ].join("\n");
+    return renderRuntimeFile("modules/one-on-one-open.md", { LOCKED_USER: lock.locked_user, SCOPE_LINE: scopeLine });
   }
-  return [
-    "<session-mode>",
-    `This thread is a private 1on1 session locked to <@${lock.locked_user}>.`,
-    "Only that user and the manager are heard here — treat it as a confidential,",
-    "direct one-on-one: you may speak more freely and personally than in a shared",
-    "channel, and anything said is between you and them.",
-    "</session-mode>",
-  ].join("\n");
+  return renderRuntimeFile("modules/one-on-one-locked.md", { LOCKED_USER: lock.locked_user });
 }
 
-function remoteBlock(r: { userId: string; dir: string }): string {
-  return [
-    "<remote-mode>",
-    `Your file and shell tools (Bash, Read, Write, Edit, Glob, Grep) run on <@${r.userId}>'s own machine, in \`${r.dir}\` — not on this server.`,
-    "Relative paths resolve against that directory. The knowledge base, MCP servers and web tools are unchanged and still run here.",
-    "Background jobs: Bash with run_in_background returns an ID; read output with mcp__remote__bash_output and stop it with mcp__remote__bash_kill.",
-    "To publish work: commit on a branch named factory/<name>, then call mcp__remote__git_push. `git push` from Bash has no credential there; git_push asks the user for approval and pushes from this server.",
-    "If a tool fails with REMOTE_UNREACHABLE or REMOTE_AUTH_FAILED, stop and tell the user (they can check with `/remote`). Do not retry in a loop and do not work around it.",
-    "</remote-mode>",
-  ].join("\n");
+function remoteBlock(r: RemoteModeInfo): string {
+  const where = r.env?.shared
+    ? `on a SHARED machine, environment \`${r.env.name}\` (${r.env.kind}), in \`${r.dir}\`. It is not disposable and other people use it, so change only what the task needs`
+    : r.env?.trust === "provisioned"
+    ? `in a disposable sandbox environment \`${r.env.name}\` (${r.env.kind}), in \`${r.dir}\``
+    : `on <@${r.userId}>'s own machine${r.env ? ` (environment \`${r.env.name}\`, ${r.env.kind})` : ""}, in \`${r.dir}\``;
+  return renderRuntimeFile("modules/remote.md", { WHERE: where });
 }

@@ -13,6 +13,8 @@ import { __resetMasterKeyCache } from "../../../src/db/crypto";
 import * as MentionOnly from "../../../src/db/mention-only";
 import * as Sandbox from "../../../src/db/sandbox";
 import * as SO from "../../../src/db/soul-overrides";
+import * as AuditEvents from "../../../src/db/audit-events";
+import { flushAudits } from "../../../src/audit/emit";
 import { writeSoulFixture, WORLD } from "../../../src/gateway/sim/soul-fixture";
 import { __resetModelCache } from "../../../src/agent/models";
 import { paths } from "../../../src/config/home";
@@ -30,6 +32,7 @@ function richTransport(o: { botUserId?: string; authThrows?: boolean } = {}) {
   const posts: any[] = [];
   const edits: any[] = [];
   const reacts: any[] = [];
+  const statuses: any[] = [];
   const handlers = new Map<string, (args: any) => Promise<void>>();
   const actions: { pattern: RegExp | string; fn: any }[] = [];
   const middlewares: any[] = [];
@@ -48,6 +51,7 @@ function richTransport(o: { botUserId?: string; authThrows?: boolean } = {}) {
     conversations: { info: async () => ({}), members: async () => ({}), replies: async () => ({}) },
     users: { info: async () => ({ user: { real_name: "Test" } }), profile: { set: async () => ({}) } },
     search: { messages: async () => ({}) },
+    assistant: { threads: { setStatus: async (a: any) => { statuses.push(a); return { ok: true }; } } },
   } as any;
   const t: Transport = {
     client,
@@ -64,7 +68,7 @@ function richTransport(o: { botUserId?: string; authThrows?: boolean } = {}) {
       if (hit) await fn({ ack: async () => {}, action: { action_id: actionId }, body: { user: { id: userId } }, respond: async () => {} });
     }
   };
-  return { t, client, posts, edits, reacts, emit, emitAction, middlewares };
+  return { t, client, posts, edits, reacts, statuses, emit, emitAction, middlewares };
 }
 
 function makeGw(o: { transport?: Rich; gwOpts?: GatewayOptions; agent?: AgentManager } = {}) {
@@ -356,6 +360,30 @@ describe("gateway uncovered branches", () => {
     expect(typeof guard!(session.id)).toBe("string");
   });
 
+  it("auto-evolve turn: its tool calls set no status and no reaction after the turn is finalized (#131)", async () => {
+    writeSoulFixture(WORLD);
+    const g = makeGw();
+    const ts = nextTs();
+    await g.emit("message", dmArgs(g, "store an abbreviation", { ts }));
+    const session = await g.agent.ensureSession({ team_id: "T", channel_id: "D_MGR", thread_ts: ts });
+    await new Promise((r) => setTimeout(r, 30));
+    // The user-visible turn: a tool sets a status, the reply, then done (status cleared).
+    g.agent.emit("event", { type: "toolCall", sessionId: session.id, tool: "Read", input: { file_path: "/x" } } as any);
+    await waitFor(() => g.statuses.some((s) => s.status && s.status !== "thinking…"));
+    g.agent.emit("event", { type: "toolCall", sessionId: session.id, tool: "mcp__slaude_surface__reply", input: {} } as any);
+    g.agent.emit("event", { type: "done", sessionId: session.id } as any);
+    await waitFor(() => g.statuses.at(-1)?.status === "");
+    const statusesBefore = g.statuses.length;
+    const reactsBefore = g.reacts.length;
+    // The evolution turn that follows.
+    g.agent.emit("event", { type: "toolCall", sessionId: session.id, tool: "Read", input: { file_path: "/skills" }, autoEvolve: true } as any);
+    g.agent.emit("event", { type: "toolCall", sessionId: session.id, tool: "mcp__slaude_surface__reply", input: {}, autoEvolve: true } as any);
+    g.agent.emit("event", { type: "done", sessionId: session.id, autoEvolve: true } as any);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(g.statuses.length).toBe(statusesBefore);
+    expect(g.reacts.length).toBe(reactsBefore);
+  });
+
   it("KB MCP deps evaluate gate/scope/managers from the live route (brain enabled)", async () => {
     writeSoulFixture(WORLD);
     const sink: { binding?: SessionBinding; approvals: any[] } = { approvals: [] };
@@ -467,6 +495,82 @@ describe("gateway uncovered branches", () => {
     expect(g.posts.some((p) => String(p.text).includes("stopped ignoring <@U0NOISY>"))).toBe(true);
   });
 
+  describe("audit rows for slash state changes", () => {
+    // Slash handling and the audit write both finish after emit() returns:
+    // poll until the expected count lands (or a short deadline passes).
+    const rowsFor = async (prefix: string, want: number) => {
+      for (let i = 0; ; i++) {
+        await flushAudits();
+        const items = (await AuditEvents.list({ action: prefix })).items;
+        if (items.length >= want || i >= 200) return items.reverse();
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+
+    it("/ignore and /unignore record ignore.set and ignore.cleared; a no-op unignore records nothing", async () => {
+      writeSoulFixture(WORLD);
+      await db.run("DELETE FROM audit_events");
+      const g = makeGw();
+      const ts = nextTs();
+      await g.emit("message", dmArgs(g, "hi", { ts }));
+      await g.emit("message", dmArgs(g, "/ignore-thread 10m", { thread_ts: ts }));
+      await g.emit("message", dmArgs(g, "/unignore-thread", { thread_ts: ts }));
+      await g.emit("message", dmArgs(g, "/unignore-thread", { thread_ts: ts }));
+      await rowsFor("ignore.", 2);
+      await g.emit("message", dmArgs(g, "/ignore <@U0NOISY> 5m"));
+      await rowsFor("ignore.", 3);
+      await g.emit("message", dmArgs(g, "/unignore <@U0NOISY>"));
+      await g.emit("message", dmArgs(g, "/unignore <@U0NOISY>"));
+      const rows = await rowsFor("ignore.", 4);
+      await new Promise((r) => setTimeout(r, 50));
+      expect((await rowsFor("ignore.", 5)).length).toBe(4);
+      expect(rows.map((e) => [e.action, e.targetKind, e.actorId]).sort()).toEqual([
+        ["ignore.cleared", "thread", WORLD.manager],
+        ["ignore.cleared", "user", WORLD.manager],
+        ["ignore.set", "thread", WORLD.manager],
+        ["ignore.set", "user", WORLD.manager],
+      ]);
+      const userSet = rows.find((e) => e.action === "ignore.set" && e.targetKind === "user")!;
+      expect(userSet.targetId).toBe("U0NOISY");
+      expect(typeof userSet.details.expiresAt).toBe("number");
+    });
+
+    it("/1on1 on and off record one_on_one.locked and one_on_one.unlocked", async () => {
+      writeSoulFixture(WORLD);
+      await db.run("DELETE FROM audit_events");
+      const g = makeGw();
+      const ts = nextTs();
+      await g.emit("message", dmArgs(g, "hi", { ts }));
+      await g.emit("message", dmArgs(g, "/1on1", { thread_ts: ts }));
+      await rowsFor("one_on_one.", 1);
+      await g.emit("message", dmArgs(g, "/1on1 off", { thread_ts: ts }));
+      const rows = await rowsFor("one_on_one.", 2);
+      expect(rows.map((e) => [e.action, e.actorKind, e.actorId, e.threadTs]).sort()).toEqual([
+        ["one_on_one.locked", "slack_user", WORLD.manager, ts],
+        ["one_on_one.unlocked", "slack_user", WORLD.manager, ts],
+      ]);
+      expect(rows[0]!.persona).toBe("default");
+    });
+
+    it("/soul add and /soul clear record soul.override.set and soul.override.cleared", async () => {
+      writeSoulFixture(WORLD);
+      await SO.clear();
+      await db.run("DELETE FROM audit_events");
+      const g = makeGw();
+      await g.emit("message", dmArgs(g, "/soul dm add <@U0EXTRA>"));
+      await g.emit("message", dmArgs(g, "/soul trust add notachannel")); // refused by validation
+      await rowsFor("soul.override.", 1);
+      await g.emit("message", dmArgs(g, "/soul clear all"));
+      const rows = await rowsFor("soul.override.", 2);
+      expect(rows.map((e) => [e.action, e.actorId, e.targetKind]).sort()).toEqual([
+        ["soul.override.cleared", WORLD.manager, "soul_field"],
+        ["soul.override.set", WORLD.manager, "soul_field"],
+      ]);
+      expect(rows.find((e) => e.action === "soul.override.set")!.details).toMatchObject({ op: "add", value: "U0EXTRA", via: "slash" });
+      expect(rows.find((e) => e.action === "soul.override.cleared")!.targetId).toBe("all");
+    });
+  });
+
   it("skill invocation rewrites the user text via buildSkillInvocation", async () => {
     writeSoulFixture(WORLD);
     const dir = join(paths.skills, "branchskill");
@@ -478,6 +582,12 @@ describe("gateway uncovered branches", () => {
       expect(g.sends.length).toBe(1);
       expect(g.sends[0]!).toContain("now please");
       expect(g.sends[0]!).not.toContain("/branchskill now please");
+      // The invocation counts as a use of the skill, for the weekly skill review (best effort, off the turn's path).
+      const SkillUsage = await import("../../../src/db/skill-usage");
+      const { agentIdReady } = await import("../../../src/knowledge/agent-identity");
+      const agentId = await agentIdReady();
+      for (let i = 0; i < 50 && !(await SkillUsage.forAgent(agentId)).get("branchskill"); i++) await new Promise((r) => setTimeout(r, 10));
+      expect((await SkillUsage.forAgent(agentId)).get("branchskill")?.uses).toBeGreaterThanOrEqual(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -669,6 +779,8 @@ describe("gateway uncovered branches", () => {
       const locked = await g.h.__agentOneOnOne(session.id, "lock");
       expect(locked).toContain("1on1");
       expect((await OneOnOne.find("D_MGR", ts))?.locked_user).toBe(WORLD.manager);
+      // the lock records the workspace it was taken in (slice C task 12)
+      expect((await OneOnOne.find("D_MGR", ts))?.team_id).toBe("T");
 
       // release → unlocked again
       const released = await g.h.__agentOneOnOne(session.id, "off");

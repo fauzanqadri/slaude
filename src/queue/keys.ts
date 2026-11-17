@@ -6,6 +6,8 @@
  * Pure module: no redis import, so it is loadable (and fully unit-testable)
  * without a Redis server.
  */
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 
 /** SLAUDE_REDIS_PREFIX — namespace for every key this process touches. */
 export function redisPrefix(): string {
@@ -79,10 +81,18 @@ export interface Keys {
    *  written with every heartbeat; TTL max(node TTL, 3× heartbeat). Absent for a node that
    *  predates labels: it counts as `{default}`. */
   nodeLabels(nodeId: string): string;
+  /** `nodecaps:<nodeId>`: the capabilities a live node advertises (e.g.
+   *  `guardrails/1`), comma-joined, written beside its labels. Absent for a
+   *  node that predates capabilities: it has none. */
+  nodeCaps(nodeId: string): string;
   /** Set of every nodeId that ever registered — reaper work list. */
   nodeSet(): string;
   /** `lock:session:<sessionId>` — one turn at a time per session. */
   sessionLock(sessionId: string): string;
+  /** `lock:workspace:<sha256(resolved dir) first 32 hex>` — one turn at a time in a
+   *  shared working directory (the agent's proactive folder) across nodes.
+   *  Hashed so a path never puts `/` into the key. */
+  workspaceLock(dir: string): string;
   /** `lock:leader:<role>` — cron / reaper / migrate leader election. */
   leaderLock(role: string): string;
   /** `coalesce:<sessionId>` — pending-job index for message coalescing. */
@@ -124,6 +134,11 @@ export interface Keys {
    *  recovery or failure retry) that finds it must not re-run the turn —
    *  the model already ran and its Slack posts are out. */
   turnDone(jobId: string): string;
+  /** `turn-senders:<jobId>` — who sent the messages of the job whose token
+   *  names `jobId` (JSON TurnSender[]), written by the turn queues on every
+   *  add and merge, so the gateway can tell a single-sender turn from a
+   *  merged one (profile writes need one sender, the speaker). */
+  turnSenders(jobId: string): string;
   /** `job-moved:<jobId>` — where a job went when it was moved to another queue
    *  (`{queue, jobId}` JSON), so a dispatch follower watching the old queue
    *  follows it instead of reading the move as the turn's end. */
@@ -145,8 +160,10 @@ export function makeKeys(prefix: string = redisPrefix()): Keys {
     node: (nodeId) => `${prefix}:nodes:${nodeId}`,
     nodePattern: () => `${prefix}:nodes:*`,
     nodeLabels: (nodeId) => `${prefix}:nodelabels:${nodeId}`,
+    nodeCaps: (nodeId) => `${prefix}:nodecaps:${nodeId}`,
     nodeSet: () => `${prefix}:nodeset`,
     sessionLock: (sessionId) => `${prefix}:lock:session:${sessionId}`,
+    workspaceLock: (dir) => `${prefix}:lock:workspace:${createHash("sha256").update(resolve(dir)).digest("hex").slice(0, 32)}`,
     leaderLock: (role) => `${prefix}:lock:leader:${role}`,
     coalesce: (sessionId) => `${prefix}:coalesce:${sessionId}`,
     coalesceLock: (sessionId) => `${prefix}:lock:coalesce:${sessionId}`,
@@ -160,6 +177,7 @@ export function makeKeys(prefix: string = redisPrefix()): Keys {
     panelResumeChannel: () => `${prefix}:panel-resume`,
     panelHoldChannel: () => `${prefix}:panel-hold`,
     turnDone: (jobId) => `${prefix}:turn-done:${jobId}`,
+    turnSenders: (jobId) => `${prefix}:turn-senders:${jobId}`,
     jobMoved: (jobId) => `${prefix}:job-moved:${jobId}`,
     redispatch: (jobId) => `${prefix}:redispatch:${jobId}`,
     labelUnservedSince: () => `${prefix}:label-unserved-since`,

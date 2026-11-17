@@ -1,0 +1,326 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { inWindow, parseClock, parseManager, parseMandates, parseProactive, parseScopedMandates, proactiveFor, proactiveRead, __setProactiveSoulSource } from "../../src/soul/proactive";
+import { FIELD_ALIASES, mutateOverride } from "../../src/soul/overrides";
+import { SoulDataSchema } from "../../src/soul/data";
+import { EXTRACTION_PROMPT } from "../../src/cli/extraction-prompt";
+
+const SOUL = (body: string) => `# Persona\n\n## Identity\n- Name: Helper\n\n${body}\n`;
+
+afterEach(() => __setProactiveSoulSource(null));
+
+describe("parseClock / inWindow", () => {
+  it("parses HH:MM and rejects junk", () => {
+    expect(parseClock("21:00")).toBe(21 * 60);
+    expect(parseClock("8:05")).toBe(8 * 60 + 5);
+    expect(parseClock("24:00")).toBeNull();
+    expect(parseClock("12:60")).toBeNull();
+    expect(parseClock("noon")).toBeNull();
+  });
+
+  it("wraps midnight", () => {
+    const w = { start: 21 * 60, end: 8 * 60 };
+    expect(inWindow(23 * 60, w)).toBe(true);
+    expect(inWindow(7 * 60, w)).toBe(true);
+    expect(inWindow(12 * 60, w)).toBe(false);
+    expect(inWindow(8 * 60, w)).toBe(false);
+    expect(inWindow(21 * 60, w)).toBe(true);
+  });
+
+  it("handles a same-day window and an empty one", () => {
+    expect(inWindow(13 * 60, { start: 12 * 60, end: 14 * 60 })).toBe(true);
+    expect(inWindow(15 * 60, { start: 12 * 60, end: 14 * 60 })).toBe(false);
+    expect(inWindow(12 * 60, { start: 12 * 60, end: 12 * 60 })).toBe(false);
+  });
+});
+
+describe("parseProactive", () => {
+  it("defaults to disabled, cap 6, cooldown 1, no quiet hours", () => {
+    expect(parseProactive(SOUL(""))).toEqual({ enabled: false, quietHours: null, maxPerPersonPerDay: 6, cooldownHours: 1, watch: [], highest: "act", wake: true, read: [], channels: {}, channelHighest: {}, channelCooldownHours: {}, channelMaxPerDay: {}, sessions: {}, invalidSessions: [] });
+  });
+
+  it("reads the global section", () => {
+    const c = parseProactive(SOUL("## Proactive\n- Enabled: yes\n- Quiet hours: 21:00–08:00\n- Max per person per day: 3\n- Cooldown: 2 hours\n"));
+    expect(c).toEqual({ enabled: true, quietHours: { start: 21 * 60, end: 8 * 60 }, maxPerPersonPerDay: 3, cooldownHours: 2, watch: [], highest: "act", wake: true, read: [], channels: {}, channelHighest: {}, channelCooldownHours: {}, channelMaxPerDay: {}, sessions: {}, invalidSessions: [] });
+  });
+
+  it("is case-insensitive, accepts a hyphen, and ignores comments", () => {
+    const c = parseProactive(SOUL("## proactive\n- ENABLED: Yes   # turn on\n* quiet hours: 22:30-07:00\n"));
+    expect(c.enabled).toBe(true);
+    expect(c.quietHours).toEqual({ start: 22 * 60 + 30, end: 7 * 60 });
+  });
+
+  it("anything but yes is off", () => {
+    expect(parseProactive(SOUL("## Proactive\n- Enabled: maybe\n")).enabled).toBe(false);
+    expect(parseProactive(SOUL("## Proactive\n- Enabled: no\n")).enabled).toBe(false);
+    expect(parseProactive(SOUL("## Proactive\n- Enabled: true\n")).enabled).toBe(false);
+  });
+
+  it("ignores malformed numbers and quiet hours", () => {
+    const c = parseProactive(SOUL("## Proactive\n- Enabled: yes\n- Quiet hours: late\n- Max per person per day: lots\n- Cooldown: -3 hours\n"));
+    expect(c.quietHours).toBeNull();
+    expect(c.maxPerPersonPerDay).toBe(6);
+    expect(c.cooldownHours).toBe(1);
+  });
+
+  it("stops the section at the next ## heading", () => {
+    const c = parseProactive(SOUL("## Proactive\n- Enabled: no\n\n## Values\n- Enabled: yes\n"));
+    expect(c.enabled).toBe(false);
+  });
+
+  it("reads per-channel overrides in either direction", () => {
+    const text = SOUL(
+      [
+        "## Proactive",
+        "- Enabled: no",
+        "",
+        "## Channel <#C0TEAMCHAN|team-channel>",
+        "### Mandate",
+        "Help the team.",
+        "### Proactive",
+        "- Enabled: yes",
+        "",
+        "## Channel G0QUIETCHAN",
+        "### Proactive",
+        "- Enabled: no",
+      ].join("\n"),
+    );
+    expect(parseProactive(text).channels).toEqual({ C0TEAMCHAN: true, G0QUIETCHAN: false });
+  });
+
+  it("ignores a channel block without a Proactive subsection, a placeholder id, and Enabled outside the subsection", () => {
+    const text = SOUL(
+      [
+        "## Channel <#C0TEAMCHAN|team-channel>",
+        "- Enabled: yes",
+        "### Mandate",
+        "- Enabled: yes",
+        "",
+        "## Channel <#Cxxx|name>",
+        "### Proactive",
+        "- Enabled: yes",
+      ].join("\n"),
+    );
+    expect(parseProactive(text).channels).toEqual({});
+  });
+
+  it("a channel subsection ends at the next ### heading", () => {
+    const text = SOUL(["## Channel C0TEAMCHAN", "### Proactive", "### Mandate", "- Enabled: yes"].join("\n"));
+    expect(parseProactive(text).channels).toEqual({});
+  });
+
+  it("ignores headings inside fenced code blocks", () => {
+    const text = SOUL(["```md", "## Proactive", "- Enabled: yes", "```"].join("\n"));
+    expect(parseProactive(text).enabled).toBe(false);
+  });
+
+  it("a top-level # heading ends the section", () => {
+    expect(parseProactive(SOUL("## Proactive\n- Enabled: no\n\n# Appendix\n- Enabled: yes\n")).enabled).toBe(false);
+  });
+
+  it("a ### Proactive outside a channel block does nothing", () => {
+    expect(parseProactive(SOUL("### Proactive\n- Enabled: yes\n")).enabled).toBe(false);
+  });
+});
+
+describe("a channel's own Cooldown and Max per day", () => {
+  const TEXT = "## Proactive\n- Enabled: no\n- Cooldown: 4 hours\n- Max per person per day: 2\n\n## Channel C0TEAMCHAN\n### Proactive\n- Enabled: yes\n- Cooldown: 0.5\n- Max per day: 12\n\n## Channel C0OTHERCHA\n### Proactive\n- Enabled: yes\n";
+  it("parses them per channel", () => {
+    const c = parseProactive(SOUL(TEXT));
+    expect(c.channelCooldownHours).toEqual({ C0TEAMCHAN: 0.5 });
+    expect(c.channelMaxPerDay).toEqual({ C0TEAMCHAN: 12 });
+  });
+  it("ignores invalid values", () => {
+    const c = parseProactive(SOUL("## Channel C0TEAMCHAN\n### Proactive\n- Cooldown: soon\n- Max per day: 0\n"));
+    expect(c.channelCooldownHours).toEqual({});
+    expect(c.channelMaxPerDay).toEqual({});
+  });
+  it("apply only to that channel (one that is not a channel session: Enabled: yes would make it one, which has no limits)", () => {
+    const off = TEXT.replaceAll("### Proactive\n- Enabled: yes", "### Proactive\n- Enabled: no");
+    __setProactiveSoulSource(() => SOUL(off));
+    const own = proactiveFor("default", "C0TEAMCHAN");
+    expect(own.cooldownHours).toBe(0.5);
+    expect(own.maxPerPersonPerDay).toBe(12);
+    const other = proactiveFor("default", "C0OTHERCHA");
+    expect(other.cooldownHours).toBe(4);
+    expect(other.maxPerPersonPerDay).toBe(2);
+    const global = proactiveFor("default");
+    expect(global.cooldownHours).toBe(4);
+    expect(global.maxPerPersonPerDay).toBe(2);
+    __setProactiveSoulSource(null);
+  });
+});
+
+describe("Wake and Read", () => {
+  it("parse from the global section", () => {
+    const c = parseProactive(SOUL("## Proactive\n- Wake: yes\n- Read: <#C0EXAMPLE|team>, C0OTHERCHA, not-a-channel\n"));
+    expect(c.wake).toBe(true);
+    expect(c.read).toEqual(["C0EXAMPLE", "C0OTHERCHA"]);
+  });
+  it("are global only: a channel block cannot set them", () => {
+    const c = parseProactive(SOUL("## Channel C0TEAMCHAN\n### Proactive\n- Wake: no\n- Read: C0OTHERCHA\n"));
+    expect(c.wake).toBe(true);
+    expect(c.read).toEqual([]);
+  });
+
+  it("proactiveRead lists only the persona's Read channels", () => {
+    __setProactiveSoulSource(() => SOUL("## Proactive\n- Read: C0OTHERCHA\n"));
+    expect(proactiveRead("default")).toEqual(["C0OTHERCHA"]);
+    __setProactiveSoulSource(null);
+  });
+});
+
+describe("proactiveFor", () => {
+  it("resolves the global switch and a channel override from the persona's soul text", () => {
+    __setProactiveSoulSource(() => SOUL("## Proactive\n- Enabled: no\n- Max per person per day: 2\n\n## Channel C0TEAMCHAN\n### Proactive\n- Enabled: yes\n"));
+    expect(proactiveFor("default").enabled).toBe(false);
+    expect(proactiveFor("default", "C0OTHER").enabled).toBe(false);
+    const ch = proactiveFor("default", "C0TEAMCHAN");
+    expect(ch.enabled).toBe(true);
+    // Enabled: yes alone makes a channel session, which has no per-channel limits.
+    expect(ch.maxPerPersonPerDay).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("passes the persona name to the soul source", () => {
+    const seen: (string | undefined)[] = [];
+    __setProactiveSoulSource((n) => {
+      seen.push(n);
+      return SOUL("## Proactive\n- Enabled: yes\n");
+    });
+    expect(proactiveFor("helper").enabled).toBe(true);
+    expect(seen).toEqual(["helper"]);
+  });
+
+  it("a soul that cannot be read reads as disabled", () => {
+    __setProactiveSoulSource(() => {
+      throw new Error("no soul");
+    });
+    expect(proactiveFor("default", "C0TEAMCHAN")).toEqual({ enabled: false, quietHours: null, maxPerPersonPerDay: 6, cooldownHours: 1, watch: [], highest: "inform" });
+  });
+
+  it("anyEnabled is true when only a channel is on", async () => {
+    const { anyProactiveEnabled } = await import("../../src/soul/proactive");
+    __setProactiveSoulSource(() => SOUL("## Channel C0TEAMCHAN\n### Proactive\n- Enabled: yes\n"));
+    expect(anyProactiveEnabled("default")).toBe(true);
+    __setProactiveSoulSource(() => SOUL(""));
+    expect(anyProactiveEnabled("default")).toBe(false);
+  });
+});
+
+describe("invariant 3: proactiveness is raised only by the SOUL", () => {
+  it("no runtime override field names it", () => {
+    for (const v of [...Object.keys(FIELD_ALIASES), ...Object.values(FIELD_ALIASES)]) expect(v).not.toMatch(/proactive/i);
+  });
+
+  it("the structured soul has no proactive field and the extraction prompt never asks for one", () => {
+    expect(Object.keys(SoulDataSchema.shape).some((k) => /proactive/i.test(k))).toBe(false);
+    expect(EXTRACTION_PROMPT).not.toMatch(/proactive/i);
+  });
+
+  it("an override write for it is refused", async () => {
+    const r = await mutateOverride({ field: "proactive" as never, action: "add", value: "C0TEAMCHAN", by: "U0MANAGER" }, {});
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe("Watch and Highest", () => {
+  it("parse globally; Highest replaces per channel; Watch is global only", () => {
+    const c = parseProactive(
+      "## Proactive\n- Enabled: yes\n- Watch: mail, tracker\n- Highest: ask\n\n## Channel <#C0EXAMPLE>\n### Proactive\n- Enabled: yes\n- Highest: act\n- Watch: other\n",
+    );
+    expect(c.watch).toEqual(["mail", "tracker"]);
+    expect(c.highest).toBe("ask");
+    expect(c.channelHighest).toEqual({ C0EXAMPLE: "act" });
+  });
+
+  it("defaults: no Watch, Highest act; an unknown level keeps the default", () => {
+    expect(parseProactive("## Proactive\n- Enabled: yes\n- Highest: always\n")).toMatchObject({
+      watch: [],
+      highest: "act",
+      channelHighest: {},
+    });
+  });
+
+  it("proactiveFor resolves highest per channel", () => {
+    __setProactiveSoulSource(
+      () => "## Proactive\n- Enabled: yes\n- Watch: mail\n- Highest: ask\n\n## Channel <#C0EXAMPLE>\n### Proactive\n- Highest: act\n",
+    );
+    expect(proactiveFor("default", "C0EXAMPLE").highest).toBe("act");
+    expect(proactiveFor("default", "C0OTHER0").highest).toBe("ask");
+    expect(proactiveFor("default").highest).toBe("ask");
+    expect(proactiveFor("default", "C0EXAMPLE").watch).toEqual(["mail"]);
+  });
+});
+
+describe("parseManager", () => {
+  it("reads the Reporting section only, in either form", () => {
+    expect(parseManager("## Reporting\n- Manager: U0MANAGER\n- Manager handle: @x\n")).toBe("U0MANAGER");
+    expect(parseManager("## Reporting\n- Manager: <@U0MANAGER|x>\n")).toBe("U0MANAGER");
+    expect(parseManager("## Other\n- Manager: U0MANAGER\n")).toBeNull();
+    expect(parseManager("## Reporting\n- Manager: someone\n")).toBeNull();
+  });
+});
+
+describe("parseMandates", () => {
+  const soul = "## Mandate\n- Help.\n- Draft first.\n\n## Proactive\n- Enabled: no\n\n## Channel <#C0HOMECHAN|home>\n\n### Mandate\n- Do the job.\n- Ask first: pay.\n\n### Proactive\n- Enabled: yes\n\n## Channel C0OTHERCHAN\n### Proactive\n- Enabled: yes\n";
+  it("reads the global one and each channel's, and nothing from Proactive", () => {
+    expect(parseMandates(soul)).toEqual({ global: "Help. Draft first.", channels: { C0HOMECHAN: "Do the job. Ask first: pay." } });
+  });
+  it("empty soul: nothing", () => {
+    expect(parseMandates("")).toEqual({ global: "", channels: {} });
+  });
+});
+
+describe("parseScopedMandates", () => {
+  const soul = [
+    "## Mandate", "- Help the team.", "",
+    "## Channel <#C0HOMECHAN|home>", "### Mandate", "Mode: extend", "- Also keep the rota.", "",
+    "## Channel C0OTHERCHAN", "### Mandate", "- **Mode:** reduce", "- No deploys.", "",
+    "## Channel C0PLAINCHAN", "### Mandate", "Just this.", "",
+    "## Scope dm", "### Mandate", "Mode: override", "Be brief.", "",
+    "## Scope public", "### Mandate", "Mode: reduce", "No internals.", "",
+    "## Scope trusted", "### Mandate", "Open up.", "",
+    "## Scope elsewhere", "### Mandate", "Ignored.", "",
+  ].join("\n");
+
+  it("reads each mode line and scope block; the mode line is not mandate text", () => {
+    expect(parseScopedMandates(soul)).toEqual({
+      global: "Help the team.",
+      channels: { C0HOMECHAN: "Also keep the rota.", C0OTHERCHAN: "No deploys.", C0PLAINCHAN: "Just this." },
+      modes: { C0HOMECHAN: "extend", C0OTHERCHAN: "reduce" },
+      unknownModes: [],
+      scopes: [
+        { scope: "dm", mandate: "Be brief.", mode: "override" },
+        { scope: "public", mandate: "No internals.", mode: "reduce" },
+        { scope: "trusted", mandate: "Open up." },
+      ],
+    });
+  });
+
+  it("a Mode line is only read first; a later one stays mandate text", () => {
+    const later = "## Channel C0HOMECHAN\n### Mandate\nDo the job.\nMode: reduce\n";
+    expect(parseScopedMandates(later).modes).toEqual({});
+    expect(parseScopedMandates(later).channels.C0HOMECHAN).toBe("Do the job. Mode: reduce");
+  });
+
+  it("an unknown Mode is extend, dropped from the text and reported", () => {
+    const r = parseScopedMandates("## Channel C0HOMECHAN\n### Mandate\nMode: stack\nDo the job.\n\n## Scope dm\n### Mandate\nMode: narrow\nBe brief.\n");
+    expect(r.modes).toEqual({ C0HOMECHAN: "extend" });
+    expect(r.channels.C0HOMECHAN).toBe("Do the job.");
+    expect(r.scopes).toEqual([{ scope: "dm", mandate: "Be brief.", mode: "extend" }]);
+    expect(r.unknownModes).toEqual(["C0HOMECHAN: stack", "scope:dm: narrow"]);
+  });
+
+  it("a first line that is a sentence starting Mode: stays mandate text", () => {
+    const r = parseScopedMandates("## Channel C0HOMECHAN\n### Mandate\nMode: be terse and helpful\n");
+    expect(r.channels.C0HOMECHAN).toBe("Mode: be terse and helpful");
+    expect(r.unknownModes).toEqual([]);
+  });
+
+  it("a Mode line in the global mandate stays text; it has no boundary", () => {
+    expect(parseScopedMandates("## Mandate\nMode: extend\nHelp.\n").global).toBe("Mode: extend Help.");
+  });
+
+  it("parseMandates keeps its shape for a soul using the new syntax", () => {
+    expect(parseMandates(soul)).toEqual({ global: "Help the team.", channels: { C0HOMECHAN: "Also keep the rota.", C0OTHERCHAN: "No deploys.", C0PLAINCHAN: "Just this." } });
+  });
+});

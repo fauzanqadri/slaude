@@ -46,6 +46,8 @@ const TRUSTED = "C0TRUSTED";
 let liveLock: string | null = null;
 const gateFromClaims = async (c: JobClaims): Promise<GateInput> => ({
   userId: c.initiator || null,
+  teamId: null,
+  interactive: false,
   lockedUser: liveLock,
   channelTrust: c.channel === TRUSTED ? "trusted" : "public",
   isManager: false,
@@ -292,5 +294,16 @@ describe("makeMemoryPlane bounds and identity", () => {
       else process.env.SLAUDE_AGENT_ID = saved;
       resetAgentId();
     }
+  });
+});
+
+describe("sync never stores the thread head, whichever provider the gateway has", () => {
+  const HEAD = "<thread-head>\nEarlier messages.\n<@U0ALICE01> Alice: private chatter\n</thread-head>\n\n";
+  test("a provider that is not the brain's gets the user text without the head", async () => {
+    const seen: Array<{ user: string }> = [];
+    const provider: MemoryProvider = { prefetch: async () => null, syncTurn: async (t) => void seen.push({ user: t.user }) };
+    const { v1 } = setup({ provider });
+    expect(await post(v1, "sync", { user: `${HEAD}<channel>\nhi\n</channel>`, assistant: "ok" })).toEqual({ status: 200, body: { ok: true } });
+    expect(seen).toEqual([{ user: "<channel>\nhi\n</channel>" }]);
   });
 });

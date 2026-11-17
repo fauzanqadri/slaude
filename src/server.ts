@@ -6,7 +6,6 @@ import { createSlackApp } from "./gateway/slack/adapter";
 import { createGateway } from "./gateway/core/gateway";
 import { createHttpSlackTransport } from "./gateway/slack/http-transport";
 import { startHealthServer, deployHandlerForRole, brainImportHandlerForRole } from "./health";
-import { loadSoulData, setSoulData } from "./soul/extract";
 import { assertOAuthKeyCanary } from "./agent/mcp-oauth/store";
 import { sharedLoopback } from "./agent/mcp-oauth/shared-loopback";
 import { verifyState } from "./agent/mcp-oauth/state";
@@ -19,9 +18,10 @@ import { getDb, resolveDbConfig } from "./db/client";
 import { assertGatewayRequirements } from "./config/gateway-requirements";
 import { securitySwitchViolations } from "./config/security-switches";
 import { nodeKeyViolations } from "./gateway/auth/node-credential";
-import { brainEnabled, brainEngineConfig } from "./knowledge/brain";
+import { brainEnabled, brainEngineConfig, closeBrain } from "./knowledge/brain";
 import { brainMode } from "./knowledge/brain-config";
 import * as SoulOverrides from "./db/soul-overrides";
+import { flushAudits } from "./audit/emit";
 import { bootProviderSecretResolver } from "./gateway/core/provider-secrets";
 import { setProviderSecretResolver } from "./gateway/api/tenants";
 
@@ -68,15 +68,6 @@ async function main() {
   const db = await getDb();
   console.log(`[db] ${db.dialect} (${db.driver}) ready`);
   await SoulOverrides.refresh();
-
-  // Warm the structured-soul cache before sessions start. Best-effort: the
-  // extractor falls back to regex parsing internally on any failure, so
-  // boot never blocks on LLM availability.
-  try {
-    setSoulData(await loadSoulData());
-  } catch (e) {
-    console.warn("[slaude] soul prewarm failed (continuing with regex fallback):", e);
-  }
 
   // Load persona registry. A tenant never synced as code reads the filesystem
   // (absent ~/.slaude/personas/ = single-bot mode); a managed one reads its
@@ -156,9 +147,9 @@ async function main() {
         portal: role !== "node" ? (req: Request) => slack.fetchPortal(req) : undefined,
       },
     });
-    slack = createGateway(agent, transport, { mcpConnectEnabled: mcpOAuthHealthy });
+    slack = createGateway(agent, transport, { mcpConnectEnabled: mcpOAuthHealthy, backgroundLearning: true, domainReconcile: true });
   } else {
-    slack = createSlackApp(agent, { mcpConnectEnabled: mcpOAuthHealthy });
+    slack = createSlackApp(agent, { mcpConnectEnabled: mcpOAuthHealthy, backgroundLearning: true, domainReconcile: true });
     health = startHealthServer({
       liveSessions: () => agent.liveCount(),
       v1: role !== "node" ? (req) => slack.fetchV1(req) : undefined,
@@ -194,6 +185,12 @@ async function main() {
     await reaperHandle?.stop();
     await loopback?.stop();
     await slack.stop();
+    // The gateway's stop ends brain work but leaves the engine open; an embedded
+    // brain then keeps its lock and the next boot reports an unclean shutdown.
+    // Audit writes still in flight (decisions made just before the signal): give
+    // them a short bound so a hung database cannot hold the exit.
+    await flushAudits({ timeoutMs: 2_000 }).catch(() => {});
+    await closeBrain().catch((e) => console.error("[slaude] brain close failed:", e));
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

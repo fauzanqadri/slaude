@@ -263,8 +263,8 @@ describe("kbSources (WS-C §4.1)", () => {
   });
 
   test("one version table: the payload needs the highest version of any field a persona sets", () => {
-    expect(PERSONA_FIELD_VERSION).toEqual({ provider: 2, runsOn: 2, kbSources: 3 });
-    expect(SUPPORTED_PAYLOAD_VERSION).toBe(3);
+    expect(PERSONA_FIELD_VERSION).toEqual({ provider: 2, runsOn: 2, kbSources: 3, background: 4, definition: 6 });
+    expect(SUPPORTED_PAYLOAD_VERSION).toBe(7);
     const key = { apiKey: "env://PERSONA_ANA_KEY" };
     expect(payloadVersionFor([])).toBe(1);
     expect(payloadVersionFor([ana])).toBe(1);
@@ -303,5 +303,56 @@ describe("kbSources (WS-C §4.1)", () => {
 
   test("kbSources is a known field, so it is never reported as ignored", () => {
     expect(unknownFieldPaths(withKb(["kb-a"]))).toEqual([]);
+  });
+});
+
+describe("background (budget and timezone)", () => {
+  const withBg = (background: unknown) => base([{ ...ana, background }]);
+  test("accepts a budget and a timezone, either alone, and absent", () => {
+    expect(parsePayload(base([ana])).personas[0]!.background).toBeUndefined();
+    expect(parsePayload(withBg({ budgetUsd: 2.5, timezone: "Europe/Berlin" })).personas[0]!.background).toEqual({ budgetUsd: 2.5, timezone: "Europe/Berlin" });
+    expect(parsePayload(withBg({ budgetUsd: 100 })).personas[0]!.background).toEqual({ budgetUsd: 100 });
+    // 0 disables the persona's background spend (as SLAUDE_BACKGROUND_BUDGET_USD=0 does).
+    expect(parsePayload(withBg({ budgetUsd: 0 })).personas[0]!.background).toEqual({ budgetUsd: 0 });
+    expect(parsePayload(withBg({ timezone: "UTC" })).personas[0]!.background).toEqual({ timezone: "UTC" });
+  });
+  test("rejects a bad timezone, a non-positive or too large budget, and unknown keys", () => {
+    expect(() => parsePayload(withBg({ timezone: "Mars/Olympus" }))).toThrow(/timezone/);
+    expect(() => parsePayload(withBg({ budgetUsd: -1 }))).toThrow(/budgetUsd/);
+    expect(() => parsePayload(withBg({ budgetUsd: 101 }))).toThrow(/budgetUsd/);
+    expect(() => parsePayload(withBg({ budgetUsd: "3" }))).toThrow(/budgetUsd/);
+    expect(() => parsePayload(withBg({ budgets: 3 }))).toThrow(PayloadError);
+  });
+  test("a persona that sets it needs payload version 4; an old payload without it still parses", () => {
+    expect(payloadVersionFor([{ ...ana, background: { budgetUsd: 1 } }])).toBe(4);
+    expect(payloadVersionFor([{ ...ana, kbSources: [] }])).toBe(3);
+    expect(parsePayload({ ...base([ana]), version: 3 }).personas).toHaveLength(1);
+    expect(() => parsePayload({ ...withBg({ budgetUsd: 1 }), version: SUPPORTED_PAYLOAD_VERSION + 1 })).toThrow(/newer/);
+  });
+});
+
+describe("guardrails (payload version 5)", () => {
+  const g = (slug: string) => ({ slug, md: `---\nname: ${slug}\n---\nprose` });
+  test("a non-empty list needs version 5; an empty one needs nothing newer", () => {
+    expect(payloadVersionFor([ana], [g("a")])).toBe(5);
+    expect(payloadVersionFor([ana], [])).toBe(1);
+    expect(payloadVersionFor([{ ...ana, kbSources: [] }], [])).toBe(3);
+    expect(parsePayload({ ...base([ana]), version: 5, guardrails: [g("a")] }).guardrails).toEqual([g("a")]);
+    expect(parsePayload({ ...base([ana]), guardrails: [] }).guardrails).toEqual([]);
+    expect(parsePayload(base([ana])).guardrails).toBeUndefined();
+    expect(() => parsePayload({ ...base([ana]), version: 4, guardrails: [g("a")] })).toThrow(/need payload version 5/);
+  });
+  test("a gateway that knows only version 4 refuses a guardrail payload instead of dropping it", () => {
+    expect(() => parsePayload({ ...base([ana]), version: 5, guardrails: [g("a")] }, { supportedVersion: 4 })).toThrow(/newer than this gateway supports \(4\)/);
+  });
+  test("slugs: valid, not repeated; entries strict and size capped (a reserved name is checked against the stored set by the sync)", () => {
+    const v5 = (guardrails: unknown[]) => ({ ...base([ana]), version: 5, guardrails });
+    expect(() => parsePayload(v5([{ slug: "Bad", md: "x" }]))).toThrow(/guardrail slug/);
+    expect(() => parsePayload(v5([g("new")]))).not.toThrow();
+    expect(() => parsePayload(v5([g("test")]))).not.toThrow();
+    expect(() => parsePayload(v5([g("a"), g("a")]))).toThrow(/duplicate guardrail 'a'/);
+    expect(() => parsePayload(v5([{ ...g("a"), extra: 1 }]))).toThrow(PayloadError);
+    expect(() => parsePayload(v5([{ slug: "a", md: "x".repeat(64 * 1024 + 1) }]))).toThrow(/at most/);
+    expect(unknownFieldPaths(v5([g("a")]))).toEqual([]);
   });
 });

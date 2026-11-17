@@ -1,0 +1,164 @@
+import { beforeEach, describe, expect, test } from "bun:test";
+import { db } from "../../src/db/schema";
+import * as Runs from "../../src/db/background-runs";
+import { canStart, localDay, overAfterStart, overLimit, PASS_FLOOR, PASS_MAX_TURNS, spendLeft, type BudgetConfig, type PassName } from "../../src/background/budget";
+import { metrics } from "../../src/metrics";
+
+const T = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
+const NOW = new Date("2026-10-26T12:00:00Z");
+const CFG: BudgetConfig = { limitUsd: 1, timeZone: "UTC" };
+const DAY = "2026-10-26";
+
+async function ledger(pass: PassName, cost: number, outcome: Runs.RunOutcome) {
+  const id = await Runs.start({ agentId: "a1", pass, scope: "agent", day: DAY });
+  await Runs.finish(id, { tokens: T, costUsd: cost, outcome });
+}
+
+beforeEach(async () => {
+  await db.run("DELETE FROM background_runs");
+});
+
+describe("localDay", () => {
+  test("DST day in Europe/Berlin", () => {
+    expect(localDay(new Date("2026-03-29T00:30:00Z"), "Europe/Berlin")).toBe("2026-03-29");
+    expect(localDay(new Date("2026-03-28T23:30:00Z"), "Europe/Berlin")).toBe("2026-03-29");
+    expect(localDay(new Date("2026-03-28T22:30:00Z"), "Europe/Berlin")).toBe("2026-03-28");
+  });
+  test("UTC is the date part", () => {
+    expect(localDay(new Date("2026-10-26T23:59:59Z"), "UTC")).toBe("2026-10-26");
+  });
+});
+
+describe("canStart", () => {
+  test("floors and caps match the constraints", () => {
+    expect(PASS_FLOOR["nightly-review"]).toBe(0.1);
+    expect(PASS_FLOOR["skill-check"]).toBe(0.02);
+    expect(PASS_MAX_TURNS["nightly-review"]).toBe(20);
+    expect(PASS_MAX_TURNS["skill-review"]).toBe(12);
+  });
+
+  test("nightly refuses at spent 0.95, runs at 0.85 with the floor as estimate", async () => {
+    await ledger("skill-check", 0.95, "ok");
+    expect(await canStart(CFG, "a1", "nightly-review", NOW)).toEqual({ ok: false, reason: "budget" });
+    await db.run("DELETE FROM background_runs");
+    await ledger("skill-check", 0.85, "ok");
+    const r = await canStart(CFG, "a1", "nightly-review", NOW);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.estimate).toBeCloseTo(0.1);
+  });
+
+  test("lastOkCost replaces the floor", async () => {
+    await Runs.finish(await Runs.start({ agentId: "a1", pass: "nightly-review", scope: "agent", day: "2026-10-25" }), {
+      tokens: T,
+      costUsd: 0.4,
+      outcome: "ok",
+    });
+    await ledger("skill-check", 0.7, "ok");
+    expect(await canStart(CFG, "a1", "nightly-review", NOW)).toEqual({ ok: false, reason: "budget" });
+  });
+
+  test("a near-zero last ok run never drops the estimate below the floor", async () => {
+    await Runs.finish(await Runs.start({ agentId: "a1", pass: "nightly-review", scope: "agent", day: "2026-10-25" }), {
+      tokens: T,
+      costUsd: 0.0001,
+      outcome: "ok",
+    });
+    await ledger("skill-check", 0.95, "ok");
+    expect(await canStart(CFG, "a1", "nightly-review", NOW)).toEqual({ ok: false, reason: "budget" });
+    await db.run("DELETE FROM background_runs WHERE pass = 'skill-check'");
+    const r = await canStart(CFG, "a1", "nightly-review", NOW);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.estimate).toBeCloseTo(PASS_FLOOR["nightly-review"]);
+  });
+
+  test("before the nightly ran, lower passes leave room for it", async () => {
+    // 1 - 0.90 - 0.10 = 0 < 0.02 (the brief's 0.85 leaves 0.05, which would pass)
+    await ledger("quiet-moment", 0.9, "ok");
+    expect(await canStart(CFG, "a1", "skill-check", NOW)).toEqual({ ok: false, reason: "budget" });
+    await ledger("nightly-review", 0, "ok");
+    expect((await canStart(CFG, "a1", "skill-check", NOW)).ok).toBe(true);
+  });
+
+  test("a skipped-budget nightly keeps the reserve; stopped-budget lifts it", async () => {
+    await ledger("quiet-moment", 0.9, "ok");
+    await ledger("nightly-review", 0, "skipped-budget");
+    expect((await canStart(CFG, "a1", "skill-check", NOW)).ok).toBe(false);
+    await ledger("nightly-review", 0.05, "stopped-budget");
+    // spent 0.95, remaining 0.05 >= 0.02
+    expect((await canStart(CFG, "a1", "skill-check", NOW)).ok).toBe(true);
+  });
+
+  test("a heartbeat ask/act turn costs like a promise check and waits behind the nightly", async () => {
+    expect(PASS_FLOOR["heartbeat-turn"]).toBe(PASS_FLOOR.commitment);
+    // Spent 0.90: 0.10 left covers 0.03, but not with the nightly's 0.10 reserved, until it ran.
+    await ledger("quiet-moment", 0.9, "ok");
+    expect(await canStart(CFG, "a1", "heartbeat-turn", NOW)).toEqual({ ok: false, reason: "budget" });
+    expect((await canStart(CFG, "a1", "commitment", NOW)).ok).toBe(true);
+    await ledger("nightly-review", 0, "ok");
+    expect((await canStart(CFG, "a1", "heartbeat-turn", NOW)).ok).toBe(true);
+  });
+
+  test("the nightly itself and lessons-upkeep are not held behind the reserve", async () => {
+    await ledger("quiet-moment", 0.85, "ok");
+    expect((await canStart(CFG, "a1", "lessons-upkeep", NOW)).ok).toBe(true);
+  });
+
+  test("a zero limit refuses everything priced", async () => {
+    expect((await canStart({ limitUsd: 0, timeZone: "UTC" }, "a1", "skill-check", NOW)).ok).toBe(false);
+  });
+});
+
+describe("metrics", () => {
+  test("registered with exact names and labels", async () => {
+    const { m } = await import("../../src/metrics");
+    m.backgroundCostUsdTotal.inc({ agent: "a1", pass: "nightly-review" }, 0.5);
+    m.backgroundRunsTotal.inc({ agent: "a1", pass: "nightly-review", outcome: "ok" });
+    const out = metrics.render();
+    expect(out).toContain('slaude_background_cost_usd_total{agent="a1",pass="nightly-review"} 0.5');
+    expect(out).toContain('slaude_background_runs_total{agent="a1",outcome="ok",pass="nightly-review"} 1');
+  });
+});
+
+describe("budget pools", () => {
+  const SPLIT: BudgetConfig = { limitUsd: 1, proactiveLimitUsd: 2, timeZone: "UTC" };
+
+  test("unset: one shared pool, as before", async () => {
+    await ledger("skill-check", 0.95, "ok");
+    expect((await canStart(CFG, "a1", "heartbeat", NOW)).ok).toBe(false);
+    // 0.05 left, less the nightly reserve of 0.1: nothing, never negative.
+    expect(await spendLeft(CFG, "a1", "heartbeat", NOW)).toBe(0);
+  });
+
+  test("set: learning spend does not touch the proactive pool", async () => {
+    await ledger("skill-check", 0.95, "ok");
+    expect((await canStart(SPLIT, "a1", "heartbeat", NOW)).ok).toBe(true);
+    expect(await spendLeft(SPLIT, "a1", "heartbeat-wake", NOW)).toBeCloseTo(2, 9);
+  });
+
+  test("set: proactive spend does not touch the learning pool", async () => {
+    await ledger("heartbeat", 1.5, "ok");
+    expect((await canStart(SPLIT, "a1", "nightly-review", NOW)).ok).toBe(true);
+    expect(await spendLeft(SPLIT, "a1", "skill-check", NOW)).toBeCloseTo(1 - PASS_FLOOR["nightly-review"], 9);
+  });
+
+  test("set: a proactive pass stops at its own limit", async () => {
+    await ledger("heartbeat-wake", 1.98, "ok");
+    expect((await canStart(SPLIT, "a1", "heartbeat", NOW)).ok).toBe(false);
+    await ledger("commitment", 0.1, "ok");
+    expect(await overLimit(SPLIT, "a1", "heartbeat", DAY)).toBe(true);
+    expect(await overLimit(SPLIT, "a1", "skill-check", DAY)).toBe(false);
+  });
+
+  test("set: a proactive pass leaves no nightly reserve; a learning pass still does", async () => {
+    const tight: BudgetConfig = { limitUsd: 0.1, proactiveLimitUsd: 0.05, timeZone: "UTC" };
+    expect((await canStart(tight, "a1", "heartbeat", NOW)).ok).toBe(true);
+    expect((await canStart(tight, "a1", "skill-check", NOW)).ok).toBe(false);
+    expect(await overAfterStart(tight, "a1", "heartbeat", NOW)).toBe(false);
+  });
+
+  test("a wake's estimate is its floor, never its last cost: one costly wake does not block the next", async () => {
+    await ledger("heartbeat-wake", 1.5, "ok");
+    const gate = await canStart(SPLIT, "a1", "heartbeat-wake", NOW);
+    expect(gate).toEqual({ ok: true, estimate: PASS_FLOOR["heartbeat-wake"] });
+  });
+});

@@ -277,6 +277,20 @@ describe("voice turn suppression", () => {
     expect(posted).toEqual(["slack/get_channel_info"]);
   });
 
+  test("pass during a voice turn is forwarded without its reaction", async () => {
+    const sent: Array<{ name: string; args: any }> = [];
+    const client = { postTool: async (_seg: string, name: string, args: any) => { sent.push({ name, args }); return { content: [{ type: "text", text: "passed" }] }; } } as any;
+    const voice = handlers(buildShimServers("sv1", { client, tokenFor: () => "tok", voiceActive: (id) => id === "sv1" }), "slaude_surface");
+    const r = await voice["pass"].handler({ reason: "not for me", react: "eyes" });
+    expect(r.content[0].text).toBe("passed");
+    expect(sent).toEqual([{ name: "pass", args: { reason: "not for me" } }]);
+    // Outside a voice turn the reaction is kept.
+    sent.length = 0;
+    const plain = handlers(buildShimServers("sv2", { client, tokenFor: () => "tok", voiceActive: (id) => id === "sv1" }), "slaude_surface");
+    await plain["pass"].handler({ reason: "not for me", react: "eyes" });
+    expect(sent).toEqual([{ name: "pass", args: { reason: "not for me", react: "eyes" } }]);
+  });
+
   test("other sessions are not suppressed", async () => {
     const posted: string[] = [];
     const servers = buildShimServers("sv2", { client: fake(posted), tokenFor: () => "tok", voiceActive: (id) => id === "sv1" });
@@ -284,3 +298,17 @@ describe("voice turn suppression", () => {
     expect(posted).toEqual(["surface/reply"]);
   });
 });
+
+describe("a tool call and the turn's abort", () => {
+  const registered = (servers: any, name: string) => servers[name].instance._registeredTools;
+
+  test("the call carries the turn's abort signal", async () => {
+    const signals: unknown[] = [];
+    const client = { postTool: async (_s: string, _n: string, _a: any, _t: string, signal?: AbortSignal) => { signals.push(signal); return { content: [{ type: "text", text: "ok" }] }; } } as any;
+    const ac = new AbortController();
+    const servers = buildShimServers("s1", { client, tokenFor: () => "tok", signalFor: (id) => (id === "s1" ? ac.signal : undefined) });
+    await registered(servers, "slaude_surface")["get_history"].handler({});
+    expect(signals).toEqual([ac.signal]);
+  });
+});
+

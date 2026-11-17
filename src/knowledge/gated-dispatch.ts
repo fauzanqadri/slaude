@@ -1,11 +1,53 @@
+import { sameAt, someSameAt } from "../access/wired";
 import type { BrainScope, ChannelTrust } from "./scope";
-import { agentSourceId, userSourceId } from "./scope";
+import type { PersonSlices } from "./scope";
+import { agentSourceId, isProfileSourceId, resolveBrainScope, speakerProfileSource, userSourceId } from "./scope";
 
 export type GateTier = "auto" | "approval" | "manager" | "deny";
 
+/** What started a turn: a human Slack message, an operator in the panel, or
+ *  a cron job. Signed into a node's job token as `origin`. */
+export type TurnOrigin = "cron" | "slack" | "panel";
+export const TURN_ORIGINS: readonly TurnOrigin[] = ["cron", "slack", "panel"];
+
+/** Interactive origin = a person started the turn's job (Slack or panel).
+ *  Cron, and an absent or unknown origin (an older token), read as not
+ *  interactive. Says nothing about synthetic follow-up turns inside the job:
+ *  see GateInput.interactive and AgentManager.isSyntheticTurn. */
+export const isInteractiveOrigin = (origin: unknown): boolean => origin === "slack" || origin === "panel";
+
+/** Who sent one of the running turn's messages (shape of the queue's TurnSender). */
+export interface TurnSender {
+  userId: string;
+  teamId: string | null;
+  origin: string | null;
+}
+
 export interface GateInput {
   userId: string | null;
+  /** Slack team of the turn (keys the speaker's profile source); null = unknown. */
+  teamId: string | null;
+  /** The turn's ORIGIN only: true when a person started the session's job or
+   *  route (a Slack message, or the panel); false for cron and when the origin
+   *  is unknown. Synthetic follow-up turns the runtime injects inside it (the
+   *  auto-evolve check, continuation and reload prompts) still read true here.
+   *  A write that needs the person's own words must ALSO check
+   *  AgentManager.isSyntheticTurn (on mono and nodes alike). */
+  interactive: boolean;
+  /** The turn's origin itself. A profile write needs "slack": a panel turn's
+   *  user id is an operator id, not a Slack id. Absent = unknown (no profile
+   *  writes). */
+  origin?: TurnOrigin;
+  /** Who sent the inputs the running turn holds (mono: every input the CLI
+   *  has outstanding, from the manager's per-input queue; a node: the job's
+   *  merged senders). A profile write needs exactly one, from Slack, and
+   *  writes THAT person's profile: a turn that also holds another person's
+   *  or a cron message is not one person's own turn. Absent = unknown = no
+   *  profile write. */
+  turnSenders?: readonly TurnSender[];
   lockedUser: string | null;
+  /** The workspace the lock was taken in, when known. Read only by the shadow of the identity compare. */
+  lockedTeamId?: string | null;
   channelTrust: ChannelTrust;
   isManager: boolean;
   /** This agent's identity — writes to its own `agent-<id>` slice auto-pass. */
@@ -13,6 +55,8 @@ export interface GateInput {
   /** Stable per-thread key (`channel:threadTs`). Scopes the standing grant —
    *  one approval in a thread auto-passes later non-destructive writes there. */
   threadKey?: string | null;
+  /** The speaker's verified-only person slices, set by the gateway under SLAUDE_PERSON_SLICES=union. Reads only: a write is classified against the writer's own slice and never uses this. */
+  person?: PersonSlices;
 }
 
 const READ_OPS = new Set([
@@ -43,16 +87,34 @@ const MANAGER_OPS = new Set([
   "schema_apply_mutations", "reload_schema_pack", "revert_version", "forget_fact",
 ]);
 
-export function classifyBrainOp(op: string, scope: BrainScope, g: GateInput): GateTier {
+/** The op classes classifyBrainOp reads, as data, for the console's guardrails view. */
+export const BRAIN_OP_CLASSES: Readonly<Record<"read" | "write" | "destructive" | "manager", readonly string[]>> = {
+  read: [...READ_OPS],
+  write: [...WRITE_OPS],
+  destructive: [...DESTRUCTIVE_OPS],
+  manager: [...MANAGER_OPS],
+};
+
+export async function classifyBrainOp(op: string, scope: BrainScope, g: GateInput): Promise<GateTier> {
   if (READ_OPS.has(op)) return "auto";
   if (MANAGER_OPS.has(op)) return "manager";
   if (DESTRUCTIVE_OPS.has(op)) {
     return g.channelTrust === "public" && !g.isManager ? "deny" : "approval";
   }
   if (WRITE_OPS.has(op)) {
+    // A person's profile: only that person, on their own Slack turn (spec
+    // §8.1, invariant 2). Never a background, cron or panel turn, never on
+    // someone else's behalf — manager included.
+    if (isProfileSourceId(scope.sourceId)) return isOwnProfileWrite(scope, g) ? "auto" : "deny";
+    // /1on1 containment (invariant 1): in a locked thread, only the lock
+    // owner's own slice is writable, by the owner. Shared, the agent's slice
+    // and public would carry the thread out without that person's approval.
+    // Checked before the background branch, so no turn in a lock is exempt.
+    if (g.lockedUser !== null) {
+      return g.userId !== null && (await sameAt({ site: "brain_gate.lock_owner", persona: g.agentId, teamId: g.teamId, userId: g.userId, otherUserId: g.lockedUser, otherTeamId: g.lockedTeamId })) && scope.sourceId === userSourceId(g.userId) ? "auto" : "deny";
+    }
     if (g.userId === null) return "auto"; // background turn — agent's own mind
     if (scope.sourceId === agentSourceId(g.agentId)) return "auto"; // agent's own private slice
-    if (g.lockedUser === g.userId && scope.sourceId === userSourceId(g.userId)) return "auto"; // user's own 1on1 slice
     // Everything else is a write to the shared/common KB (explicit target:"shared").
     // Legit to ask approval — including the manager (the standing grant collapses
     // repeat cards per thread). Non-manager in a public channel: denied.
@@ -60,6 +122,42 @@ export function classifyBrainOp(op: string, scope: BrainScope, g: GateInput): Ga
     return "deny";
   }
   return "manager"; // unknown op: fail closed
+}
+
+/**
+ * The one person whose words the running turn holds, from Slack, or null.
+ * This sender, not the live ctx's speaker, is whose profile may be written:
+ * on mono the ctx is whoever spoke last, which need not be the person whose
+ * input the CLI is processing.
+ */
+export function soleSlackSender(g: GateInput): TurnSender | null {
+  const s = g.turnSenders;
+  if (!s || s.length !== 1) return null;
+  return s[0]!.origin === "slack" ? s[0]! : null;
+}
+
+/**
+ * The KB scope a running turn's tools read under: resolveBrainScope, with the
+ * speaker's profile only when the turn's senders are exactly that speaker,
+ * from Slack. On mono the gate's speaker is the live ctx, which the next
+ * delivered message rewrites, so a person posting mid-turn must not make
+ * their profile readable in someone else's turn; and while the senders are
+ * mixed or unknown it is nobody's own turn, so no profile is read at all.
+ */
+export async function turnBrainScope(g: GateInput, kbSources: string[]): Promise<BrainScope> {
+  const sender = soleSlackSender(g);
+  const own = sender !== null && g.userId !== null && (await sameAt({ site: "brain_gate.turn_sender_same", persona: g.agentId, teamId: g.teamId, userId: g.userId, otherUserId: sender.userId, otherTeamId: sender.teamId })) && (sender.teamId ?? null) === g.teamId;
+  return resolveBrainScope({ ...g, teamId: own ? g.teamId : null, kbSources });
+}
+
+/** The write goes to the profile of the turn's sole Slack sender, on a
+ *  Slack-origin interactive turn. */
+function isOwnProfileWrite(scope: BrainScope, g: GateInput): boolean {
+  if (!g.interactive || g.origin !== "slack" || g.userId === null) return false;
+  const sender = soleSlackSender(g);
+  if (!sender) return false;
+  const own = speakerProfileSource(sender.teamId, sender.userId);
+  return own !== null && scope.sourceId === own;
 }
 
 // Field-compatible subset of the Surface ApprovalRequest contract.
@@ -98,7 +196,7 @@ export type GatedResult = { ok: true; result: unknown } | { ok: false; reason: s
 // manager-tier ops are never covered. See docs/findings/2026-06-14-brain-memoize-failure.md.
 // Read per-grant (not at import) so tests/ops can tune the window via env.
 // Explicit 0 disables the standing grant (every write cards); unset/invalid → 8h.
-const grantTtlMs = (): number => {
+export const grantTtlMs = (): number => {
   const n = Number(process.env.SLAUDE_KB_GRANT_TTL_MS);
   return Number.isFinite(n) && n >= 0 ? n : 8 * 60 * 60 * 1000;
 };
@@ -132,7 +230,7 @@ function liveGrant(key: string | null, now: number): boolean {
 }
 
 export async function gatedBrainCall(op: string, d: GatedCallDeps): Promise<GatedResult> {
-  const tier = classifyBrainOp(op, d.scope, d.gate);
+  const tier = await classifyBrainOp(op, d.scope, d.gate);
   if (tier === "deny") {
     return { ok: false, reason: `kb operation "${op}" is not allowed from this channel` };
   }
@@ -154,7 +252,7 @@ export async function gatedBrainCall(op: string, d: GatedCallDeps): Promise<Gate
       category: tier === "manager" ? "kb-admin" : "kb",
     });
     if (!r.approved) return { ok: false, reason: `denied by ${r.by}${r.note ? `: ${r.note}` : ""}` };
-    if (tier === "manager" && !d.managers.includes(r.by)) {
+    if (tier === "manager" && !(await someSameAt(d.managers, (mgr) => ({ site: "brain_gate.manager_approver", persona: d.gate.agentId, teamId: d.gate.teamId, userId: r.by, otherUserId: mgr })))) {
       return { ok: false, reason: `kb operation "${op}" needs manager approval — approved by ${r.by}, who is not the manager` };
     }
     // First approval opens a standing grant scoped to (thread, this writer) —

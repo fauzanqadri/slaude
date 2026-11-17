@@ -33,10 +33,12 @@ const stubTools = {
 /** The audited gate decision per route. A change here is a security decision. */
 const EXPECTED_GATES: Record<string, "label" | "none"> = {
   "node.whoami": "none",
+  "node.plugins": "none",
   sessions: "label",
   "tenants.runtime": "label",
   "tenants.mcp-credentials": "label",
   "tenants.remote-key": "label",
+  "tenants.remote-env": "label",
   "tenants.mcp-credentials.refresh": "label",
   "tenants.personas.runtime": "label",
   pending: "label",
@@ -46,6 +48,9 @@ const EXPECTED_GATES: Record<string, "label" | "none"> = {
   "tools.memory": "label",
   tools: "label",
   "tools.mcpx": "label",
+  "background.skill-check": "label",
+  "background.turn": "label",
+  "background.skill-usage": "label",
 };
 
 /** One concrete request per label-gated route, scoped to the matrix's token. */
@@ -54,6 +59,7 @@ const SAMPLES: Record<string, { method: string; path: string; body?: string }> =
   "tenants.runtime": { method: "GET", path: "/v1/tenants/default/runtime" },
   "tenants.mcp-credentials": { method: "GET", path: "/v1/tenants/default/mcp-credentials" },
   "tenants.remote-key": { method: "GET", path: "/v1/tenants/default/remote-key" },
+  "tenants.remote-env": { method: "GET", path: "/v1/tenants/default/remote-env" },
   "tenants.mcp-credentials.refresh": { method: "POST", path: "/v1/tenants/default/mcp-credentials/refresh", body: "{}" },
   "tenants.personas.runtime": { method: "GET", path: "/v1/tenants/default/personas/default/runtime" },
   pending: { method: "GET", path: "/v1/pending/P-matrix" },
@@ -62,6 +68,9 @@ const SAMPLES: Record<string, { method: string; path: string; body?: string }> =
   "tools.memory": { method: "POST", path: "/v1/tools/memory/prefetch", body: "{}" },
   tools: { method: "POST", path: "/v1/tools/kb/search_kbs", body: JSON.stringify({ query: "x" }) },
   "tools.mcpx": { method: "POST", path: "/v1/tools/mcpx/example/list", body: "{}" },
+  "background.skill-check": { method: "POST", path: "/v1/background/skill-check/start", body: "{}" },
+  "background.turn": { method: "POST", path: "/v1/background/turn/finish", body: "{}" },
+  "background.skill-usage": { method: "POST", path: "/v1/background/skill-usage", body: JSON.stringify({ skill: "greet" }) },
 };
 
 const routes: RouteDef[] = v1Routes({ tools: stubTools }, new InMemoryPendingSource());
@@ -199,7 +208,8 @@ describe("routing is behaviour-identical to the old if-chain", () => {
     if (seg.length === 6 && seg[1] === "tenants" && seg[3] === "personas" && seg[5] === "runtime") {
       return only("GET")("tenants.personas.runtime");
     }
-    if (seg.length === 3 && seg[1] === "pending") return only("GET")("pending");
+    // rc.10 adds DELETE (a node cancels an owner card it stopped waiting on).
+    if (seg.length === 3 && seg[1] === "pending") return only("GET", "DELETE")("pending");
     if (seg.length === 4 && seg[1] === "jobs" && (seg[3] === "ack" || seg[3] === "fail")) return only("POST")("jobs.event");
     if (seg.length === 4 && seg[1] === "jobs" && seg[3] === "token-refresh") return only("POST")("jobs.token-refresh");
     if (seg.length === 4 && seg[1] === "tools") return only("POST")("tools");

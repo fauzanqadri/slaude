@@ -1,7 +1,9 @@
+import { decidePersonSlices, runAsPersonFor } from "../../slices/decide";
 import type { AgentManager, AgentEvent } from "../../agent/manager";
 import { env } from "../../config/env";
 import { m as metric } from "../../metrics";
 import {
+  allowedSkillsOf,
   discoverSkills,
   matchSkillInvocation,
   buildSkillInvocation,
@@ -9,14 +11,37 @@ import {
 import { ReactionTracker } from "../slack/reactions";
 import { Presence } from "../slack/presence";
 import { Status } from "../slack/status";
-import { PermissionGate } from "../slack/permission-gate";
-import { ApprovalGate } from "../slack/approval-gate";
+import { PermissionGate, liveTurnStamp, stampFromSenders } from "../slack/permission-gate";
+import { ApprovalGate, type ApprovalRequest } from "../slack/approval-gate";
 import { IgnoreGate } from "../slack/ignore-gate";
 import { parseSlashCommand, helpText, humanModeName, MODE_LABELS } from "../slack/commands";
 import { soulData, soulDataBase, effectiveSoulForChannel } from "../../soul/extract";
+import { trustSoulFor, approvalTimeoutFor, effectiveSoulForChannelFor, soulDataFor } from "../../soul/per-persona";
+import { observeSlackChannel, observeSlackUser, setLiveWorkspaces } from "../../domain/first-sight";
+import { loadGrants, roleOf } from "../../access/role";
+import type { SiteId } from "../../access/sites";
+import { admitAt, approversAt, listAt, roleAt, sameAt } from "../../access/wired";
+import { indexWritten, runAsOf } from "../../proactive/commitment-index";
+import type { CommitmentRow } from "../../db/commitments";
+import { onProactiveReaction, onProactiveReply, type FeedbackDeps } from "../../proactive/feedback";
+import { proactiveReplyBlock, proactiveWorkBlock } from "../../proactive/reply-context";
+import type { PromiseTransport } from "../../proactive/promises";
+import type { ProactiveTransport } from "../../proactive/dispatch";
+import { channelSessionOn, channelSessionWakes, proactiveFor } from "../../soul/proactive";
+import { aliasesFor, engageFor } from "../engage/setting";
+import { observeEngage, type ImplicitRun } from "../engage/observe";
+import { clearAgentRecord, noteAgentMessage } from "../engage/record";
+import { setLastSpeakerRedis } from "../engage/last-speaker";
+import { engageState, setEngageRedis } from "../engage/budget";
+import { gateClassifier } from "../engage/gate-classifier";
+import { buildImplicitInput } from "../engage/input";
+import { errorCode, loadUserNames } from "../engage/users";
+import type { ShadowDeps } from "../engage/shadow";
+import { ledgerTurnRun, type TurnPass } from "../../background/skill-check";
 import { mutateOverride, FIELD_ALIASES } from "../../soul/overrides";
 import * as SoulOverrides from "../../db/soul-overrides";
 import { quietForVoice, voiceTurns } from "../../voice/turn-flags";
+import { personaAgentId as personaAgentIdFor } from "../../persona/agent-slice";
 import { VoiceCalls } from "../../voice/call";
 import { voiceBundleFromEnv, voiceConfigFromEnv, type VoiceConfig } from "../../voice/config";
 import { drainVoiceCalls, endCallsOnSessionExit, makeMonoVoiceHost, voiceServersFor } from "../../voice/hosts";
@@ -24,12 +49,12 @@ import { drainVoiceCalls, endCallsOnSessionExit, makeMonoVoiceHost, voiceServers
 /** Mono shutdown: how long live voice calls get to say goodbye and end. */
 const VOICE_SHUTDOWN_GRACE_MS = 5_000;
 import { monoPersonaSoul } from "../../voice/mono-soul";
-import { createSlackMcp, SLACK_MCP_NAME, createRuntimeMcp, RUNTIME_MCP_NAME, createConnectMcp, CONNECT_MCP_NAME, type SlackContext, parseDuration } from "../slack/mcp-tools";
+import { createSlackMcp, SLACK_MCP_NAME, createRuntimeMcp, RUNTIME_MCP_NAME, createConnectMcp, CONNECT_MCP_NAME, type SlackContext, parseDuration, isManagerOrApprover } from "../slack/mcp-tools";
 import { makeSlackSurfaceFactory } from "../slack/surface";
+import { setOutboundApprover, type HoldRequest } from "../slack/outbound";
 import { createSurfaceMcp, SURFACE_MCP_NAME } from "./surface-mcp";
 import { humanizeToolStatus, redactSecrets } from "./status-text";
 import * as Remote from "../../db/remote";
-import { handleRemoteCommand, endRemoteForThread, remoteStatusOn } from "./remote-command";
 import { handleSandboxCommand } from "./sandbox-command";
 import { handleParticipantCommand, handleWorkflowCommand, startWorkflow } from "./workflow-command";
 import { StageGate } from "../slack/stage-gate";
@@ -39,16 +64,51 @@ import { createCommitter } from "../../workflow/commit";
 import { createFreshRunner } from "../../workflow/fresh-turn";
 import { sandboxBash } from "../../remote/sandbox-call";
 import type { WorkflowThreadRow } from "../../db/workflow";
+import * as Envs from "../../db/environments";
+import { handleEnvCommand, addEnvironment, useEnvironment, defaultEnvDeps } from "./env-command";
+import type { RemoteTarget } from "../../remote/types";
+
+/** A thread's remote target that runs on a person's own machine (the manager
+ *  filter applies); a sandbox does not. */
+const personalRemote = (t: RemoteTarget | null): boolean => !!t && t.env?.trust !== "provisioned";
+import {
+  ENV_ADD_ACTION,
+  ENV_ADD_VIEW,
+  ENV_KIND_ACTION,
+  ENV_USE_ACTION,
+  decodeEnvOffer,
+  envAddModal,
+  envPickerBlocks,
+  readEnvAddValues,
+} from "./env-form";
+import { getKind } from "../../remote/kinds";
+import {
+  handleRemoteCommand,
+  endRemoteForThread,
+  remoteStatusOn,
+  decodeRemoteOffer,
+  readRemoteConnectValues,
+  remoteConnectModal,
+  remoteOfferBlocks,
+  REMOTE_CONNECT_VIEW,
+  REMOTE_OPEN_ACTION,
+  type RemoteCommandCtx,
+} from "./remote-command";
 import { activeRemoteTarget } from "../../remote/active";
-import { HelperClient } from "../../remote/helper-client";
-import { cleanupCommand } from "../../remote/tools/bash";
+import { sweepIdleSandboxes } from "../../remote/env-runtime";
+import { makeMonoRemoteFactory, monoRemoteResolver, monoSharedBindingGuard } from "../../remote/mono";
+import { turnKindOf } from "../../remote/definitions/decision";
 import type { Surface, SurfaceFactory, SessionBinding } from "./surface";
+import { surfaceOfSession } from "./surface";
 import { createSkillsMcp, SKILLS_MCP_NAME } from "../../skills/mcp-tools";
+import { startSkillVersionReconciler } from "../../skills/versions";
 import { createSessionMcp, SESSION_MCP_NAME } from "../../agent/session-mcp";
 import { createKbMcp, KB_MCP_NAME, type BrainToolDeps } from "../../knowledge/mcp-tools";
 import { createV1Api } from "../api";
 import type { PendingSource } from "../api/pending-source";
-import type { JobClaims } from "../api/auth";
+import { jobLabel, type JobClaims } from "../api/auth";
+import type { ToolPlaneDeps } from "../api/tools/deps";
+import { memoryScopeForClaims } from "../api/memory";
 import { defaultGateBus } from "../../queue/gate-bus";
 import { makeQueueDispatch, type QueueDispatch } from "./dispatch";
 import { createOnceGuard, failureText } from "./failure-codes";
@@ -59,6 +119,7 @@ import { makeRegistry, type Registry } from "../../queue/registry";
 import { makePubSub, type PubSub } from "../../queue/pubsub";
 import { makePanelLock, type PanelLock } from "../../queue/panel-lock";
 import { createPanelApi } from "../panel/api";
+import { dbInventorySources, startPluginInventory } from "./plugin-inventory";
 import { createPortalApi } from "../portal/api";
 import { createDeployApi } from "../deploy/api";
 import { createBrainImportApi } from "../brain-import/api";
@@ -70,30 +131,56 @@ import { accountForSlackUser } from "../../db/accounts";
 import { makeDeferQueue } from "../panel/defer-queue";
 import { suppressibleSurface } from "../panel/suppress";
 import type { DispatchMeta } from "./dispatch";
-import { brainEnabled, ensureSources } from "../../knowledge/brain";
+import { brainCall, brainCallIfOpen, brainEnabled, brainReady, ensureSources } from "../../knowledge/brain";
+import { buildTurnMemoryContext } from "../../memory/turn-context";
 import { brainMode } from "../../knowledge/brain-config";
 import { syncKbWikis } from "../../knowledge/brain-sync";
 import { scheduleNightlyMaintenance } from "../../knowledge/brain-cycle";
 import { trackBrainWork, whileClosing } from "../../knowledge/brain-work";
-import { channelTrustFor, resolveBrainScope } from "../../knowledge/scope";
+import { agentSourceId, channelTrustFor, resolveBrainScope, type ChannelTrust } from "../../knowledge/scope";
+import { gather } from "../../knowledge/gather";
+import { gateKey, gateRunnerFromEnv, type GateConsult, type GateRunner } from "../gate/runner";
+import { buildGateInput, isAgentAuthor, type GateContextDeps } from "../gate/context";
+import type { GateAction, ImplicitLevel, Trust } from "../gate/types";
+import { providerSecretResolver } from "../api/tenants";
+import { parseRef } from "../../secrets";
+import { channelWorkspaceDir, proactiveWorkspaceDir } from "../../agent/workspace-claim";
+import { channelSessionKey, isChannelSessionKey, isRootChannelEvent, neutraliseEnvelopeTags, refusalAtRoot } from "./channel-session";
+import { makeAuthorFilter } from "./author-filter";
+import { buildThreadHead, fetchThreadSlice } from "./thread-head";
+import { isSyntheticThread } from "../../web/shared/surfaces";
+import { PanelChatRefused } from "../panel/api";
+import { wakeGateConfig, WakeTargetBusyError, type WakeRunOptions, type WakeTransport } from "../../proactive/wake";
+import { wakeRefusal } from "../../proactive/wake-guard";
+import { MUST_REPLY_INSTRUCTION, mustReplyEffect } from "../../agent/must-reply";
+import { inboundGuidance, inboundVerdict, installOwnerGuardrails, makeReplyQuiet, type InboundVerdict } from "./owner-guardrails";
+import { auditFiring } from "../../guardrails/audit";
+import { wakeStatusText } from "../../proactive/wake-status";
+import type { WakeToolDeps } from "../../proactive/wake-tools";
 import { agentIdSync, resolveAgentId } from "../../knowledge/agent-identity";
 import { memory as processMemory } from "../../memory";
 import { makeScopedMemory } from "../../memory/scoped";
+import { backgroundAgentId, ledgerSkillCheckBudget, warnUnpricedModels } from "../../background/skill-check";
+import { recordSkillUse } from "../../skills/usage";
 import { scrubChildEnv, withoutKeys } from "../../agent/child-env";
 import { providerSelectingNames } from "../../agent/provider-env";
-import { memoryScopeFor } from "../../memory/scope";
-import { getPersonaRegistry, labelsInUse, livePersona, managedPersonaProvider, onPersonaRegistryInstalled } from "../../persona/registry";
+import { memoryScopeFor, withClaimLock } from "../../memory/scope";
+import { getPersonaRegistry, labelsInUse, livePersona, managedPersonaProvider, onPersonaRegistryInstalled, skillsAllowedFor } from "../../persona/registry";
 import { makeLabelMonitor } from "../../queue/label-status";
-import type { GateInput } from "../../knowledge/gated-dispatch";
+import { isInteractiveOrigin, turnBrainScope, type GateInput } from "../../knowledge/gated-dispatch";
 import { personaKbs, personaKbSourceIds } from "../../knowledge/persona-kb";
 import { resolveUserName } from "../slack/users";
 import { downloadAttachments, type SlackFile } from "../slack/attachments";
 import * as Sessions from "../../db/sessions";
 import * as SeenEvents from "../../db/seen-events";
 import * as PendingGates from "../../db/pending-gates";
+import * as AuditEvents from "../../db/audit-events";
+import { auditExpiredGates, auditGateRow } from "../../audit/emit";
+import { auditIgnore, auditOneOnOne, auditSoulOverride } from "../../audit/events";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import { bridgeExternalMcp, connectableServers, loadExternalMcp, privateOverrides, sessionExternalMcp } from "./external-mcp";
-import { connectText, createMcpBridge, reauthText } from "./mcp-bridge";
+import { connectText, createMcpBridge, reauthText, type McpBridge } from "./mcp-bridge";
+import { createSourceReader, oauthOnlyWatches, unservedWatches } from "../../proactive/source-reader";
 import { parseRunAs } from "../../agent/credential-owner";
 import * as SlackOauthFlows from "../../db/slack-oauth-flows";
 import { randomBytes } from "node:crypto";
@@ -115,6 +202,13 @@ import * as MentionOnly from "../../db/mention-only";
 import * as Sandbox from "../../db/sandbox";
 import { CronScheduler } from "../slack/cron-scheduler";
 import { startCronLeader } from "./cron-leader";
+import { defaultSchedulerDeps, leaderElect, personaManager, startBackgroundScheduler, wakeNow, type SchedulerSlack } from "../../background/scheduler";
+import { budgetConfigFor } from "../../background/config";
+import { cardPoster, registerProposalActions } from "../../background/proposal-cards";
+import { setMergeNoticeSender } from "../../domain/merge-notice";
+import { digestRecipientOf, personaApp } from "../../background/digest";
+import { createSlackNames, type NameContext, type SlackNameClient } from "../panel/slack-names";
+import { createLookupClients, teamLookupToken } from "../panel/lookup-clients";
 import type { LeaderHandle } from "../../queue/locks";
 import { getNextRun } from "../slack/cron-parser";
 import { clientForApp, type AppRef, type Transport } from "./transport";
@@ -142,6 +236,12 @@ export interface GatewayHandle {
   fetchBrainImport?(req: Request): Promise<Response | null>;
   /** Ticket-workflow callbacks from the factory (/workflow/v1). */
   fetchWorkflow?(req: Request): Promise<Response | null>;
+  /** TEST SEAM ONLY. The decision-gate consult, so the implicit path (no call site yet) can be pinned. */
+  __consultGate?(
+    args: any,
+    o: { mentionsAgent: boolean; personaId?: string; continuation?: boolean; implicit?: ImplicitLevel },
+    actual: GateAction,
+  ): Promise<GateConsult | undefined>;
   /** TEST/SIM SEAM ONLY. The pending-gate source behind /v1/pending. */
   __pendingSource(): PendingSource;
   /** TEST/SIM SEAM ONLY. Live per-session MCP contexts built by the resolver.
@@ -152,6 +252,11 @@ export interface GatewayHandle {
    *  Requires the session's route to exist (feed a message first). Production
    *  never calls this. */
   __resolveMcp(sessionId: string): Promise<Record<string, McpServerConfig> | undefined>;
+  /** Test seam: how this gateway delivers promise checks (phase E). */
+  __promises?: PromiseTransport;
+  /** Test seam: how this gateway dispatches heartbeat ask/act turns. */
+  __proactive?: ProactiveTransport;
+  __wake?: WakeTransport;
   /** TEST SEAM: the mono process's voice call registry. */
   __voiceCalls?: VoiceCalls;
   /** TEST/SIM SEAM ONLY. Drive the natural-language connect path (what the
@@ -166,14 +271,77 @@ export interface GatewayHandle {
   /** TEST/SIM SEAM ONLY. Drive the agent-facing sandbox switch
    *  (mcp__slaude_surface__enter_sandbox) for a live session. */
   __agentEnterSandbox(sessionId: string): Promise<string>;
+  /** TEST SEAM ONLY. The brain gate input a mono session's tools see now
+   *  (its route's context); undefined with no route. */
+  __brainGate?(sessionId: string): Promise<GateInput | undefined>;
+  /** TEST SEAM ONLY. The brain gate input a node turn's /v1 tools see for
+   *  these (verified) job-token claims. */
+  __brainGateForClaims?(claims: JobClaims): Promise<GateInput>;
+  /** Test seam: the /v1 tool plane's context for a job token's claims. */
+  __v1SlackCtx?(claims: JobClaims): SlackContext;
+  __postBridgeConnectCard?(claims: JobClaims, server: string, scope: "initiator" | "global", reason: "connect" | "reauth"): Promise<void>;
+  /** TEST SEAM ONLY. Open a node turn's tool permission card, as the /v1
+   *  can_use_tool relay does for these (verified) job-token claims. */
+  __openPermissionForClaims?: ToolPlaneDeps["openPermission"];
+  /** TEST SEAM ONLY. The panel's chat enqueue (what POST /panel chat calls
+   *  after its own auth), without the panel's OIDC. */
+  __panelChat?(session: SessionRow, text: string, operatorId: string): Promise<void>;
 }
 
 const REACT_RECEIVED = "eyes";
 const REACT_WORKING = "gear";
 const REACT_DONE = "white_check_mark";
 const REACT_ERROR = "x";
+/** A mention the decision gate doubts is addressed to the agent: recorded, not run. */
+const REACT_DOUBT = "thinking_face";
+
+/** The brain's channel trust in the envelope's terms (trusted / allowed / restricted). */
+const GATE_TRUST: Record<ChannelTrust, Trust> = { trusted: "trusted", public: "allowed", unknown: "restricted" };
+
+/** An early drop: the slackDropsTotal reason label and the line handleMessage
+ *  logs (null for a silent drop: no line, no metric). */
+type PreTurnDrop = { reason: string; log: string | null; reply?: string };
+
+/** Pages of thread history the decision gate reads at most. */
+const GATE_REPLY_PAGES = 5;
+/** conversations.replies page size for the gate (Slack's recommended maximum),
+ *  independent of how many messages the gate keeps. */
+const GATE_REPLY_PAGE_SIZE = 200;
+
+/**
+ * The decision gate's thread context: the last `limit` messages of the thread
+ * up to and including `latest` (conversations.replies pages oldest-first from
+ * the thread start, so the tail is kept across pages; pages are large so the
+ * page bound reaches the event in all but very long threads). Throws on a failed call;
+ * buildGateInput reads that as no context.
+ */
+async function threadTail(client: any, channel: string, threadTs: string, latest: string, limit: number) {
+  let tail: Array<{ user?: string; bot_id?: string; text?: string; ts: string }> = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < GATE_REPLY_PAGES; page++) {
+    const r = await client.conversations.replies({
+      channel, ts: threadTs, latest, inclusive: true, limit: GATE_REPLY_PAGE_SIZE, ...(cursor ? { cursor } : {}),
+    });
+    if (!r?.ok) throw new Error("conversations.replies failed");
+    const upToEvent = (r.messages ?? []).filter((m: { ts: string }) => Number(m.ts) <= Number(latest));
+    tail = [...tail, ...upToEvent].slice(-limit);
+    cursor = r.response_metadata?.next_cursor || undefined;
+    if (!cursor) break;
+  }
+  return tail;
+}
 
 const STATUS_THINKING = { text: "thinking", emoji: ":thought_balloon:" };
+
+/** How a message is handed to handleMessage. */
+type HandleDispatch = {
+  suppress?: boolean;
+  personaId?: string;
+  engagedBefore?: boolean;
+  channelSession?: boolean;
+  /** Implicit engagement: the message was not an @mention. The first turn says so and the model may pass. */
+  implicit?: boolean;
+};
 
 type SessionRoute = {
   ctx: SlackContext;
@@ -181,6 +349,19 @@ type SessionRoute = {
   surface: Surface;
   /** Whether the agent has emitted user-visible output this turn (surface reply/edit/upload). */
   spoke: boolean;
+  /** The agent ended this turn deliberately without replying (`mcp__slaude_surface__pass`).
+   *  Satisfies the stop guard like `spoke`, but posts nothing. Reset per turn. */
+  passed?: boolean;
+  /** The reaction the pass added (`react`), if any. A passed turn ends without ✅,
+   *  and the received 👀 is kept only when it is this same emoji. Reset per turn. */
+  passReact?: string;
+  /** Whether the thread was engaged before this turn's mention engaged it.
+   *  `false` means the mention engaged it; a turn that then only passes puts it
+   *  back (a passing mention is not an invitation). Undefined when the turn did
+   *  not come from a mention. Set per turn. */
+  engagedBefore?: boolean;
+  /** This turn was started by implicit engagement (no @mention): the Stop guard does not force a reply, so a model that says nothing is a pass. Set per turn. */
+  implicit?: boolean;
   /** Slack message ref for the live todo tracker posted by the TodoWrite interceptor.
    *  Cleared at the start of each new user turn so each request gets a fresh block. */
   todoRef?: string;
@@ -197,6 +378,23 @@ type SessionRoute = {
   /** This turn is a disengaged message recorded into the transcript but suppressed
    *  by the UserPromptSubmit hook (no model run). Skip all Slack-visible feedback. */
   suppress?: boolean;
+  /** People's turns dispatched on this route and not yet ended by done or error.
+   *  A folded or merged input leaves it too high, which only holds recordings back. */
+  personTurns?: number;
+  /** When personTurns last counted a person's turn, to stop trusting a count left high. */
+  personTurnAt?: number;
+  /** A channel session's recording queued behind the turn that is running. */
+  recordingBehind?: boolean;
+  /** A channel session's recording dispatched at idle whose end has not arrived. */
+  recordingAhead?: boolean;
+  /** Set while a channel session's wake runs on this route: it is the wake's
+   *  until the wake's done or error. What arrives meanwhile only queues here and
+   *  applies, in arrival order, when the wake ends (see endChannelWake). */
+  wakeHold?: Array<() => void>;
+  /** The wake's own turn has started: outcomes before this belong to an earlier turn. */
+  wakeStarted?: boolean;
+  /** Ends the wake's hold if its outcome never comes. Cleared with the hold. */
+  wakeHoldTimer?: ReturnType<typeof setTimeout>;
   /** When true, this session was started by a silent cron job — the stop guard
    *  must not force a reply (the job ran without intending to post to Slack). */
   silent?: boolean;
@@ -206,6 +404,9 @@ type SessionRoute = {
 };
 
 export interface GatewayOptions {
+  /** How a token becomes a Slack client for read-only lookups (names, the thread head). Defaults to a real
+   *  no-retry WebClient; a test supplies a fake so nothing depends on an ambient token or the network. */
+  lookupClientFactory?: import("../panel/lookup-clients").LookupClientFactory;
   /** Override how a Surface is built per session. Defaults to a SlackSurface over the
    *  transport client — the extension seam for future surfaces. */
   surfaceFactory?: SurfaceFactory;
@@ -257,6 +458,18 @@ export interface GatewayOptions {
    *  node. Tests inject one over their key prefix; explicit null forces the
    *  panel off regardless of env. */
   panel?: PanelInfra | null;
+  /** Decision gate (phase B). Default: the runner gateRunnerFromEnv resolves
+   *  to at boot (SLAUDE_DECISION_CONFIG), treated as off until it does. */
+  gateRunner?: GateRunner;
+  /** Test seam: what `/heartbeat now` runs. Default: wakeNow. */
+  __wakeNow?: typeof wakeNow;
+  /** Start the background learning scheduler (nightly review, lessons upkeep;
+   *  phase D): leader-elected in the gateway role, directly in mono, never on a
+   *  node, and only with the brain enabled. Default false, so no test starts it
+   *  by building a gateway; server.ts turns it on. */
+  backgroundLearning?: boolean;
+  /** Run the domain-record reconciler once Slack auth is known (server.ts sets it; tests do not). */
+  domainReconcile?: boolean;
 }
 
 /** Redis-backed primitives the control panel needs — injected together so a
@@ -295,31 +508,89 @@ export function bindingFor(ctx: SlackContext): SessionBinding {
     // Channel-target crons must post at channel root, not threaded under the
     // originating thread. The surface binding is the single seam every post
     // tool (reply/upload/getHistory) reads, so drop the thread ref here when
-    // the context is channel-targeted. postTarget is only set for crons; normal
-    // inbound sessions leave it unset and keep their thread.
+    // the context is channel-targeted. postTarget is only set for crons and a
+    // channel session's root turns; other sessions leave it unset and keep their thread.
     get threadRef() { return ctx.postTarget === "channel" ? undefined : ctx.threadTs; },
     get inboundRef() { return ctx.inboundTs; },
     get userId() { return ctx.userId; },
+    get replyTo() { return ctx.origin === "slack" ? ctx.answers : undefined; },
     get teamId() { return ctx.teamId; },
     requestApproval: (r) => ctx.requestApproval!(r),
     reloadSession: (prompt?) => ctx.reloadSession?.(prompt) ?? false,
+    get sessionId() { return ctx.sessionId ?? ctx.turnSessionId; },
+    // A wake's turn has nobody to approve a held reply.
+    get unattended() { return !!ctx.wake || ctx.unattended === true; },
+    get appId() { return ctx.apiAppId; },
+    get turnSignal() { return ctx.turnSignal?.(); },
+    get turnDeadline() { return ctx.turnDeadline; },
+    // The session row's folder (on a node-claimed session too: the gateway made the row and a node
+    // only reads it), so an upload is confined to it. No session id or no row: undefined, which refuses.
+    workingDir: async () => {
+      const id = ctx.sessionId ?? ctx.turnSessionId;
+      return id ? (await Sessions.findById(id))?.working_dir : undefined;
+    },
   };
+}
+
+/** One more person's turn on the route; a recording that came first no longer runs behind nothing. */
+function countTurn(route: SessionRoute | undefined): void {
+  if (!route) return;
+  route.personTurns = (route.personTurns ?? 0) + 1;
+  route.personTurnAt = Date.now();
+  route.recordingBehind = undefined;
+}
+
+/** Closes one turn on the route at its done or error, saying what ended. */
+function settleTurn(route: SessionRoute): { ownRecording: boolean; hadTurn: boolean; recordingNext: boolean } {
+  if (route.recordingAhead) {
+    route.recordingAhead = undefined;
+    return { ownRecording: true, hadTurn: false, recordingNext: false };
+  }
+  const hadTurn = (route.personTurns ?? 0) > 0;
+  route.personTurns = Math.max(0, (route.personTurns ?? 0) - 1);
+  const recordingNext = route.personTurns === 0 && route.recordingBehind === true;
+  if (recordingNext) route.recordingBehind = undefined;
+  return { ownRecording: false, hadTurn, recordingNext };
 }
 
 /** Dispatch meta for an operator-panel turn: the session row is the only
  *  source, including the Slack app its thread arrives through (D1.2). */
 export function panelDispatchMeta(session: SessionRow, operatorId: string, eventTs: string): DispatchMeta {
   const personaId = session.persona_id && session.persona_id !== "default" ? session.persona_id : undefined;
+  // A channel session's key, live or archived, is not a Slack ts: its console
+  // turns have no thread and post at root (the token's thread claim stays empty).
+  const channelSession = isChannelSessionKey(session.slack_thread_ts) || (session.slack_thread_ts ?? "").startsWith("channel-archived:");
   return {
     teamId: session.slack_team_id ?? "",
     channelId: session.slack_channel_id ?? "",
-    threadTs: session.slack_thread_ts ?? "",
+    threadTs: channelSession ? "" : (session.slack_thread_ts ?? ""),
     eventTs,
     userId: operatorId,
     personaId,
     ...(session.slack_app_id ? { apiAppId: session.slack_app_id } : {}),
+    origin: "panel",
+    ...(channelSession ? { postTarget: "channel" as const, channelSession: true } : {}),
   };
 }
+
+/** A cron run's dispatch: it runs as the job's creator, under its app, and is
+ *  never interactive (origin "cron"), so it can never write a profile. */
+export function cronDispatchMeta(job: CronJobs.CronJob, threadTs: string, eventTs: string): DispatchMeta {
+  return {
+    teamId: job.slackTeamId!,
+    channelId: job.slackChannelId!,
+    threadTs,
+    eventTs,
+    userId: job.createdBy,
+    personaId: job.personaId !== "default" ? job.personaId : undefined,
+    ...(job.slackAppId ? { apiAppId: job.slackAppId } : {}),
+    origin: "cron",
+    // A job created inside a /1on1 runs as its lock owner wherever it lands.
+    ...(job.oauthUser ? { oauthUser: job.oauthUser } : {}),
+  };
+}
+
+const HEARTBEAT_NOW_WHERE = "`/heartbeat now` runs a channel's wake. It works at the root of a channel where this agent's Proactive is on: mention me there, not in a thread or a DM.";
 
 export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOptions = {}): GatewayHandle {
 
@@ -472,6 +743,42 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       .catch((e) => console.error("[panel] hold subscribe failed:", e));
   }
 
+  // The console's live tail reads events:<session>. On nodes the worker
+  // appends every agent event there; in mono nothing did, so the console
+  // showed no activity. Mono appends its own agent's events here.
+  if (panelInfra && !queueDispatch) {
+    const pubsub = panelInfra.pubsub;
+    agent.on("event", (e: AgentEvent) => {
+      if (voiceTurns.active(e.sessionId)) return;
+      void pubsub.appendEvent(e.sessionId, e).catch(() => {});
+    });
+  }
+
+  /**
+   * Show a Slack message delivered to a session on the console's live tail.
+   * Display only: it goes to the event stream, never to the agent's input
+   * (the model gets the message through its turn).
+   *
+   * /1on1 asymmetry, on purpose: the live tail shows a locked thread's
+   * messages like any other (the agent's own events on that stream already
+   * show the conversation to operators watching it), while the console's
+   * history reads only the agent's own slice, so a /1on1 turn recorded in
+   * the person's slice never appears there.
+   */
+  function streamUserMessage(sessionId: string, m: { userId: string; userName?: string; text: string }): void {
+    if (!panelInfra) return;
+    const event = {
+      type: "userMessage" as const,
+      sessionId,
+      userId: m.userId,
+      ...(m.userName ? { userName: redactSecrets(m.userName) } : {}),
+      text: redactSecrets(m.text),
+      at: Date.now(),
+      surface: surfaceOfSession(),
+    };
+    void panelInfra.pubsub.appendEvent(sessionId, event).catch(() => {});
+  }
+
   // Sweeper: drain-driven off the deferred queue, not a local held map — so a
   // TTL-expiry (or a release we missed the broadcast for) still resumes on
   // whichever replica is holding the deferred messages. For each session with
@@ -546,6 +853,68 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     if (!personaId || personaId === "default") return defaultOutClient(app);
     return livePersona(personaId)?.outClient ?? defaultOutClient(app);
   };
+  // The persona an app is registered for (`slack-app add --persona`, `slack_apps.persona_id`). What is addressed to the
+  // app's own bot (a DM, an @mention of it, a reply in a thread it is engaged in) runs as that persona, so a second
+  // Slack app is a second persona on the same gateway and nodes, posting through its own bot. 'default' (what a
+  // registration gets without `--persona`), a persona that is not live, and a transport that carries no per-app
+  // persona all give undefined: the default persona, exactly as before.
+  const warnedAppPersona = new Set<string>();
+  // The client the console's name lookups use: a dedicated lookup client (no
+  // retries, rate limits rejected; never the posting client) for the bot of the
+  // app the row was recorded with, else the persona's latest app, else the
+  // deployment's own bot.
+  const lookupClients = createLookupClients(opts.lookupClientFactory);
+  const panelNameClient = async (ctx: NameContext): Promise<SlackNameClient | null> => {
+    const persona = ctx.persona && ctx.persona !== "default" ? ctx.persona : undefined;
+    const tokenFor = (app: AppRef): string | undefined => {
+      try {
+        return t.botTokenFor?.(app);
+      } catch {
+        return undefined;
+      }
+    };
+    let token = ctx.appId ? tokenFor({ apiAppId: ctx.appId, ...(ctx.teamId ? { teamId: ctx.teamId } : {}) }) : undefined;
+    if (!token) {
+      const app = await personaApp(persona ?? "default").catch(() => undefined);
+      if (app) token = tokenFor(app);
+    }
+    if (!token && !persona) {
+      token = tokenFor(ctx.teamId ? { teamId: ctx.teamId } : {});
+      // The team alone is ambiguous with several apps in it (one per persona),
+      // and the default agent may have no thread to name its app: any app of
+      // that workspace can say the workspace's and a person's name.
+      if (!token && ctx.teamId) token = await teamLookupToken(ctx.teamId, t.apps ? () => t.apps!() : undefined, tokenFor);
+      if (!token) {
+        try {
+          token = env.slack.botToken();
+        } catch {
+          token = undefined;
+        }
+      }
+    }
+    return lookupClients.forToken(token);
+  };
+  const appPersonaOf = (args: any): string | undefined => {
+    const id: unknown = args?.context?.personaId;
+    if (typeof id !== "string" || !id || id === "default") return undefined;
+    if (getPersonaRegistry().lookupByName(id)) return id;
+    const key = `${args?.context?.apiAppId ?? "-"}:${id}`;
+    if (!warnedAppPersona.has(key)) {
+      warnedAppPersona.add(key);
+      console.warn(`[persona] app ${args?.context?.apiAppId ?? "-"} is registered for persona=${id}, which is not live: its messages run as the default persona`);
+    }
+    return undefined;
+  };
+  /** Whether the user is a manager of the persona (roleOf; persona NAME, absent = default). */
+  const isManagerOf = async (personaName: string | null | undefined, userId: string | null | undefined, teamId?: string | null): Promise<boolean> =>
+    !!userId && (await roleOf(personaName, userId, undefined, teamId)) === "manager";
+  /**
+   * isManagerOf through the decision seam: the same legacy answer (the persona's
+   * grants, `roleFromGrants`), with the internal-id answer shadowed in the
+   * background under `site`. The value returned never depends on the shadow.
+   */
+  const managerAt = async (site: SiteId, personaName: string | null | undefined, userId: string | null | undefined, teamId: string | null | undefined): Promise<boolean> =>
+    !!userId && (await roleAt({ site, persona: personaName, teamId, userId, grants: await loadGrants(personaName) })) === "manager";
   // Surfaces resolve their client on every call, so a sync that rotates,
   // removes or re-points a persona's userToken reaches surfaces built before
   // it, including the one the in-process surface MCP of a warm session holds
@@ -554,14 +923,14 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   const surfaceFactoryFor = (personaId?: string, app?: AppRef): SurfaceFactory => {
     if (opts.surfaceFactory) return opts.surfaceFactory;
     const named = personaId && personaId !== "default" ? personaId : undefined;
-    return makeSlackSurfaceFactory(() => outClientForPersona(named, app));
+    return makeSlackSurfaceFactory(() => outClientForPersona(named, app), named);
   };
   // A session's surface follows its context: the persona's current client, as
   // the app the context currently names.
   const surfaceForCtx = (ctx: SlackContext): Surface =>
     opts.surfaceFactory
       ? opts.surfaceFactory(bindingFor(ctx))
-      : makeSlackSurfaceFactory(() => outClientForPersona(ctx.personaId, appOf(ctx)))(bindingFor(ctx));
+      : makeSlackSurfaceFactory(() => outClientForPersona(ctx.personaId, appOf(ctx)), ctx.personaId)(bindingFor(ctx));
 
   // Resolve per-session client: persona xoxp when available, bot token as fallback.
   // routes Map is populated lazily (after this line), but the resolver is called
@@ -575,20 +944,116 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const route = routes.get(sessionId);
     return botClientFor(route ? appOf(route.ctx) : undefined);
   });
-  const permissions = new PermissionGate(t);
+  // A prompt's initiator comes from the senders of the inputs the session is
+  // processing, never from the route ctx (every delivered message rewrites
+  // its userId and origin, so a bystander posting mid-turn would be stamped).
+  const permissions = new PermissionGate(t, {
+    turnOf: (sessionId) => liveTurnStamp(agent, sessionId, routes.get(sessionId)?.ctx.origin),
+  });
   const stageGate = new StageGate(t);
   const approvals = new ApprovalGate(t, env.slack.approvers(), {
-    timeoutSeconds: () => soulData().approvalTimeoutSeconds || 300,
+    // The agent's own soul timeout, else the default persona's, else 5 minutes.
+    timeoutSeconds: (persona) => approvalTimeoutFor(persona) || 300,
   });
+  // A reply an owner guardrail holds goes to the agent's approvers on the
+  // ApprovalGate's card, in the session's thread; the held text goes to each
+  // approver privately, never into the thread.
+  const heldRequest = (req: HoldRequest): ApprovalRequest => ({
+    channel: req.channel,
+    threadTs: req.threadTs ?? "",
+    summary: req.summary,
+    ...(req.sessionId ? { sessionId: req.sessionId } : {}),
+    ...(req.app ? { app: req.app } : {}),
+    persona: req.persona,
+    privateDetail: req.detail,
+    timeoutSeconds: req.timeoutSeconds,
+  });
+  setOutboundApprover({
+    approvers: (req) => approvals.approversFor(heldRequest(req)),
+    // The turn's abort cancels the card.
+    ask: (req) => approvals.request(heldRequest(req), req.signal),
+  });
+  // Background-learning messages (phase D): the weekly digest to the manager
+  // and a person's proposals to their DM. Both carry buttons, so they go out
+  // as the bot of the app (interactivity-bound, like the gates); chat:write
+  // with im:write lets a bot post to a user id, which opens its DM.
+  const backgroundManagers = (): string[] =>
+    // Shadowed (slice C task 18) against the default persona's grants; no workspace here, so counted no_team.
+    // The call is not awaited: with no workspace the answer is the soul's in every mode.
+    {
+      const legacy = [soulData().manager.userId, soulData().backupManager.userId].filter((u): u is string => !!u);
+      void listAt({ site: "gateway.background_managers", persona: "default", teamId: null, roles: ["manager"], grants: () => loadGrants("default"), legacy });
+      return legacy;
+    };
+  /** The persona's servers as the MCP bridge serves them (bridgeExternalMcp:
+   *  the managed persona's config; files only with the operator's opt-in). */
+  const bridgeServers = (claims: JobClaims) =>
+    bridgeExternalMcp(claims.persona && claims.persona !== "default" ? claims.persona : undefined, { label: jobLabel(claims) });
+  /** Boot warning: a watched server a session mounts but the bridge does not
+   *  serve (a file-configured server without the opt-in) is never read. */
+  const warnUnservedWatches = (): void => {
+    const personas = ["default", ...getPersonaRegistry().list().map((p) => p.name)];
+    for (const p of new Set(personas)) {
+      try {
+        const watch = proactiveFor(p).watch;
+        if (!watch.length) continue;
+        const named = p === "default" ? undefined : p;
+        for (const name of unservedWatches(watch, sessionExternalMcp(named, loadExternalMcp()), bridgeExternalMcp(named))) {
+          console.warn(
+            `[proactive] persona=${p} watch "${name}": the MCP bridge does not serve it, so the heartbeat cannot read it; a file-configured server needs SLAUDE_MCP_BRIDGE_ALLOW_FILE_CONFIG=1`,
+          );
+        }
+        // Mono: /mcp global connect writes the agent's OAuth grant into the
+        // CLI's own store, which the bridge neither reads nor may refresh (the
+        // CLI rotates it), so a server with no config headers is not readable.
+        if (env.role() === "mono") {
+          for (const name of oauthOnlyWatches(watch, bridgeExternalMcp(named))) {
+            console.warn(
+              `[proactive] persona=${p} watch "${name}": it has no config headers, so the heartbeat would need the agent's OAuth connection, which on mono lives in the agent CLI's own store and is not used; the source is skipped when it asks for auth`,
+            );
+          }
+        }
+      } catch (e) {
+        console.warn(`[proactive] persona=${p}: could not check watched sources: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  };
+  const backgroundSlack: SchedulerSlack = {
+    // As the bot of the app the message names; on a multi-app transport a
+    // post that does not name both app id and team is refused (cardPoster).
+    post: cardPoster(t),
+    // Mono keeps the agent's OAuth grants in the CLI's own store (persistTokens).
+    ...(env.role() === "mono" ? { agentOAuthInCli: true } : {}),
+    managers: backgroundManagers,
+    digestRecipient: () => digestRecipientOf(soulData()),
+  };
+  // The notice a user merge sends (slice C task 27) goes out through the same runtime DM path as a card:
+  // the bot of the workspace's Slack app. A node never sends; the gateway that committed the merge does.
+  const unsetMergeNoticeSender = env.role() === "node" ? () => {} : setMergeNoticeSender({ post: cardPoster(t), ...(t.apps ? { apps: () => t.apps!() } : {}) });
+  // A proposal is decided by the managers of the persona that owns it (roleOf "manager").
+  const proposalManagers = async (personaName: string, teamId?: string): Promise<string[]> =>
+    (await approversAt({ site: "gateway.proposal_managers", persona: personaName, teamId, grants: await loadGrants(personaName), roles: ["manager"] }));
+  registerProposalActions(t, { managers: proposalManagers, call: brainCall, now: () => new Date(), ready: brainReady });
   const ignoreGate = new IgnoreGate();
   // Boot sweep: auto-expire pending gates whose deadline passed while no
   // process was alive (a restart killed their auto-deny timers). Rows with no
   // deadline stay; a later click on one settles it as cancelled.
+  // Expiry audit ownership: a row is expired by exactly one guarded UPDATE.
+  // Rows this sweep (or the recurring one below) wins are audited here; rows an
+  // in-process auto-deny timer wins are audited by that timer (approval-gate).
   void PendingGates.sweepExpired()
     .then((rows) => {
       for (const r of rows) console.log(`[gates] expired orphaned ${r.kind} gate ${r.id} (session ${r.sessionId})`);
+      auditExpiredGates(rows);
     })
     .catch((e) => console.error("[gates] boot sweep failed:", e));
+  // The skill version log: reconcile now, then on a timer. Best effort, never blocks boot.
+  const stopSkillVersionReconciler = startSkillVersionReconciler();
+  // Domain sessions, slice D: the periodic boundary fill, started once Slack auth knows the workspaces.
+  let boundaryFillStopped = false;
+  let stopBoundaryFill: () => Promise<void> = async () => {
+    boundaryFillStopped = true; // a shutdown before Slack auth finished: start nothing afterwards
+  };
   // Clean up expired ignores + abandoned paste-back OAuth flows every 5 minutes.
   // Each parked flow holds the registered client secret and the PKCE verifier
   // (encrypted), so an abandoned one must not linger until the initiator happens
@@ -598,11 +1063,46 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     // Overdue gates (live auto-deny timers normally win; this catches strays)
     // + settled gate rows past the 24h audit horizon + stale dedup rows on
     // quiet deployments where the inbound-path purge never fires.
-    void PendingGates.sweepExpired().catch(() => {});
+    void PendingGates.sweepExpired().then(auditExpiredGates).catch(() => {});
     void PendingGates.purgeSettledOlderThan().catch(() => {});
+    // Audit rows are the durable record; kept SLAUDE_AUDIT_RETENTION_DAYS.
+    void AuditEvents.purgeOlderThan(env.auditRetentionDays() * 86_400_000).catch(() => {});
     void SeenEvents.purgeOlderThan().catch(() => {});
     void SlackOauthFlows.sweepExpiredFlows().catch(() => {});
+    // Idle sandboxes (provisioned environments) are torn down and restart on
+    // the thread's next message. Safe on every replica: each teardown is claimed.
+    // Mono reboots the warm session now; a split deploy reboots through the
+    // fingerprint once the next dispatch provisions a new sandbox.
+    if (env.remote.enabled()) {
+      void sweepIdleSandboxes(undefined, (ch, ts) => {
+        if (queueDispatch) return;
+        for (const [sid, r] of routes) if (r.ctx.channel === ch && (r.ctx.threadTs ?? r.ctx.inboundTs) === ts) agent.reload(sid);
+      }).catch((e) => console.error("[env] idle sweep failed:", e));
+    }
   }, 5 * 60 * 1000);
+
+  // Mono turn senders (phase C, invariant 2): the route's ctx is rewritten
+  // by every delivered message, so a profile write reads who sent the inputs
+  // the session's CLI is processing from the manager's own per-input queue
+  // (AgentManager.turnSenders; the Slack and panel paths hand each message's
+  // sender to sendMessage). Bound on every route ctx; declared before the
+  // cron scheduler, whose routes bind it too (cron inputs carry no sender).
+  const noteTurnSender = (sessionId: string, ctx: SlackContext): void => {
+    ctx.turnSenders ??= () => (typeof agent.turnSenders === "function" ? agent.turnSenders(sessionId) : null);
+    ctx.turnTexts ??= () => (typeof agent.turnTexts === "function" ? agent.turnTexts(sessionId) : null);
+    // Held replies: the session to audit and the turn's abort (mono).
+    ctx.turnSessionId ??= sessionId;
+    ctx.turnSignal ??= () => (typeof agent.sessionSignal === "function" ? agent.sessionSignal(sessionId) : undefined);
+  };
+
+  // A turn that starts anywhere but a person's Slack message (a cron run, a wake or heartbeat turn, the
+  // panel) is a first real turn too: it spends the session's thread head marker, so a human reply that
+  // comes later is not given a head in the middle of a conversation the agent already had. Best effort.
+  const spendThreadHead = (sessionId: string): Promise<void> =>
+    Sessions.claimThreadHead(sessionId).then(
+      () => {},
+      (e) => console.warn(`[thread-head] could not spend the marker session=${sessionId}: ${e instanceof Error ? e.message : typeof e}`),
+    );
 
   const cronScheduler = new CronScheduler({
     agent,
@@ -612,17 +1112,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     ...(queueDispatch
       ? {
           send: async ({ session, envelope, job, threadTs }) => {
-            await queueDispatch.dispatch(session, envelope, {
-              teamId: job.slackTeamId!,
-              channelId: job.slackChannelId!,
-              threadTs,
-              eventTs: String(Date.now() / 1000),
-              userId: job.createdBy,
-              personaId: job.personaId !== "default" ? job.personaId : undefined,
-              ...(job.slackAppId ? { apiAppId: job.slackAppId } : {}),
-              // A job created inside a /1on1 runs as its lock owner wherever it lands.
-              ...(job.oauthUser ? { oauthUser: job.oauthUser } : {}),
-            });
+            await queueDispatch.dispatch(session, envelope, cronDispatchMeta(job, threadTs, String(Date.now() / 1000)));
           },
           // when_active=skip asks whether a turn is already running. Under the
           // split that happens on a node, so the gateway's own agent knows
@@ -633,6 +1123,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         }
       : {}),
     onExecute: (job, sessionId) => {
+      void spendThreadHead(sessionId);
       // Register a route so cron sessions get Slack MCP tools + event handling.
       const jobPersonaId = job.personaId !== "default" ? job.personaId : undefined;
       // The app the job was created under: it posts as that app after a
@@ -649,6 +1140,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         teamId: job.slackTeamId ?? undefined,
         postTarget: job.target,
         personaId: jobPersonaId,
+        origin: "cron",
       };
       ctx.requestApproval = (req) =>
         approvals.request({
@@ -657,30 +1149,255 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           sessionId,
           app: jobApp,
           ...req,
+          persona: ctx.personaId,
         });
       ctx.reloadSession = (prompt?) => agent.reload(sessionId, prompt);
+      noteTurnSender(sessionId, ctx);
       routes.set(sessionId, { ctx, surface: wrapSurface(surfaceForCtx(ctx), sessionId), spoke: false, silent: true });
     },
   });
-  agent.setPermissionResolver(permissions.resolver);
+  /** Nobody is in a wake's turn to click a card: refused at once rather than left waiting. */
+  const refuseApprovalInWake: NonNullable<SlackContext["requestApproval"]> = async () => {
+    throw new Error("approval is not available when you woke on your own; propose it with proactive_post at level ask");
+  };
+  /** A wake's post's thread, ready for a human reply: engaged, its app stamped, a channel post's in the proactive folder. */
+  const bindWakePostThread: WakeToolDeps["bindThread"] = async (post, personaId) => {
+    if (!post.messageTs || !post.teamId) return;
+    const persona = personaId && personaId !== "default" ? personaId : "default";
+    const session = await agent.ensureSession(
+      { team_id: post.teamId, channel_id: post.channelId, thread_ts: post.messageTs, persona_id: persona },
+      post.audience === "channel" ? { workingDir: channelSessionOn(persona, post.channelId) ? channelWorkspaceDir(post.agentId, post.channelId) : proactiveWorkspaceDir(post.agentId) } : {},
+    );
+    await Sessions.setEngaged(session.id, true);
+    if (!session.slack_app_id && post.appId) await Sessions.setSlackApp(session.id, post.appId);
+  };
+  const wakeToolDeps: WakeToolDeps = {
+    post: backgroundSlack.post,
+    call: brainCall,
+    managerId: personaManager,
+    agentId: backgroundAgentId,
+    timeZone: (personaId) => budgetConfigFor(personaId).timeZone,
+    bindThread: bindWakePostThread,
+    gate: wakeGateConfig,
+    now: () => new Date(),
+  };
+  /**
+   * One background turn into a thread through the cron path (promise checks,
+   * heartbeat ask/act): the thread's session, a route bound like a cron run's
+   * (origin cron, silent), then the queue in the gateway role or this
+   * process in mono, carrying the open ledger run its own usage closes. Whom
+   * the turn runs as is the thread's own /1on1 lock, never a carried identity;
+   * callers check that the lock is what they expect. `userId` is the ctx's
+   * and the job's initiator; `engage` marks the thread engaged so a later
+   * human reply continues it; `sharedFolder` (a heartbeat channel post's
+   * thread only) creates its session in the agent's proactive folder.
+   */
+  const dispatchThreadTurn = async (
+    target: { teamId: string; channelId: string; threadTs: string; personaId: string | undefined; userId: string; engage?: boolean; appId?: string | null; sharedFolder?: boolean; wake?: WakeRunOptions; channelSession?: boolean },
+    envelope: string,
+    run: { runId: string; agentId: string },
+    pass: TurnPass,
+  ): Promise<void> => {
+    const { teamId, channelId, threadTs, userId } = target;
+    const persona = target.personaId;
+    const session = await agent.ensureSession(
+      { team_id: teamId, channel_id: channelId, thread_ts: threadTs, persona_id: persona ?? "default" },
+      target.channelSession ? { workingDir: channelWorkspaceDir(run.agentId, channelId) } : target.sharedFolder ? { workingDir: proactiveWorkspaceDir(run.agentId) } : {},
+    );
+    await spendThreadHead(session.id);
+    if (target.engage) await Sessions.setEngaged(session.id, true);
+    // A thread a heartbeat post just opened has no app of its own yet: the
+    // post's app is stamped on it, so this turn (and a later reply's) speaks
+    // as the app that posted, which a multi-app transport requires.
+    if (!session.slack_app_id && target.appId) {
+      await Sessions.setSlackApp(session.id, target.appId);
+      session.slack_app_id = target.appId;
+    }
+    const app: AppRef = { apiAppId: session.slack_app_id ?? undefined, teamId };
+    const ctx: SlackContext = {
+      client: outClientForPersona(persona, app),
+      apiAppId: app.apiAppId,
+      resolveBotToken: () => t.botTokenFor?.(app),
+      channel: channelId,
+      threadTs,
+      inboundTs: String(Date.now()),
+      userId,
+      teamId,
+      postTarget: target.channelSession ? "channel" : "thread",
+      personaId: persona,
+      origin: "cron",
+    };
+    ctx.requestApproval = target.wake
+      ? refuseApprovalInWake
+      : (req) => approvals.request({ channel: ctx.channel, threadTs: ctx.threadTs, sessionId: session.id, app, ...req, persona: ctx.personaId });
+    if (target.wake) ctx.wake = { runId: run.runId, deps: wakeToolDeps, channelSession: channelId };
+    ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
+    noteTurnSender(session.id, ctx);
+    // A channel wake runs only with the route to itself. A person's turn on it
+    // must not end up answering as the wake: `busy` keeps a wake back while a
+    // turn runs, and this catches one that started since. The last check is
+    // synchronous with routes.set, so a message cannot slip in between.
+    if (target.channelSession && ((await channelTurnRunning(session.id)) || channelTurnPending(session.id))) throw new WakeTargetBusyError(`channel session ${session.id}: a turn is running`);
+    const route: SessionRoute = { ctx, surface: wrapSurface(surfaceForCtx(ctx), session.id), spoke: false, silent: true };
+    routes.set(session.id, route);
+    if (target.channelSession) holdRouteForChannelWake(session.id, route, target.wake?.maxMinutes);
+    if (queueDispatch) {
+      try {
+        await queueDispatch.dispatch(session, envelope, {
+          teamId,
+          channelId,
+          threadTs,
+          eventTs: String(Date.now() / 1000),
+          userId,
+          personaId: persona,
+          ...(app.apiAppId ? { apiAppId: app.apiAppId } : {}),
+          origin: "cron",
+          backgroundRunId: run.runId,
+          ...(target.wake ? { wake: target.wake } : {}),
+          ...(target.channelSession ? { postTarget: "channel" as const, channelSession: true } : {}),
+        });
+      } catch (e) {
+        if (target.channelSession) endChannelWake(session.id, route);
+        throw e;
+      }
+    } else if (pass === "heartbeat-turn" || pass === "heartbeat-wake") {
+      // Not awaited: the turn may wait for the agent's proactive folder (one
+      // turn there at a time), and a round dispatching several items must not
+      // block on it. A turn that then fails leaves its run to the stale sweep.
+      void agent.sendMessage(session.id, envelope, { backgroundRun: ledgerTurnRun({ runId: run.runId, agentId: run.agentId, pass }), ...(target.wake ? { wake: target.wake } : {}) }).catch((e) => {
+        // A channel wake that never started has nothing running on its route.
+        if (target.channelSession) endChannelWake(session.id, route);
+        // A voice call owns the session: the run is closed and the wake is settled, not failed.
+        if ((e as { code?: string })?.code === "WAKE_BUSY") return;
+        console.error(`[proactive] heartbeat turn failed session=${session.id}: ${redactSecrets(e instanceof Error ? e.message : String(e))}`);
+      });
+    } else {
+      await agent.sendMessage(session.id, envelope, { backgroundRun: ledgerTurnRun({ runId: run.runId, agentId: run.agentId, pass }) });
+    }
+  };
+  // A channel's wake: a turn in that channel's session. Its only way to speak
+  // is proactive_post. On a node the signed `wake` claim carries that rule.
+  backgroundSlack.wake = {
+    dispatch: async (target, envelope, run, caps) => {
+      const persona = target.personaId && target.personaId !== "default" ? target.personaId : undefined;
+      await dispatchThreadTurn(
+        { teamId: target.teamId, channelId: target.channelId, threadTs: target.threadTs, personaId: persona, userId: target.agentId, appId: target.appId ?? null, channelSession: true, wake: caps },
+        envelope,
+        run,
+        "heartbeat-wake",
+      );
+    },
+    busy: async (target) => {
+      const session = await Sessions.findByThread({ team_id: target.teamId, channel_id: target.channelId, thread_ts: channelSessionKey(target.channelId), persona_id: target.personaId || "default" });
+      if (!session) return false;
+      return channelTurnRunning(session.id);
+    },
+  };
+  // Promise checks (phase E): a due commitment's check turn goes into the
+  // thread that made the promise, through the cron path (a route bound like a
+  // cron run's, origin cron; the queue in the gateway role, this process in
+  // mono), carrying its open `commitment` ledger run. It never runs as anyone
+  // through a carried identity: the thread's own /1on1 lock decides, and a
+  // check whose thread no longer has the scope it was promised in (a lock
+  // taken or released since) is refused and retried, so a /1on1 promise is
+  // only ever checked inside that /1on1.
+  const promiseTeam = async (row: CommitmentRow): Promise<string | null> =>
+    row.teamId ?? (await Sessions.teamForThread(row.channelId, row.threadTs));
+  const promiseSession = async (row: CommitmentRow): Promise<SessionRow | null> => {
+    const teamId = await promiseTeam(row);
+    return teamId ? Sessions.findByThread({ team_id: teamId, channel_id: row.channelId, thread_ts: row.threadTs, persona_id: row.personaId || "default" }) : null;
+  };
+  /** Throws unless the thread still has the scope the promise was made in (its /1on1 lock owner, or no lock). */
+  const promiseScopeHolds = async (row: CommitmentRow): Promise<void> => {
+    const lockedUser = (await OneOnOne.find(row.channelId, row.threadTs))?.locked_user ?? null;
+    if ((row.runAs ?? null) !== lockedUser) throw new Error("the thread's /1on1 lock changed since the promise; not speaking there");
+  };
+  backgroundSlack.promises = {
+    isBusy: async (row) => {
+      const session = await promiseSession(row);
+      if (!session) return false;
+      // Mono: a turn running, or the proactive folder held by another thread
+      // (the check would wait for it, and the scheduler awaits the check).
+      if (!queueDispatch) return agent.isTurnInFlight(session.id) || (await agent.folderHeldByOther(session.id));
+      // A turn running (its session lock) or a message waiting to be claimed.
+      if ((await getRedis().exists(makeKeys().sessionLock(session.id))) > 0) return true;
+      return queueDispatch.turns.hasPending(session.id);
+    },
+    dispatch: async (row, envelope, run) => {
+      const teamId = await promiseTeam(row);
+      if (!teamId) throw new Error("no Slack team is known for this thread");
+      await promiseScopeHolds(row);
+      const persona = row.personaId && row.personaId !== "default" ? row.personaId : undefined;
+      await dispatchThreadTurn(
+        { teamId, channelId: row.channelId, threadTs: row.threadTs, personaId: persona, userId: row.beneficiary },
+        envelope,
+        run,
+        "commitment",
+      );
+    },
+    post: async (row, text) => {
+      // Even the fixed line names the promise's due: only where a check may speak.
+      await promiseScopeHolds(row);
+      const teamId = await promiseTeam(row);
+      const persona = row.personaId && row.personaId !== "default" ? row.personaId : undefined;
+      const session = await promiseSession(row);
+      const app: AppRef = { apiAppId: session?.slack_app_id ?? undefined, teamId: teamId ?? undefined };
+      await outClientForPersona(persona, app).chat.postMessage({ channel: row.channelId, thread_ts: row.threadTs, text }); // runtime-ui: gateway notice, card or command reply
+    },
+  };
+
+  // Heartbeat ask/act (src/proactive/dispatch.ts): the item's turn goes into
+  // the thread of the post the round just made, as the agent. The thread is
+  // new, so no /1on1 lock is expected; one taken since would make the turn
+  // run as that person, so it is refused. The initiator is the agent's own id
+  // in a DM as in a channel: no person sent this turn, and the route's
+  // userId is what manager-only tools and the brain gate's isManager read,
+  // so a DM recipient (often the manager) must not lend the turn their
+  // rights. A human reply rewrites the route with its real sender. Engaged,
+  // so that reply continues the thread.
+  backgroundSlack.proactive = {
+    dispatch: async (post, envelope, run, personaId) => {
+      if (!post.messageTs) throw new Error("the post has no message ts");
+      if (!post.teamId) throw new Error("no Slack team is known for this post");
+      if (await OneOnOne.find(post.channelId, post.messageTs)) throw new Error("the post's thread has a /1on1 lock; a heartbeat turn runs only as the agent");
+      const persona = personaId && personaId !== "default" ? personaId : undefined;
+      await dispatchThreadTurn(
+        {
+          teamId: post.teamId,
+          channelId: post.channelId,
+          threadTs: post.messageTs,
+          personaId: persona,
+          userId: post.agentId,
+          engage: true,
+          appId: post.appId,
+          // Only a channel post's thread shares the proactive folder: a DM
+          // post's thread (manager or person) keeps its own, so files made
+          // for one person never sit where a channel thread works.
+          sharedFolder: post.audience === "channel",
+        },
+        envelope,
+        run,
+        "heartbeat-turn",
+      );
+    },
+  };
+
+  // Nobody is in a wake's turn to click a card (mono; a node asks the tool plane).
+  agent.setPermissionResolver((sessionId, toolName, input, ctx) =>
+    routes.get(sessionId)?.ctx.wake ? Promise.resolve({ behavior: "deny", message: wakeRefusal(toolName) }) : permissions.resolver(sessionId, toolName, input, ctx),
+  );
   if (env.remote.enabled() && env.role() !== "gateway") {
     // Mono: the query runs in this process, so resolve the target from the DB
     // and open the helper here. In split deploys the node does this from claims.
-    agent.setRemote(
-      async (sessionId) => {
-        const row = await Sessions.findById(sessionId);
-        return row?.slack_channel_id && row.slack_thread_ts ? activeRemoteTarget(row.slack_channel_id, row.slack_thread_ts) : null;
-      },
-      async (sessionId, t) => {
-        const key = await Remote.getKey(t.teamId, t.userId);
-        if (!key) throw new Error("remote key missing for target owner");
-        return new HelperClient({
-          transport: { kind: "tailcat", addr: t.addr },
-          privateKey: key.privateKey,
-          onDispose: async (exec) => { await exec(cleanupCommand(sessionId), { timeoutMs: 30_000 }); },
-        });
-      },
-    );
+    // A shared environment is checked per persona, and only for an interactive turn.
+    const kindOf = (sessionId: string) => {
+      const c = routes.get(sessionId)?.ctx;
+      return c && !c.wake && !c.unattended ? turnKindOf({ origin: c.origin }) : turnKindOf({ origin: c?.origin, wake: c?.wake, backgroundRunId: c?.unattended ? "unattended" : undefined });
+    };
+    agent.setRemote((sid) => monoRemoteResolver(sid, kindOf), makeMonoRemoteFactory(undefined, kindOf));
+  } else if (env.role() !== "gateway") {
+    // Remote mode is off: nothing is resolved, except that a thread still bound to a shared machine refuses rather than running on the server.
+    agent.setRemote(monoSharedBindingGuard, makeMonoRemoteFactory());
   }
 
 
@@ -689,10 +1406,12 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   // single-app transport has one identity, logged as before.
   void (async () => {
     const apps = t.apps ? await t.apps() : [{ apiAppId: "", teamId: "", client: t.client }];
+    const authTeams = new Set<string>();
     for (const a of apps) {
       const who = a.apiAppId ? `app=${a.apiAppId} ` : "";
       try {
         const res = await a.client.auth.test();
+        if (typeof (res as any).team_id === "string" && (res as any).team_id) authTeams.add((res as any).team_id);
         const scopesHeader = (res as any).response_metadata?.scopes ?? (res as any).headers?.["x-oauth-scopes"];
         console.log(
           `[slack-auth] ${who}team=${(res as any).team} user=${(res as any).user} bot_user=${(res as any).user_id} bot_id=${(res as any).bot_id} url=${(res as any).url}`,
@@ -702,10 +1421,81 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         console.error(`[slack-auth] ${who}auth.test failed:`, e?.data?.error ?? e?.message);
       }
     }
+    // First sight resolves an audit event's workspace from the connected teams (a node never gets here).
+    setLiveWorkspaces(() => [...authTeams]);
+    // Domain records: backfill and repair, after Slack auth, never blocking boot
+    // (reconcileAtBoot logs a failure and returns). A node has no database.
+    if (opts.domainReconcile === true) {
+      const { reconcileAtBoot } = await import("../../domain/reconcile");
+      void reconcileAtBoot({ role: env.role(), liveTeamIds: () => [...authTeams] });
+      // Completes boundary_id and locator on rows the writers could not (bounded per tick, never on a node).
+      const { startBoundaryFill } = await import("../../domain/boundary-backfill");
+      if (!boundaryFillStopped) {
+        const stop = startBoundaryFill({ liveTeamIds: () => [...authTeams] });
+        stopBoundaryFill = async () => {
+          boundaryFillStopped = true;
+          await stop();
+        };
+      }
+    }
   })().catch((e) => console.error("[slack-auth] app listing failed:", e?.message ?? e));
 
   // Per-session route + slack context. Mutated on each new inbound user message.
   const routes = new Map<string, SessionRoute>();
+  /** How long a counted person's turn is trusted with no other sign of it. A
+   *  folded or merged input leaves the count high for good, and a gateway role
+   *  sees no session exit to clear it: past this, a wake would starve. */
+  const PERSON_TURN_TRUST_MS = 10 * 60_000;
+  /** What this process knows without waiting: a person's turn on the route, a
+   *  message between its route and its dispatch (its slot is open), or, in mono, a running turn. */
+  const channelTurnPending = (sessionId: string): boolean => {
+    const route = routes.get(sessionId);
+    const counted = (route?.personTurns ?? 0) > 0 && Date.now() - (route?.personTurnAt ?? 0) < PERSON_TURN_TRUST_MS;
+    return counted || dispatchOrder.has(sessionId) || (!queueDispatch && agent.turnRunning(sessionId));
+  };
+  /** Whether a channel wake must wait: as above, an operator driving the session, or the session lock and queue in the gateway role. */
+  const channelTurnRunning = async (sessionId: string): Promise<boolean> => {
+    if (channelTurnPending(sessionId)) return true;
+    if (panelInfra && (await panelHeldAsync(sessionId).catch(() => true))) return true;
+    if (!queueDispatch) return false;
+    if ((await getRedis().exists(makeKeys().sessionLock(sessionId))) > 0) return true;
+    return queueDispatch.turns.hasPending(sessionId);
+  };
+  /** The longest a wake's route is held, past its own wall clock, if its outcome never arrives. */
+  const CHANNEL_WAKE_MARGIN_MINUTES = 15;
+  const CHANNEL_WAKE_NO_CLOCK_MINUTES = 120;
+  /** A channel session's wake owns the route until it ends: done, error, or a failure to start. */
+  const holdRouteForChannelWake = (sessionId: string, route: SessionRoute, maxMinutes: number | undefined): void => {
+    route.wakeHold = [];
+    const minutes = maxMinutes && maxMinutes > 0 ? maxMinutes + CHANNEL_WAKE_MARGIN_MINUTES : CHANNEL_WAKE_NO_CLOCK_MINUTES;
+    route.wakeHoldTimer = setTimeout(() => endChannelWake(sessionId, route), minutes * 60_000);
+    route.wakeHoldTimer.unref?.();
+  };
+  /**
+   * The wake is over: its route goes, so nothing of it (no refused approvals,
+   * no silent Stop guard) carries into the next turn, and what arrived during
+   * it now applies in arrival order, each building its route as it would have.
+   */
+  function endChannelWake(sessionId: string, route: SessionRoute): void {
+    if (routes.get(sessionId) !== route || !route.wakeHold) return;
+    if (route.wakeHoldTimer) clearTimeout(route.wakeHoldTimer);
+    const held = route.wakeHold;
+    route.wakeHold = undefined;
+    routes.delete(sessionId);
+    for (const apply of held) {
+      try {
+        apply();
+      } catch (e) {
+        console.error(`[gateway] could not apply a held message session=${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+  /** Runs now, or when the channel wake on this session ends. */
+  const afterChannelWake = (sessionId: string, apply: () => void): void => {
+    const held = routes.get(sessionId)?.wakeHold;
+    if (held) held.push(apply);
+    else apply();
+  };
   const firstFailurePost = createOnceGuard();
 
   // On every registry install, bring warm routes in line with it:
@@ -754,6 +1544,24 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     cronScheduler.start();
   }
 
+  // Background learning (phase D): one scheduler where the brain lives. Like
+  // cron, the gateway role elects one replica to run it (each slot is also
+  // claimed in the database, so a leader change mid-pass never re-runs one);
+  // mono runs it directly. Ticks wait for an open brain and never boot it.
+  let backgroundScheduler: { stop(graceMs?: number): Promise<void> } | undefined;
+  // The heartbeat round reads the agent's own sources through a bridge of its
+  // own: the same servers as the node bridge (bridgeServers), but no
+  // onNeedsAuth, so a source that needs re-authorising posts no card; the
+  // round reports it instead. Reads go out as the agent (backgroundClaims).
+  let backgroundBridge: McpBridge | undefined;
+  if (opts.backgroundLearning === true && env.role() !== "node" && brainEnabled()) {
+    backgroundBridge = createMcpBridge({ servers: bridgeServers });
+    backgroundSlack.sources = createSourceReader(backgroundBridge);
+    warnUnservedWatches();
+    backgroundScheduler = startBackgroundScheduler(defaultSchedulerDeps(backgroundSlack), queueDispatch ? { elect: leaderElect(getRedis()) } : {});
+    console.log(`[slaude] background learning scheduler ${queueDispatch ? "contending for leadership" : "started"}`);
+  }
+
   // MCP resolver — first-call-per-session wires the slack MCP server bound to
   // the session's SlackContext object. We mutate fields on the same context
   // object across turns so the SDK MCP server stays valid for the session.
@@ -767,7 +1575,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   if (externalMcp.privateServices.length) {
     console.log(`[mcp] private (1on1-scoped) services: ${externalMcp.privateServices.join(", ")}`);
   }
-  // Brain source bootstrap — sources MUST exist before any kb_memoize write runs.
+  // Brain source bootstrap: sources MUST exist before any memory_save write runs.
   // KB wiki import runs after, in the background; failures are logged, not fatal.
   // In remote mode the separate brain-server process owns the engine, source
   // bootstrap and nightly maintenance; the gateway only proxies runtime calls.
@@ -804,38 +1612,74 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     cancelNightlyMaintenance = scheduleNightlyMaintenance();
   }
   // Stop-hook enforcement: if a turn ends without any user-visible Slack tool
-  // (reply / edit / upload), block the stop once with an instruction that
-  // forces the agent to call `mcp__slaude_slack__reply` before exiting.
+  // (reply / edit / upload) or an explicit pass, block the stop once with an
+  // instruction to either reply (`mcp__slaude_surface__reply`) or pass
+  // (`mcp__slaude_surface__pass`) before exiting.
+  // Owner guardrails: the session resolver and audit sink, the boot snapshot
+  // and its reload (nodes get theirs in the runtime bundle).
+  const stopOwnerGuardrails = installOwnerGuardrails(agent, {
+    pubsub: queueDispatch?.pubsub ?? panelInfra?.pubsub ?? null,
+    mono: !queueDispatch,
+    redis: queueDispatch?.turns?.redis ? { client: queueDispatch.turns.redis, prefix: queueDispatch.turns.keys?.prefix ?? "slaude" } : null,
+  });
+  // The engage last-speaker record is shared by every replica when there is a Redis (mono keeps it in memory).
+  if (queueDispatch?.turns?.redis) {
+    setLastSpeakerRedis(queueDispatch.turns.redis, queueDispatch.turns.keys?.prefix ?? "slaude");
+    // The shadow classifier's budgets, claims and pass memory are per channel across every replica too.
+    setEngageRedis(queueDispatch.turns.redis, queueDispatch.turns.keys?.prefix ?? "slaude");
+  }
+  const guardrailReplyQuiet = makeReplyQuiet();
   agent.setStopGuard((sessionId) => {
     if (voiceTurns.active(sessionId)) return null;
     const route = routes.get(sessionId);
     if (!route) return null;
     if (route.spoke) return null;
+    if (route.passed) return null;
     if (route.silent) return null;
-    return "You have not delivered a reply to the user. Call `mcp__slaude_surface__reply` now with your answer to the inbound message, then stop. Do not stop without replying.";
+    // Implicit engagement: the message was not addressed to the agent, so ending without a reply is an answer.
+    if (route.implicit) return null;
+    return MUST_REPLY_INSTRUCTION;
   });
 
   // Brain gate input from the live SlackContext — read per tool call so the
   // current turn's author (not the session creator) drives KB scoping.
-  const brainGateFor = async (ctx: SlackContext): Promise<GateInput> => {
-    const soul = soulData();
-    const lock = await OneOnOne.find(ctx.channel, ctx.threadTs);
-    // Use the persona's Slack user ID as the agent brain-slice key when in
-    // multi-persona mode; fall back to the process-level bot ID otherwise.
-    const personaId = ctx.personaId && ctx.personaId !== "default" ? ctx.personaId : null;
-    // Managed + not live: livePersona throws, so the gate refuses rather than
-    // reading or writing the default agent's private brain slice.
-    const personaAgentId = personaId
-      ? (livePersona(personaId)?.slackUserId ?? agentIdSync())
-      : agentIdSync();
-    return {
-      userId: ctx.userId ?? null,
-      lockedUser: lock?.locked_user ?? null,
+  type BrainGateCtx = Pick<SlackContext, "channel" | "threadTs" | "userId" | "teamId" | "personaId" | "origin" | "turnSenders">;
+  // `lockedUser`: the thread's lock owner when the caller already read it.
+  const brainGateFor = async (ctx: BrainGateCtx, known?: { lockedUser: string | null; lockedTeamId?: string | null }): Promise<GateInput> => {
+    const soul = trustSoulFor(ctx.personaId);
+    const lockRow = known ? null : await OneOnOne.find(ctx.channel, ctx.threadTs);
+    const lockedUser = known ? known.lockedUser : (lockRow?.locked_user ?? null);
+    const lockedTeamId = known ? (known.lockedTeamId ?? null) : (lockRow?.team_id ?? null);
+    // The persona's Slack user ID as the agent brain-slice key, the process
+    // agent otherwise (shared with the console's history reader). Managed +
+    // not live: it throws, so the gate refuses rather than reading or writing
+    // the default agent's private brain slice.
+    const personaAgentId = personaAgentIdFor(ctx.personaId);
+    const gate: GateInput = {
+      // A wake's initiator is the agent itself, and the agent is not a person
+      // talking: it writes to its own mind like any background turn.
+      userId: ctx.userId && ctx.userId !== personaAgentId ? ctx.userId : null,
+      teamId: ctx.teamId || null,
+      // Mono: the route's origin (set by the Slack, panel and cron paths);
+      // nodes: the signed `origin` claim. Unknown reads as not interactive.
+      interactive: isInteractiveOrigin(ctx.origin),
+      ...(ctx.origin ? { origin: ctx.origin } : {}),
+      ...(await (async () => {
+        const senders = await ctx.turnSenders?.();
+        return senders ? { turnSenders: senders } : {};
+      })()),
+      lockedUser,
+      lockedTeamId,
       channelTrust: channelTrustFor(ctx.channel, soul),
-      isManager: !!ctx.userId && (ctx.userId === soul.manager.userId || ctx.userId === soul.backupManager.userId),
+      isManager: await managerAt("gateway.brain_gate.role", ctx.personaId, ctx.userId, ctx.teamId),
       agentId: personaAgentId,
       threadKey: `${ctx.channel}:${ctx.threadTs}`,
     };
+    // Slice F shadow: compare the speaker's verified-only union with the legacy own slice, in the
+    // background and counts only. A no-op unless SLAUDE_PERSON_SLICES=shadow; the gate is unchanged.
+    // Under union the speaker's verified-only slices ride on the gate (reads only, Rule S: never the lock owner's).
+    const person = gate.userId ? await decidePersonSlices({ site: "brain.gate_speaker", teamId: gate.teamId, slackUserId: gate.userId }) : undefined;
+    return person ? { ...gate, person } : gate;
   };
 
   // Episodic memory for turns that run in THIS process (mono): scoped by the
@@ -851,28 +1695,219 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         if (!route) return null;
         const { ctx } = route;
         const runAsUser = await agent.resolveEffectiveIdentity(sessionId, ctx.channel, ctx.threadTs);
-        return memoryScopeFor(await brainGateFor(ctx), { channel: ctx.channel, runAsUser: runAsUser ?? null });
+        const gate = await brainGateFor(ctx);
+        const runAsPerson = await runAsPersonFor(gate, runAsUser);
+        const scope = await memoryScopeFor(gate, { channel: ctx.channel, runAsUser: runAsUser ?? null, ...(runAsPerson ? { runAsPerson } : {}) });
+        // Only an interactive turn counts toward the quiet-moment pass's thread activity.
+        return gate.interactive ? { ...scope, activityAgentId: gate.agentId } : scope;
       },
     }),
   );
 
+  // One loud line at boot for a configured model the price table lacks (the
+  // gateway prices every check and pass, its nodes' included).
+  warnUnpricedModels();
+
+  // The post-turn skill check's budget (spec §9.3), on the ledger for turns
+  // that run in THIS process (mono). The run's scope is whom the session's
+  // turns run as, by the same rule as memory above.
+  agent.setBackgroundBudget(
+    ledgerSkillCheckBudget({
+      scopeFor: async (sessionId) => {
+        const route = routes.get(sessionId);
+        if (!route) return "agent";
+        const runAsUser = await agent.resolveEffectiveIdentity(sessionId, route.ctx.channel, route.ctx.threadTs);
+        return runAsUser ? `user:${runAsUser}` : "agent";
+      },
+    }),
+  );
+
+  // Skill usage for the weekly skill review (spec §9.1), for turns that run in
+  // THIS process (mono): keyed by the session persona's agent id, best effort.
+  agent.setSkillUsageRecorder(async (_sessionId, personaName, skill) =>
+    recordSkillUse(await backgroundAgentId(personaName ?? "default"), skill),
+  );
+
   // Brain tool deps for a context + surface — shared by the per-session MCP
   // resolver and the REST tool plane so both run identical scoping and gating.
-  const brainDepsFor = (ctx: SlackContext, surface: Surface): BrainToolDeps | undefined =>
-    brainEnabled()
+  const brainDepsFor = (ctx: SlackContext, surface: Surface, sessionId: string | undefined = ctx.sessionId, claims?: JobClaims): BrainToolDeps | undefined => {
+    const claimGate = async (): Promise<GateInput> => {
+      const g = await brainGateFor(ctx);
+      return claims ? withClaimLock(g, claims.lock?.user) : g;
+    };
+    return brainEnabled()
       ? {
           // kb-* sources: the live persona's kbSources ∩ installed, per call
           // (WS-C §4.1.3), so a sync applies on the next turn.
-          scope: async () =>
-            resolveBrainScope({ ...(await brainGateFor(ctx)), kbSources: personaKbSourceIds(ctx.personaId) }),
-          gate: () => brainGateFor(ctx),
-          managers: () => {
-            const soul = soulData();
-            return [soul.manager.userId, soul.backupManager.userId].filter((u): u is string => !!u);
+          // The speaker's profile only on that one sender's own turn (turnBrainScope).
+          // On /v1 the lock is the more private of the live lock and the signed
+          // claim (as the memory routes), so a lock released mid-turn cannot let
+          // the rest of the turn write the /1on1 out to agent-<id>.
+          scope: async () => turnBrainScope(await claimGate(), personaKbSourceIds(ctx.personaId)),
+          gate: () => claimGate(),
+          // memory_thread_history: the memory read scope. On /v1 the job token is
+          // authoritative, derived as the memory routes do; mono uses the live
+          // identity, as its route above does.
+          thread: async () => {
+            if (!sessionId) return { sessionId: undefined, read: null };
+            if (claims) return { sessionId, read: (await memoryScopeForClaims(await brainGateFor(ctx), claims)).read };
+            const runAsUser = await agent.resolveEffectiveIdentity(sessionId, ctx.channel, ctx.threadTs);
+            const gate = await brainGateFor(ctx);
+            const runAsPerson = await runAsPersonFor(gate, runAsUser);
+            return { sessionId, read: (await memoryScopeFor(gate, { channel: ctx.channel, runAsUser: runAsUser ?? null, ...(runAsPerson ? { runAsPerson } : {}) })).read };
+          },
+          // The persona's managers (roleOf "manager": its soul's manager and
+          // backup plus stored manager grants, no deny).
+          managers: async () => {
+            return (await approversAt({ site: "gateway.brain_managers", persona: ctx.personaId, teamId: ctx.teamId, grants: await loadGrants(ctx.personaId), roles: ["manager"] }));
           },
           requestApproval: (r) => surface.requestApproval(r),
+          // A commitment written here is indexed for the promise scheduler (phase E).
+          onWritten: async (pages, scope) =>
+            indexWritten(pages, {
+              agentId: (await claimGate()).agentId,
+              personaId: ctx.personaId ?? "default",
+              teamId: ctx.teamId || null,
+              runAs: runAsOf(scope),
+              allowedThreads: [`${ctx.channel}:${ctx.threadTs}`],
+              writtenAt: new Date(),
+            }),
         }
       : undefined;
+  };
+
+  // Per-turn memory context (phase C §8.4) for one inbound Slack message:
+  // built for THAT message's sender, never from the live route ctx (which the
+  // next delivered message rewrites), under the scope the KB tools get on that
+  // sender's own turn. So it never holds another person's profile, and in
+  // someone else's /1on1 it holds only the sender's own profile. Bounded in
+  // time and size by buildTurnMemoryContext; any failure means no block.
+  // Reads only a brain that is already open (brainReady, brainCallIfOpen):
+  // the message hot path never boots the local engine or connects the remote
+  // one. A brain not open yet (or closing) means no block, silently.
+  const turnMemoryBlock = async (m: {
+    channel: string; threadTs: string; userId: string; teamId: string; personaId?: string; lockedUser: string | null; lockedTeamId?: string | null;
+  }): Promise<string> => {
+    if (!brainEnabled() || !brainReady()) return "";
+    try {
+      const sender = { userId: m.userId, teamId: m.teamId || null, origin: "slack" };
+      const ctx: BrainGateCtx = {
+        channel: m.channel, threadTs: m.threadTs, userId: m.userId, teamId: m.teamId, personaId: m.personaId,
+        origin: "slack", turnSenders: () => [sender],
+      };
+      const g = await brainGateFor(ctx, { lockedUser: m.lockedUser, lockedTeamId: m.lockedTeamId });
+      const inner = await buildTurnMemoryContext({
+        call: brainCallIfOpen,
+        scope: await turnBrainScope(g, personaKbSourceIds(m.personaId)),
+        agentSource: agentSourceId(g.agentId),
+        speaker: m.userId,
+        threadKey: `${m.channel}:${m.threadTs}`,
+        channelId: m.channel,
+      });
+      return inner ? `<memory-context>\n${inner}\n</memory-context>\n\n` : "";
+    } catch (e) {
+      console.warn(`[memory-context] skipped: ${e instanceof Error ? e.name : typeof e}`);
+      return "";
+    }
+  };
+
+  // A reply under a proactive post (spec §5 Stitching): the post's
+  // `<proactive-context>` for that reply's turn. Only threaded replies count,
+  // so a top-level message (its own root) never gets one. Like the memory
+  // block it reads only an already-open brain; any failure means no block.
+  // `hasReply` is true when the block holds the post's own context (a reply under a proactive post): then
+  // the thread head is skipped, since the post is the context. The first-turn work block does not count.
+  const turnProactiveBlock = async (m: { channel: string; threadTs: string; eventTs: string; personaId?: string; firstTurn: boolean }): Promise<{ text: string; hasReply: boolean }> => {
+    const none = { text: "", hasReply: false };
+    if (!brainEnabled() || !brainReady()) return none;
+    try {
+      const persona = m.personaId ?? "default";
+      const reply = m.threadTs === m.eventTs ? "" : await proactiveReplyBlock({ channel: m.channel, threadTs: m.threadTs, personaId: m.personaId });
+      // Where the agent works on its own, a new thread starts knowing what it has been doing.
+      const workAgent = m.firstTurn && proactiveFor(persona, m.channel).enabled ? await backgroundAgentId(persona) : null;
+      const work = workAgent ? await proactiveWorkBlock({ channel: m.channel, agentId: workAgent, ...(channelSessionOn(persona, m.channel) ? { folder: channelWorkspaceDir(workAgent, m.channel) } : {}) }) : "";
+      const block = [reply, work].filter(Boolean).join("\n\n");
+      return { text: block ? `${block}\n\n` : "", hasReply: Boolean(reply) };
+    } catch (e) {
+      console.warn(`[proactive-context] skipped: ${e instanceof Error ? e.name : typeof e}`);
+      return none;
+    }
+  };
+
+  // This persona's own identities, for reading "[you]" in the thread head, as keys `u:<user id>` and
+  // `b:<bot id>`: the persona's own user (and the delivering app's bot, when that app is the persona's), or
+  // for the default persona the delivering bot and the post-as-user identity. Another persona's or app's
+  // messages are not "you".
+  const ownIdentities = async (args: any, personaId?: string): Promise<Set<string>> => {
+    const named = personaId && personaId !== "default" ? getPersonaRegistry().lookupByName(personaId) : null;
+    const own = await botIdsOf(`${args?.context?.apiAppId ?? ""}:${args?.context?.teamId ?? args?.event?.team ?? ""}`, args?.client ?? t.client);
+    const keys = new Set<string>();
+    if (named) {
+      keys.add(`u:${named.slackUserId}`);
+      if (keys.has(`u:${own.userId}`) && own.botId) keys.add(`b:${own.botId}`);
+    } else {
+      if (own.userId) keys.add(`u:${own.userId}`);
+      if (own.botId) keys.add(`b:${own.botId}`);
+      for (const selfId of await getSelfUserIds()) if (!getPersonaRegistry().lookupByUserId(selfId)) keys.add(`u:${selfId}`);
+    }
+    return keys;
+  };
+
+  // The thread head (rc.28): what a session starting inside an existing thread is shown of it, as a
+  // `<thread-head>` block (or "" for none). One conversations.replies path, plus a users lookup per
+  // distinct author (cached). The whole of it (read, author checks, name lookups) runs against a hard
+  // deadline, on a client that never retries and rejects a rate-limited call instead of sleeping on
+  // Retry-After. Any failure, a 429, a missing thread or the deadline means no block and a turn that runs
+  // without it; a result that arrives late is dropped.
+  const threadHeadBlock = async (m: { args: any; client: any; channel: string; threadTs: string; eventTs: string; teamId: string; personaId?: string }): Promise<string> => {
+    const where = `ch=${m.channel} thread=${m.threadTs}`;
+    const build = async (): Promise<string> => {
+      const persona = m.personaId ?? "default";
+      let token: string | undefined = m.args?.context?.botToken;
+      if (!token && env.slack.mode() === "socket") {
+        try {
+          token = env.slack.botToken();
+        } catch {
+          token = undefined;
+        }
+      }
+      // A client of its own for this read; the receiving app's client is the fallback where no token is known.
+      const reader: any = (token ? lookupClients.forToken(token) : null) ?? m.client;
+      const slice = await fetchThreadSlice(reader, m.channel, m.threadTs, m.eventTs, env.threadHeadMessages(), GATE_REPLY_PAGES, GATE_REPLY_PAGE_SIZE);
+      const own = await ownIdentities(m.args, m.personaId);
+      const grants = await loadGrants(persona);
+      // The ingress's own checks, so reading a person is never wider than hearing them.
+      const isSelf = (x: { user?: string; bot_id?: string }) => (x.user ? own.has(`u:${x.user}`) : false) || (x.bot_id ? own.has(`b:${x.bot_id}`) : false);
+      const filter = makeAuthorFilter({
+        isSelf,
+        // Anyone the ingress would not admit (denied or not granted here) is not read back either.
+        isAdmitted: async (userId) => (await admitAt({ site: "gateway.thread_head.admit", persona, teamId: m.teamId, userId, channelId: m.channel, isDM: false, grants })).ok,
+        isIgnored: (userId) => ignoreGate.shouldDrop(userId, m.channel, m.threadTs),
+        textDenied: async (text) => (await inboundVerdict(persona, m.channel, text))?.action === "deny",
+      });
+      return await buildThreadHead(slice, { isSelf, filter, nameOf: (userId) => resolveUserName(reader, userId) });
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Whichever settles first wins; a late result from the other is dropped (and the read cannot reject
+      // unhandled: its own failure is caught below).
+      return await Promise.race([
+        build().catch((e) => {
+          const why = e instanceof Error ? e.message : typeof e;
+          console.warn(why === "thread_not_found" ? `[thread-head] skipped ${where}: Slack has no such thread (root deleted or not visible)` : `[thread-head] skipped ${where}: ${why}`);
+          return "";
+        }),
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => {
+            console.warn(`[thread-head] skipped ${where}: deadline of ${env.threadHeadDeadlineMs()} ms passed`);
+            resolve("");
+          }, env.threadHeadDeadlineMs());
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 
   // Voice calls (voice mode spec §3): mono only — a gateway never runs a
   // session; a node gets its config through the runtime bundle. Registered
@@ -926,6 +1961,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const servers: Record<string, McpServerConfig> = {
       [SURFACE_MCP_NAME]: createSurfaceMcp(route.surface, {
         initiator: () => route.ctx.userId,
+        teamId: () => route.ctx.teamId,
+        auditContext: () => ({
+          persona: route.ctx.personaId, sessionId,
+          channelId: route.ctx.channel, threadTs: route.ctx.threadTs ?? route.ctx.inboundTs,
+        }),
         setOneOnOne: (action, scope) => agentOneOnOne(sessionId, route.ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(route.ctx, active),
         ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(sessionId, route.ctx) } : {}),
@@ -938,7 +1978,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       [SESSION_MCP_NAME]: createSessionMcp({
         getSnapshot: () => agent.getTokenSnapshot(sessionId),
       }),
-      [KB_MCP_NAME]: createKbMcp(brainDepsFor(route.ctx, route.surface), { kbs: () => personaKbs(route.ctx.personaId) }),
+      [KB_MCP_NAME]: createKbMcp(brainDepsFor(route.ctx, route.surface, sessionId), { kbs: () => personaKbs(route.ctx.personaId) }),
       // Per-persona MCP isolation. A filesystem tenant: named personas load
       // ~/.slaude/personas/<name>/mcp.json, the default the boot-time global.
       // A managed tenant: each persona's effective mcp, never the persona
@@ -1069,7 +2109,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         slackUserId: a.userId, serverName: a.serverName, cfg: a.serverConfig, tokens,
       });
       if (!r.ok) {
-        throw new Error("your Slack user isn't connected to an account yet — run `/link`, sign in, then connect again");
+        throw new Error("your Slack user isn't connected to an account yet: send me ` /link` as a message (with a space before it, or after mentioning me), sign in, then connect again");
       }
       agent.noteSessionEvent(a.sessionId, `Connected MCP server \`${a.serverName}\`${a.scope === "global" ? " (agent's shared identity)" : ""}.`);
       agent.reload(a.sessionId);
@@ -1106,13 +2146,13 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   const redactAuthMessage = async (surface: Surface, ref: string | undefined, serverName: string) => {
     if (!ref || !surface.capabilities.has("edit") || !surface.edit) return;
     try {
-      await surface.edit({ ref, text: `:link: Authorize \`${serverName}\` — link removed (flow finished).` });
+      await surface.edit({ ref, text: `:link: Authorize \`${serverName}\`: link removed (flow finished).`, runtime: true });
     } catch { /* best-effort: redaction failure must not mask the connect outcome */ }
   };
 
   async function connectServer(a: { sessionId: string; channelId: string; threadTs: string; userId: string; serverName: string; serverCfg: any; scope: ConnectScope; personaName?: string; app?: AppRef }) {
     const surface = connectSurface(a.channelId, a.threadTs, a.userId, a.app);
-    const post = (text: string) => surface.reply({ text });
+    const post = (text: string) => surface.reply({ text, runtime: true });
     const serverConfig: OAuthServerConfig = { type: "http", url: a.serverCfg.url, headers: a.serverCfg.headers };
     const redirectUrl = env.oauthRedirectUrl();
 
@@ -1185,7 +2225,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
    */
   async function completePaste(pend: SlackOauthFlows.SlackOauthFlow, code: string, state: string | undefined, app: AppRef): Promise<void> {
     const surface = connectSurface(pend.channelId, pend.threadTs, pend.userId, app);
-    const post = (text: string) => surface.reply({ text });
+    const post = (text: string) => surface.reply({ text, runtime: true });
     if (state && state !== pend.state) {
       await post(":x: OAuth `state` mismatch — paste the URL from the same authorize step, or rerun `/mcp connect`.");
       return;
@@ -1215,7 +2255,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   // loopback, and redacts on settle, so the model turn isn't held while the user clicks.
   async function agentConnect(sessionId: string, ctx: SlackContext, serverName: string): Promise<string> {
     if (opts.mcpConnectEnabled === false) {
-      return ":warning: MCP connect is temporarily disabled (store-format canary failed) — see server logs.";
+      return ":warning: MCP connect is temporarily disabled (store-format canary failed), see server logs.";
     }
     // Empty if somehow absent — the scope checks below then reject (it can't equal a
     // lock owner or the manager), so connectServer is never reached without a real user.
@@ -1224,13 +2264,12 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const lock = await OneOnOne.find(ctx.channel, threadTs);
     let scope: ConnectScope;
     if (lock) {
-      if (lock.locked_user !== userId) {
+      if (!(await sameAt({ site: "gateway.agent_connect.lock_owner", persona: ctx.personaId, teamId: ctx.teamId, userId, otherUserId: lock.locked_user, otherTeamId: lock.team_id }))) {
         return `:lock: this 1on1 thread belongs to <@${lock.locked_user}> — only they can connect MCP servers here.`;
       }
       scope = "initiator";
     } else {
-      const soul = soulData();
-      if (userId !== soul.manager.userId && userId !== soul.backupManager.userId) {
+      if (!(await managerAt("gateway.agent_connect.role", ctx.personaId, userId, ctx.teamId))) {
         return ":lock: connecting the agent's shared identity is manager-only. Start a `/1on1` to connect your own MCP servers instead.";
       }
       scope = "global";
@@ -1257,25 +2296,28 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const threadTs = ctx.threadTs ?? ctx.inboundTs ?? "";
     if (action === "lock") {
       const prevTarget = await Remote.findTarget(ctx.channel, threadTs);
-      if (prevTarget && prevTarget.user_id !== userId) await endRemoteForThread(ctx.channel, threadTs, { sessionId });
-      await OneOnOne.lock({ channelId: ctx.channel, threadTs, lockedUser: userId, createdBy: userId });
+      if (prevTarget && !(await sameAt({ site: "gateway.one_on_one_agent_lock.prev_target_same", persona: ctx.personaId, teamId: ctx.teamId, userId, otherUserId: prevTarget.user_id, otherTeamId: prevTarget.team_id }))) await endRemoteForThread(ctx.channel, threadTs, { sessionId, userMachineOnly: true });
+      await OneOnOne.lock({ channelId: ctx.channel, threadTs, lockedUser: userId, createdBy: userId, teamId: ctx.teamId || null });
+      auditOneOnOne("one_on_one.locked", { userId, sessionId, channelId: ctx.channel, threadTs, persona: ctx.personaId, lockedUser: userId, via: "agent_tool" });
       agent.reload(sessionId);
       return `Locked this thread to a 1on1 with <@${userId}> — only they and the manager are heard here now.`;
     }
     if (action === "open") {
       const existing = await OneOnOne.find(ctx.channel, threadTs);
       if (!existing) {
-        await OneOnOne.lock({ channelId: ctx.channel, threadTs, lockedUser: userId, createdBy: userId });
+        await OneOnOne.lock({ channelId: ctx.channel, threadTs, lockedUser: userId, createdBy: userId, teamId: ctx.teamId || null });
+        auditOneOnOne("one_on_one.locked", { userId, sessionId, channelId: ctx.channel, threadTs, persona: ctx.personaId, lockedUser: userId, via: "agent_tool", mode: "open" });
       }
-      await endRemoteForThread(ctx.channel, threadTs, { sessionId }); // open mode forbids remote
+      await endRemoteForThread(ctx.channel, threadTs, { sessionId, userMachineOnly: true }); // open mode forbids remote
       await OneOnOne.setOpen(ctx.channel, threadTs, scope ?? "");
       agent.reload(sessionId);
       const scopeNote = scope ? ` Scope: ${scope}` : "";
       return `Opened this 1on1 to all participants.${scopeNote} Use set_one_on_one(action="lock") to restrict again.`;
     }
     if (!await OneOnOne.find(ctx.channel, threadTs)) return "No active 1on1 in this thread — nothing to release.";
-    await endRemoteForThread(ctx.channel, threadTs, { sessionId });
+    await endRemoteForThread(ctx.channel, threadTs, { sessionId, userMachineOnly: true });
     await OneOnOne.unlock(ctx.channel, threadTs);
+    auditOneOnOne("one_on_one.unlocked", { userId, sessionId, channelId: ctx.channel, threadTs, persona: ctx.personaId, via: "agent_tool" });
     agent.reload(sessionId);
     return "Released 1on1 — the thread is open again.";
   }
@@ -1285,12 +2327,82 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   async function agentMentionOnly(ctx: SlackContext, active: boolean): Promise<string> {
     const threadTs = ctx.threadTs ?? ctx.inboundTs ?? "";
     if (active) {
-      await MentionOnly.set({ channelId: ctx.channel, threadTs, createdBy: ctx.userId ?? "" });
+      await MentionOnly.set({ channelId: ctx.channel, threadTs, createdBy: ctx.userId ?? "", teamId: ctx.teamId || null });
       return "Mention-only on — I'll reply in this thread only when @-mentioned.";
     }
     if (!await MentionOnly.find(ctx.channel, threadTs)) return "This thread isn't in mention-only mode — nothing to change.";
     await MentionOnly.clear(ctx.channel, threadTs);
     return "Mention-only off — I'll follow this thread normally again.";
+  }
+
+  /** The /remote handler's context for one thread and user: replies post as the
+   *  thread's persona through `app`; private replies and the Connect button go
+   *  ephemerally to `userId`. Shared by the typed command and the Connect modal. */
+  async function remoteCommandCtx(i: {
+    teamId: string;
+    channelId: string;
+    threadTs: string;
+    userId: string;
+    sessionId: string;
+    personaId?: string;
+    app?: AppRef;
+  }): Promise<RemoteCommandCtx> {
+    const { teamId, channelId, threadTs, userId, sessionId } = i;
+    const surface = surfaceFactoryFor(i.personaId, i.app)({
+      conversationId: channelId,
+      threadRef: threadTs,
+      inboundRef: threadTs,
+      userId,
+      teamId,
+      requestApproval: async () => { throw new Error("approval is not part of /remote"); },
+      reloadSession: () => false,
+    });
+    const canEphemeral = surface.capabilities.has("ephemeral") && !!surface.sayEphemeral;
+    const reply = async (text: string) => {
+      await outClientForPersona(i.personaId, i.app).chat.postMessage({ channel: channelId, thread_ts: threadTs, text, mrkdwn: true }); // runtime-ui: gateway notice, card or command reply
+    };
+    const isManager = await managerAt("gateway.remote_ctx.role", i.personaId, userId, teamId);
+    // The conversation's tenant, as dispatch reads it (the session's own column; sqlite has none).
+    const tenantId = ((await Sessions.findById(sessionId).catch(() => null)) as { tenant_id?: string } | null)?.tenant_id ?? "default";
+    return {
+      teamId, channelId, threadTs, userId, sessionId,
+      isManager,
+      personaId: i.personaId ?? "default",
+      tenantId,
+      reply,
+      sayPrivately: async (text) => {
+        if (canEphemeral) {
+          await surface.sayEphemeral!({ text, userId });
+          return;
+        }
+        await reply(":warning: `/remote` setup needs a surface that supports private replies.");
+      },
+      // The form needs ephemeral blocks to carry the button and modals to open.
+      ...(canEphemeral && t.view
+        ? {
+            offerConnect: async () => {
+              const offer = { sessionId, teamId, channelId, threadTs, userId, apiAppId: i.app?.apiAppId, issuedAt: Date.now() };
+              await surface.sayEphemeral!({ text: "Connect your machine for /remote", userId, blocks: remoteOfferBlocks(offer) });
+            },
+            offerPicker: async (envs) => {
+              const offer = { sessionId, teamId, channelId, threadTs, userId, apiAppId: i.app?.apiAppId, issuedAt: Date.now() };
+              const current = (await Envs.findBinding(channelId, threadTs))?.env_id;
+              await surface.sayEphemeral!({ text: "Your environments", userId, blocks: envPickerBlocks(offer, envs, current) });
+            },
+            offerAdd: async () => {
+              const offer = { sessionId, teamId, channelId, threadTs, userId, apiAppId: i.app?.apiAppId, issuedAt: Date.now() };
+              await surface.sayEphemeral!({ text: "Add an environment", userId, blocks: envPickerBlocks(offer, []).slice(-1) });
+            },
+          }
+        : {}),
+      reload: () => { agent.reload(sessionId); },
+      // ponytail: in-memory on this process; on a split deploy the node never sees it.
+      note: (text) => agent.noteSessionEvent(sessionId, text),
+      reloadThread: async (ch, ts) => {
+        const other = await Sessions.findAnyByThread({ team_id: teamId, channel_id: ch, thread_ts: ts }).catch(() => null);
+        if (other) agent.reload(other.id);
+      },
+    };
   }
 
   // Ticket-workflow tools for one session: the starter is the turn's Slack user, and
@@ -1320,12 +2432,133 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const ask = "Ask the user to type `/sandbox on` in this thread.";
     if (!env.sandbox.activeUrl()) return "Sandbox mode is not enabled on this deployment.";
     if (await Sandbox.find(ctx.channel, threadTs)) return "Sandbox mode is already on in this thread.";
-    if (await Remote.findTarget(ctx.channel, threadTs)) return `This thread runs on the user's own machine (/remote). ${ask}`;
+    if (await Envs.findBinding(ctx.channel, threadTs)) return `This thread runs on the user's own machine (/remote). ${ask}`;
     if (!env.sandbox.autoAllowed(ctx.userId)) return "This user is not on the sandbox allowlist, so the thread stays here; tell them to ask the manager for access. Do not do the code work on this server.";
     await Sandbox.set({ channelId: ctx.channel, threadTs, createdBy: ctx.userId ?? "" });
     agent.reloadAfterTurn(sessionId);
     return "Sandbox mode on from the next turn: finish this reply, tell the user their next message continues in the sandbox, and do no code work here.";
   }
+
+  // /env picker: Use buttons and the Add environment modal. The value (and the
+  // modal's private_metadata) is bound to the user it was posted to and to a
+  // max age; every check (enabled, lock owner, crons, key, preflight) runs in
+  // the shared /env core, and results go to the thread.
+  async function envCtxForOffer(offer: { sessionId: string; teamId: string; channelId: string; threadTs: string; userId: string; apiAppId?: string }, apiAppId?: string): Promise<RemoteCommandCtx | null> {
+    const session = await Sessions.findById(offer.sessionId);
+    if (!session || session.slack_channel_id !== offer.channelId || session.slack_thread_ts !== offer.threadTs) return null;
+    const app: AppRef = { apiAppId: apiAppId ?? offer.apiAppId, teamId: offer.teamId };
+    return remoteCommandCtx({ ...offer, personaId: session.persona_id ?? undefined, app });
+  }
+
+  t.action(new RegExp(`^${ENV_USE_ACTION}$`), async ({ ack, action, body, respond }) => {
+    await ack();
+    if (!env.remote.enabled()) return;
+    const decoded = await decodeEnvOffer((action as { value?: string }).value, (body as any).user?.id);
+    if (!decoded.ok) {
+      if (decoded.reason === "expired") {
+        await respond({ response_type: "ephemeral", replace_original: true, text: "That button expired. Send `/env` again." }).catch(() => {}); // runtime-ui: gateway notice, card or command reply
+      }
+      return;
+    }
+    const { offer } = decoded;
+    const ctx = await envCtxForOffer(offer, (body as any).api_app_id);
+    const e = offer.envId ? await Envs.getEnv(offer.envId) : null;
+    if (!ctx || !e) return;
+    await useEnvironment(e, undefined, ctx, defaultEnvDeps);
+  });
+
+  t.action(new RegExp(`^${ENV_ADD_ACTION}$`), async ({ ack, action, body, respond }) => {
+    await ack();
+    if (!env.remote.enabled()) return;
+    const decoded = await decodeEnvOffer((action as { value?: string }).value, (body as any).user?.id);
+    if (!decoded.ok) {
+      if (decoded.reason === "expired") {
+        await respond({ response_type: "ephemeral", replace_original: true, text: "That button expired. Send `/env` again." }).catch(() => {}); // runtime-ui: gateway notice, card or command reply
+      }
+      return;
+    }
+    const clickApp: AppRef = { apiAppId: (body as any).api_app_id, teamId: (body as any).team?.id ?? (body as any).user?.team_id };
+    const client = botClientFor(clickApp);
+    const triggerId = (body as any).trigger_id;
+    if (!client.views || !triggerId) return;
+    await client.views.open({ trigger_id: triggerId, view: envAddModal({ ...decoded.offer, issuedAt: Date.now() }) }); // runtime-ui: gateway notice, card or command reply
+  });
+
+  // Kind picked in the Add modal: redraw the modal with that kind's fields.
+  t.action(new RegExp(`^${ENV_KIND_ACTION}$`), async ({ ack, action, body }) => {
+    await ack();
+    if (!env.remote.enabled()) return;
+    const view = (body as any).view;
+    const decoded = await decodeEnvOffer(view?.private_metadata, (body as any).user?.id);
+    if (!decoded.ok) return;
+    const kindName = (action as { selected_option?: { value?: string } }).selected_option?.value;
+    if (!kindName || !getKind(kindName)) return;
+    const clickApp: AppRef = { apiAppId: (body as any).api_app_id, teamId: (body as any).team?.id ?? (body as any).user?.team_id };
+    const client = botClientFor(clickApp);
+    if (!client.views?.update) return;
+    await client.views.update({ view_id: view.id, hash: view.hash, view: envAddModal({ ...decoded.offer, kindName }) }).catch(() => {}); // runtime-ui: gateway notice, card or command reply
+  });
+
+  t.view?.(ENV_ADD_VIEW, async ({ ack, view, body }) => {
+    await ack();
+    const decoded = await decodeEnvOffer(view.private_metadata, (body as any).user?.id);
+    if (!("offer" in decoded)) return;
+    const ctx = await envCtxForOffer(decoded.offer, (body as any).api_app_id);
+    if (!ctx) return;
+    if (!decoded.ok) {
+      await ctx.sayPrivately("That form expired. Send `/env add` again.").catch(() => {});
+      return;
+    }
+    if (!env.remote.enabled()) return;
+    const kind = getKind(decoded.offer.kindName ?? "");
+    if (!kind) return;
+    const v = readEnvAddValues(view, kind);
+    await addEnvironment({ kindName: kind.kind, name: v.name, fields: v.fields, dir: v.dir, use: true }, ctx, defaultEnvDeps);
+  });
+
+  // /remote Connect button → the address/directory modal. Only the user the
+  // button was posted to can open it (the value is bound to them), and only
+  // within REMOTE_OFFER_TTL_MS.
+  t.action(new RegExp(`^${REMOTE_OPEN_ACTION}$`), async ({ ack, action, body, respond }) => {
+    await ack();
+    if (!env.remote.enabled()) return;
+    const decoded = await decodeRemoteOffer((action as { value?: string }).value, (body as any).user?.id);
+    if (!decoded.ok) {
+      if (decoded.reason === "expired") {
+        await respond({ response_type: "ephemeral", replace_original: true, text: "That Connect button expired. Send `/remote` again for a new one." }).catch(() => {}); // runtime-ui: gateway notice, card or command reply
+      }
+      return;
+    }
+    // The trigger belongs to the app the click arrived through: open the modal as it.
+    const clickApp: AppRef = { apiAppId: (body as any).api_app_id, teamId: (body as any).team?.id ?? (body as any).user?.team_id };
+    const client = botClientFor(clickApp);
+    const triggerId = (body as any).trigger_id;
+    if (!client.views || !triggerId) return;
+    const existing = await Remote.findTarget(decoded.offer.channelId, decoded.offer.threadTs);
+    const initialDir = existing?.user_id === decoded.offer.userId ? existing.dir : undefined;
+    // Restamp: the modal's own clock starts when it opens.
+    await client.views.open({ trigger_id: triggerId, view: remoteConnectModal({ ...decoded.offer, issuedAt: Date.now() }, initialDir) }); // runtime-ui: gateway notice, card or command reply
+  });
+
+  // Connect modal submitted: the same path as `/remote <addr> <dir>`, minus the
+  // address in the thread. Every check (enabled, lock owner, foreign crons, key,
+  // preflight) runs in handleRemoteCommand; results go to the thread.
+  t.view?.(REMOTE_CONNECT_VIEW, async ({ ack, view, body }) => {
+    await ack();
+    const decoded = await decodeRemoteOffer(view.private_metadata, (body as any).user?.id);
+    if (!("offer" in decoded)) return; // invalid: not ours to answer
+    const { offer } = decoded;
+    const session = await Sessions.findById(offer.sessionId);
+    if (!session || session.slack_channel_id !== offer.channelId || session.slack_thread_ts !== offer.threadTs) return;
+    const app: AppRef = { apiAppId: (body as any).api_app_id ?? offer.apiAppId, teamId: offer.teamId };
+    const ctx = await remoteCommandCtx({ ...offer, personaId: session.persona_id ?? undefined, app });
+    if (!decoded.ok) {
+      await ctx.sayPrivately("That Connect form expired. Send `/remote` again for a new one.").catch(() => {});
+      return;
+    }
+    const { addr, dir } = readRemoteConnectValues(view);
+    await handleRemoteCommand({ kind: "remote", action: "on", addr, dir }, ctx);
+  });
 
   t.action(/^slaude_mcp:connect:.+$/, async ({ ack, action, body }) => {
     await ack();
@@ -1341,14 +2574,14 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     // Checks run BEFORE the guarded resolve so an unauthorized click never
     // consumes the card.
     const clicker = (body as any).user?.id;
-    if (clicker !== ctx.userId) return;
+    const cardTeam: string | undefined = (body as any).team?.id ?? (body as any).user?.team_id;
+    if (!(await sameAt({ site: "gateway.connect_card.clicker_same", persona: ctx.personaName, teamId: cardTeam, userId: clicker, otherUserId: ctx.userId }))) return;
     if (ctx.scope === "initiator") {
       const lock = await OneOnOne.find(ctx.channelId, ctx.threadTs);
-      if (!lock || lock.locked_user !== ctx.userId) return;
+      if (!lock || !(await sameAt({ site: "gateway.connect_card.lock_owner", persona: ctx.personaName, teamId: cardTeam, userId: clicker, otherUserId: lock.locked_user, otherTeamId: lock.team_id }))) return;
     } else {
       if (await OneOnOne.find(ctx.channelId, ctx.threadTs)) return; // a lock appeared — global no longer applies
-      const soul = soulData();
-      if (ctx.userId !== soul.manager.userId && ctx.userId !== soul.backupManager.userId) return;
+      if (!(await managerAt("gateway.connect_card.role", ctx.personaName, ctx.userId, cardTeam))) return;
     }
     // Look the server up BEFORE consuming the card: a card minted by an older
     // version can name a server this persona does not mount, and approving it
@@ -1358,19 +2591,53 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const cfg = httpExternalServers(ctx.personaName)[ctx.serverName];
     if (!cfg) {
       await connectSurface(ctx.channelId, ctx.threadTs, ctx.userId, clickApp)
-        .reply({ text: `:warning: \`${ctx.serverName}\` is not available for this agent any more, so it can't be connected. Run \`/mcp\` for the current list.` })
+        .reply({ text: `:warning: \`${ctx.serverName}\` is not available for this agent any more, so it can't be connected. Run \`/mcp\` for the current list.`, runtime: true })
         .catch(() => {});
       return;
     }
     // One click wins; a duplicate (or another replica) sees null and stops.
-    if (!(await PendingGates.resolve(token, "approved", clicker))) return;
+    const settled = await PendingGates.resolve(token, "approved", clicker);
+    if (!settled) return;
+    auditGateRow(settled, {
+      verb: "decided",
+      actorKind: "slack_user",
+      actorId: clicker,
+      decision: "allow",
+      summary: `connect ${ctx.serverName} (${ctx.scope})`,
+      details: { server: ctx.serverName, scope: ctx.scope },
+    });
     await connectServer({ ...ctx, sessionId: gate.sessionId, serverCfg: cfg, personaName: ctx.personaName, app: clickApp });
+  });
+
+  // A session with no process runs no turn: what was counted on its route is over.
+  agent.on("sessionExit", (sessionId: string) => {
+    if (agent.isLive(sessionId)) return;
+    const route = routes.get(sessionId);
+    if (!route) return;
+    route.personTurns = 0;
+    route.recordingBehind = undefined;
+    route.recordingAhead = undefined;
   });
 
   agent.on("event", (e: AgentEvent) => {
     console.log(`[agent-evt] ${e.type} session=${e.sessionId}${"tool" in e ? ` tool=${e.tool}` : ""}${"error" in e ? ` err=${redactSecrets(String(e.error))}` : ""}`);
     const route = routes.get(e.sessionId);
     if (!route) return;
+
+    // A channel session's wake: its route shows nothing in Slack (nobody is in
+    // the turn, and its thread key is not a Slack ts). Its end frees the route,
+    // before the panel gate below, which would otherwise skip it.
+    // A `done` before the wake's own turnStart is an earlier turn's, replayed
+    // late on a node's stream. An `error` ends it either way: a wake's job can
+    // fail before it starts, and it should not hold the route to the timer.
+    if (route.wakeHold) {
+      if (e.type === "turnStart") route.wakeStarted = true;
+      else if (e.type === "error") {
+        console.error(`[turn-error] session=${e.sessionId} code=${e.code ?? "UNKNOWN"} job=${e.jobId ?? "-"}: ${redactSecrets(String(e.error))}`);
+        endChannelWake(e.sessionId, route);
+      } else if (e.type === "done" && !e.autoEvolve && route.wakeStarted) endChannelWake(e.sessionId, route);
+      return;
+    }
 
     // Active-surface lock (design §Active-surface lock, outbound gate): while an
     // operator drives this session from the panel, suppress the Slack-facing
@@ -1384,18 +2651,23 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         // Voice-origin turn: no status, no reaction, no task tracker, and a
         // (suppressed) reply must not count as the agent having spoken.
         if (voiceTurns.active(e.sessionId)) break;
+        // The internal skill-evolution turn runs after the user's turn was
+        // finalized (✅, status cleared): its tools must not bring back a
+        // "thinking" status or a working reaction (#131).
+        if (e.autoEvolve) break;
         // Any user-visible tool counts as "spoke" — reply, edit, upload all
         // surface content. (react alone doesn't satisfy: an emoji isn't a real
         // answer.) Matches the canonical surface namespace + the deprecated
         // slack namespace during the transition.
-        const userVisible =
-          e.tool === `mcp__${SURFACE_MCP_NAME}__reply` ||
-          e.tool === `mcp__${SURFACE_MCP_NAME}__edit` ||
-          e.tool === `mcp__${SURFACE_MCP_NAME}__upload` ||
-          e.tool === `mcp__${SLACK_MCP_NAME}__reply` ||
-          e.tool === `mcp__${SLACK_MCP_NAME}__edit` ||
-          e.tool === `mcp__${SLACK_MCP_NAME}__upload`;
-        if (userVisible) {
+        // (Shared with the node worker's guard: src/agent/must-reply.ts.)
+        const effect = mustReplyEffect(e.tool);
+        if (effect === "passed") {
+          // Deliberate silence: satisfies the stop guard without counting as
+          // having spoken, and without the working reaction.
+          route.passed = true;
+          const react = (e.input as any)?.react;
+          if (typeof react === "string" && react) route.passReact = react.replace(/^:|:$/g, "");
+        } else if (effect === "spoke") {
           route.spoke = true;
           void reactions.set(e.sessionId, route.ctx.channel, route.ctx.inboundTs, REACT_WORKING);
         } else {
@@ -1410,9 +2682,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
               void (async () => {
                 try {
                   if (route.todoRef && route.surface.capabilities.has("edit") && route.surface.edit) {
-                    await route.surface.edit({ ref: route.todoRef, text });
+                    await route.surface.edit({ ref: route.todoRef, text, tracker: true });
                   } else {
-                    const { ref } = await route.surface.reply({ text });
+                    const { ref } = await route.surface.reply({ text, tracker: true });
                     route.todoRef = ref;
                   }
                 } catch (err) {
@@ -1446,9 +2718,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
                 void (async () => {
                   try {
                     if (route.tasksRef && route.surface.capabilities.has("edit") && route.surface.edit) {
-                      await route.surface.edit({ ref: route.tasksRef, text });
+                      await route.surface.edit({ ref: route.tasksRef, text, tracker: true });
                     } else {
-                      const { ref } = await route.surface.reply({ text });
+                      const { ref } = await route.surface.reply({ text, tracker: true });
                       route.tasksRef = ref;
                     }
                   } catch (err) {
@@ -1483,9 +2755,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             void (async () => {
               try {
                 if (route.tasksRef && route.surface.capabilities.has("edit") && route.surface.edit) {
-                  await route.surface.edit({ ref: route.tasksRef, text });
+                  await route.surface.edit({ ref: route.tasksRef, text, tracker: true });
                 } else {
-                  const { ref } = await route.surface.reply({ text });
+                  const { ref } = await route.surface.reply({ text, tracker: true });
                   route.tasksRef = ref;
                 }
               } catch (err) {
@@ -1497,6 +2769,14 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         break;
       }
       case "done": {
+        // engagedBefore belongs to the turn that is ending (the auto-evolve
+        // check that follows a user turn is not one).
+        const engagedBefore = route.engagedBefore;
+        if (!e.autoEvolve) route.engagedBefore = undefined;
+        // An implicit turn ends with the turn: a later explicit or panel turn on this route is guarded again.
+        const implicitTurn = route.implicit === true;
+        if (!e.autoEvolve) route.implicit = undefined;
+        const settled = e.autoEvolve ? null : settleTurn(route);
         void (async () => {
           // Voice-origin turn: the thread stays quiet (no ✅, no task-block
           // edits), but the per-turn state is still cleaned up.
@@ -1510,7 +2790,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           }
           // Suppressed (disengaged) turns set no 👀/status and must not stamp a
           // ✅ on the recorded-but-unprocessed message. Nothing to clean up.
-          if (route.suppress) return;
+          if (route.suppress || settled?.ownRecording) return;
+          // Settled by the turn that ran, so a recording queued behind it ends quietly.
+          if (settled?.recordingNext) route.suppress = true;
           // Auto-evolve turns are internal — don't reset reactions/presence
           // (they were already finalized on the user-visible turn's done).
           if (e.autoEvolve) return;
@@ -1521,7 +2803,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
               route.todosSnapshot.every((t) => t.status === "completed") &&
               route.surface.capabilities.has("edit") && route.surface.edit) {
             const doneText = `**Tasks**\n${route.todosSnapshot.map((t) => `✓ ${t.content}`).join("\n")}`;
-            await route.surface.edit({ ref: route.todoRef, text: doneText }).catch(() => {});
+            await route.surface.edit({ ref: route.todoRef, text: doneText, tracker: true }).catch(() => {});
           }
           // Stamp the structured task block "all done" when every task is completed/deleted.
           if (route.tasksRef && route.tasksMap?.size &&
@@ -1529,14 +2811,29 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
               route.surface.capabilities.has("edit") && route.surface.edit) {
             const completedTasks = [...route.tasksMap.values()].filter((t) => t.status === "completed");
             const doneText = `**Tasks**\n${completedTasks.map((t) => `✓ ${t.subject}${t.completedAt ? ` _(${t.completedAt})_` : ""}`).join("\n")}`;
-            await route.surface.edit({ ref: route.tasksRef, text: doneText }).catch(() => {});
+            await route.surface.edit({ ref: route.tasksRef, text: doneText, tracker: true }).catch(() => {});
           }
           route.tasksRef = undefined;
           route.tasksMap = undefined;
+          // A mention that engaged the thread and ended in a pass (nothing
+          // user-visible) gives the engagement back: the thread stays as it was.
+          // An implicit turn that ends without speaking is a pass too, whether or not the pass tool was called.
+          const quiet = !route.spoke && (route.passed || implicitTurn);
+          if (quiet && engagedBefore === false) {
+            console.log(`[pass] disengage ch=${route.ctx.channel} ts=${route.ctx.threadTs}`);
+            await persistEngaged(route.ctx.teamId, route.ctx.channel, route.ctx.threadTs, false, route.ctx.personaId ?? "default")
+              .catch((err) => console.error(`[pass] disengage failed ch=${route.ctx.channel} ts=${route.ctx.threadTs}:`, err?.message ?? err));
+          }
           // No fallback notice: setStopGuard above forces a reply via the SDK
           // Stop hook. If the agent still stops without spoke, manager logs
           // to stderr — surfacing a Slack message here would be redundant.
-          await reactions.set(e.sessionId, route.ctx.channel, route.ctx.inboundTs, REACT_DONE);
+          if (quiet) {
+            // A pass posts nothing: no ✅. The received 👀 goes too, unless the
+            // pass reacted with that same emoji (Slack holds one per name).
+            await reactions.clear(e.sessionId, route.passReact);
+          } else {
+            await reactions.set(e.sessionId, route.ctx.channel, route.ctx.inboundTs, REACT_DONE);
+          }
           reactions.forget(e.sessionId);
           presence.exit(e.sessionId);
           await status.clear(e.sessionId);
@@ -1544,20 +2841,48 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         break;
       }
       case "error": {
+        const implicitTurn = route.implicit === true;
+        const engagedBeforeErr = route.engagedBefore;
+        route.implicit = undefined;
+        route.engagedBefore = undefined;
+        const settled = settleTurn(route);
         // The raw error (provider/CLI text, stack fragments) stays in the server
         // log; Slack only ever gets the fixed text for the failure code (D1.6).
         console.error(`[turn-error] session=${e.sessionId} code=${e.code ?? "UNKNOWN"} job=${e.jobId ?? "-"}: ${redactSecrets(String(e.error))}`);
+        // A failed recording is logged and counted; it says nothing in Slack.
+        if (settled.ownRecording || (route.suppress && route.ctx.postTarget === "channel" && !settled.hadTurn)) {
+          metric.channelSessionRecordFailuresTotal.inc();
+          break;
+        }
+        // A recording behind this failed turn must not leave a checkmark on it.
+        if (settled.recordingNext) route.suppress = true;
         // Voice-origin turn: no failure text or ❌ in the thread (the call voices it).
         if (voiceTurns.active(e.sessionId)) break;
+        // An implicit turn that failed before it spoke stays quiet: nobody asked this thread anything. Log it,
+        // leave nothing behind, and give the engagement back.
+        if (implicitTurn && !route.spoke) {
+          console.error(`[engage] implicit turn failed quietly session=${e.sessionId} ch=${route.ctx.channel} code=${e.code ?? "UNKNOWN"}`);
+          void (async () => {
+            if (engagedBeforeErr === false) {
+              await persistEngaged(route.ctx.teamId, route.ctx.channel, route.ctx.threadTs, false, route.ctx.personaId ?? "default")
+                .catch((err) => console.error(`[pass] disengage failed ch=${route.ctx.channel} ts=${route.ctx.threadTs}:`, err?.message ?? err));
+            }
+            await reactions.clear(e.sessionId);
+            reactions.forget(e.sessionId);
+            presence.exit(e.sessionId);
+            await status.clear(e.sessionId);
+          })();
+          break;
+        }
         void (async () => {
           // One message per failed turn. With a job id (queue mode) the key is the
           // job, so a client retry or a queue attempt that surfaces the same failure
           // posts once. Without one (mono/local) it is the session's current inbound
           // message, so the MCP-circuit error and the result error of one turn post
           // once. The guard is an in-process Set: it does NOT span replicas.
-          if (firstFailurePost(e.jobId ? `${e.sessionId}:job:${e.jobId}` : `${e.sessionId}:ts:${route.ctx.inboundTs}`)) {
+          if (!e.quiet && firstFailurePost(e.jobId ? `${e.sessionId}:job:${e.jobId}` : `${e.sessionId}:ts:${route.ctx.inboundTs}`)) {
             try {
-              await botClientFor(appOf(route.ctx)).chat.postMessage({
+              await botClientFor(appOf(route.ctx)).chat.postMessage({ // runtime-ui: gateway notice, card or command reply
                 channel: route.ctx.channel,
                 thread_ts: route.ctx.threadTs,
                 text: failureText(e.code),
@@ -1585,8 +2910,43 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     }
   });
 
-  async function handleMessage(args: any, dispatch?: { suppress?: boolean; personaId?: string }) {
+  // Arrival order per session for the dispatch tail (route ctx update,
+  // reactions, dispatch). The per-message reads before it (user name,
+  // attachments, the memory context) take varying time, so without this two
+  // quick messages in one thread could reach the session in the other order.
+  // Each message takes a slot when it reaches those reads and waits for the
+  // previous message's slot before its tail; a slot is always released when
+  // its handleMessage ends, so one failure never blocks the next message.
+  const dispatchOrder = new Map<string, Promise<void>>();
+  const takeDispatchSlot = (sessionId: string): { ready: Promise<void>; release: () => void } => {
+    const prev = dispatchOrder.get(sessionId) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    const tail = prev.then(() => mine);
+    dispatchOrder.set(sessionId, tail);
+    void tail.then(() => {
+      if (dispatchOrder.get(sessionId) === tail) dispatchOrder.delete(sessionId);
+    });
+    return { ready: prev, release };
+  };
+
+  async function handleMessage(args: any, dispatch?: HandleDispatch) {
+    const slot = { release: () => {} };
+    try {
+      return await handleMessageInOrder(args, dispatch, slot);
+    } finally {
+      slot.release();
+    }
+  }
+
+  async function handleMessageInOrder(
+    args: any,
+    dispatch: HandleDispatch | undefined,
+    slot: { release: () => void },
+  ) {
     const suppress = dispatch?.suppress === true;
+    // A recording is never an implicit turn: nothing runs.
+    const implicit = dispatch?.implicit === true && !suppress;
     const { event, client, context } = args;
     const teamId: string | undefined = context.teamId ?? event.team;
     // The app this event arrived through (HTTP mode): everything this turn
@@ -1602,96 +2962,65 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       `[slack-rx] type=${event.type} subtype=${event.subtype ?? "-"} ch=${channelId} ts=${eventTs} thread=${event.thread_ts ?? "-"} user=${userId} txt=${JSON.stringify(text.slice(0, 80))}`,
     );
 
+    // Early drops (missing ids, self echo, ignore gate, admission for the
+    // persona) come from preTurnDropReason, shared with the decision gate. The
+    // dedup claim is handleMessage's own step, run between the self-echo and
+    // the ignore checks exactly where it has always been. The id check is
+    // repeated here only to narrow teamId/userId for the code below.
     if (!teamId || !userId) return;
-    // Drop only self-echoes; other bots' messages flow through so slaude can
-    // see CI alerts, summarizer bots, etc. in shared threads.
-    if (await isSelfBotEcho(args, event)) {
-      console.log(`[slack-rx] drop ch=${channelId} ts=${eventTs} — self bot echo`);
-      metric.slackDropsTotal.inc({ reason: "self_bot" });
-      return;
+    {
+      let guardrailVerdict: InboundVerdict | null = null;
+      const drop = await preTurnDropReason(args, {
+        personaId: dispatch?.personaId,
+        onGuardrail: (v) => (guardrailVerdict = v),
+        // Dedup — durable atomic claim in seen_events by (channel, ts), so a Slack
+        // redelivery is dropped even across a restart or by a sibling replica.
+        afterSelfEcho: async () => {
+          // Each app delivers its own copy, so a channel session claims per
+          // agent: otherwise only the first agent would record the message.
+          const dedupKey = dispatch?.channelSession
+            ? `${channelId}:${eventTs}:${dispatch.personaId ?? "default"}`
+            : `${channelId}:${eventTs}`;
+          if (!(await SeenEvents.tryInsert(dedupKey))) {
+            return { reason: "dedup", log: `[slack-rx] drop ch=${channelId} ts=${eventTs} — dedup (already seen)` };
+          }
+          // Rows only matter for Slack's retry window; prune stale ones as we go.
+          void SeenEvents.maybePurge();
+          return null;
+        },
+      });
+      const verdict = guardrailVerdict as InboundVerdict | null;
+      if (verdict) {
+        const thread = event.thread_ts || eventTs;
+        for (const ev of verdict.events) {
+          auditFiring(ev, { persona: dispatch?.personaId || "default", channelId, threadTs: thread, userId, kind: "inbound" });
+        }
+      }
+      if (drop) {
+        if (drop.log !== null) {
+          console.log(drop.log);
+          metric.slackDropsTotal.inc({ reason: drop.reason });
+        }
+        // A recording is dropped and audited like any message, but nobody asked it anything.
+        if (drop.reason === "owner_guardrail" && drop.reply && !(dispatch?.channelSession && suppress)) {
+          const thread = event.thread_ts || eventTs;
+          // One reply per person per thread per quiet window; later denies are silent (and audited above).
+          if (guardrailReplyQuiet(`${dispatch?.personaId || "default"}:${channelId}:${thread}:${userId}`)) {
+            const out = outClientForPersona(dispatch?.personaId, app);
+            try {
+              await out.chat.postEphemeral({ channel: channelId, user: userId, thread_ts: thread, text: drop.reply }); // runtime-ui: gateway notice, card or command reply
+            } catch {
+              await out.chat.postMessage({ channel: channelId, thread_ts: thread, text: drop.reply }).catch((err: unknown) => // runtime-ui: gateway notice, card or command reply
+                console.error(`[slack-rx] guardrail reply failed ch=${channelId}: ${(err as Error)?.message ?? String(err)}`));
+            }
+          }
+        }
+        return;
+      }
     }
-    // Self-echo when posting as a real user (xoxp) — default identity or a named
-    // persona: own posts carry our user id and no bot_id. Drop them to avoid
-    // re-ingesting our own output.
-    const selfUserIds = await getSelfUserIds();
-    if (selfUserIds.has(userId)) {
-      console.log(`[slack-rx] drop ch=${channelId} ts=${eventTs} — self user echo`);
-      metric.slackDropsTotal.inc({ reason: "self_user" });
-      return;
-    }
-
-    // Dedup — durable atomic claim in seen_events by (channel, ts), so a Slack
-    // redelivery is dropped even across a restart or by a sibling replica.
-    const dedupKey = `${channelId}:${eventTs}`;
-    if (!(await SeenEvents.tryInsert(dedupKey))) {
-      console.log(`[slack-rx] drop ch=${channelId} ts=${eventTs} — dedup (already seen)`);
-      metric.slackDropsTotal.inc({ reason: "dedup" });
-      return;
-    }
-    // Rows only matter for Slack's retry window; prune stale ones as we go.
-    void SeenEvents.maybePurge();
 
     const isDM = channelType === "im";
     const threadTs: string = event.thread_ts || (isDM ? eventTs : eventTs);
-
-    // Ignore gate: temp/permanent ignores for users or threads. /unignore* must
-    // bypass it — otherwise a thread-ignore drops the very message meant to lift it
-    // (the /unignore-thread is in the ignored thread), and the thread is stuck
-    // ignored forever. The blocklist + channel-mode gates below still apply, so this
-    // doesn't grant a non-allowed user any new reach.
-    {
-      // botUserId isn't resolved yet here; strip any leading user-mention so a
-      // "<@bot> /unignore-thread" still parses.
-      const peek = parseSlashCommand(text.replace(/<@[^>]+>/g, "").trim());
-      const isUnignore = peek?.kind === "unignore";
-      if (!isUnignore && (await ignoreGate.shouldDrop(userId, channelId, threadTs))) {
-        console.log(`[slack-rx] drop ch=${channelId} user=${userId} thread=${threadTs} — ignored`);
-        metric.slackDropsTotal.inc({ reason: "ignored" });
-        return;
-      }
-    }
-
-    // Hard blocklist: blocked user → drop before any further processing.
-    // Never reaches Claude (no token spend, no logs). Channel blocking is
-    // unnecessary — default posture already denies anywhere not allowed/trusted.
-    {
-      const soul = soulData();
-      if (soul.blockedUsers.includes(userId)) {
-        console.log(`[slack-rx] drop ch=${channelId} user=${userId} — blocked user`);
-        metric.slackDropsTotal.inc({ reason: "blocked_user" });
-        return;
-      }
-    }
-
-    // Channel-mode gate, driven entirely by SOUL.md:
-    //   - trusted channel → team zone, anyone can address slaude (most open)
-    //   - allowed channel  → public zone, anyone can address slaude (mind exposure)
-    //   - DM or unlisted   → manager-only (approvers can still click Approve /
-    //     Deny on request_approval blocks but cannot chat)
-    {
-      const soul = soulData();
-      const isDM_ = channelType === "im";
-      const isTrusted = !isDM_ && soul.trustedChannels.includes(channelId);
-      const isAllowed = !isDM_ && soul.allowedChannels.includes(channelId);
-      const publicZone = isTrusted || isAllowed;
-      if (!publicZone) {
-        const managerId = soul.manager.userId;
-        const backupId = soul.backupManager.userId;
-        // Whitelisted DM users may engage in 1:1 DMs (not in non-whitelisted
-        // channels) on top of manager/backup. Grants chat only — admin commands
-        // still gate on manager/backup/approver below.
-        const dmAllowed = isDM_ && soul.dmAllowedUsers.includes(userId);
-        const allowed = (managerId && userId === managerId) || (backupId && userId === backupId) || dmAllowed;
-        if (!allowed) {
-          console.log(
-            `[slack-rx] drop ch=${channelId} user=${userId} — non-whitelist/DM accepts manager/backup${isDM_ ? "/dm-allowlist" : ""} only` +
-              (managerId ? "" : " (no manager set in SOUL.md)"),
-          );
-          metric.slackDropsTotal.inc({ reason: "whitelist" });
-          return;
-        }
-      }
-    }
 
     // 1on1 lock: while active, only the locked user + manager/backup are heard in
     // this thread. After channel-mode (overrides "anyone can chat" in trusted/allowed
@@ -1701,17 +3030,18 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     {
       const lock = await OneOnOne.find(channelId, threadTs);
       if (lock) {
-        const soul = soulData();
-        const isMgr = userId === soul.manager.userId || userId === soul.backupManager.userId;
+        const isMgr = await managerAt("gateway.one_on_one_gate.role", dispatch?.personaId, userId, teamId);
+        const isLockOwner = (await sameAt({ site: "gateway.one_on_one_gate.lock_owner", persona: dispatch?.personaId, teamId, userId, otherUserId: lock.locked_user, otherTeamId: lock.team_id }));
         // In open mode (open_scope !== null) anyone may speak; only locked mode enforces the initiator gate.
-        if (lock.open_scope === null && userId !== lock.locked_user && !isMgr) {
+        if (lock.open_scope === null && !isLockOwner && !isMgr) {
           console.log(`[slack-rx] drop ch=${channelId} user=${userId} thread=${threadTs} — 1on1 locked to ${lock.locked_user}`);
           metric.slackDropsTotal.inc({ reason: "one_on_one" });
           return;
         }
-        // Remote mode runs tools on the owner's machine: only the owner drives it. The
-        // manager is heard only to inspect or end it (/remote off|status, /1on1 off).
-        if (lock.open_scope === null && userId !== lock.locked_user && isMgr && env.remote.enabled() && (await activeRemoteTarget(channelId, threadTs))) {
+        // A personal environment runs tools on the owner's machine: only the owner
+        // drives it. The manager is heard only to inspect or end it (/remote or
+        // /env off|status, /1on1 off). A sandbox needs no such filter (spec §4).
+        if (lock.open_scope === null && !isLockOwner && isMgr && env.remote.enabled() && personalRemote(await activeRemoteTarget(channelId, threadTs))) {
           // Strip exactly what the slash dispatcher strips (bot + persona mention).
           const mgrBot = (await client.auth.test()).user_id as string;
           const mgrPersona = dispatch?.personaId ? getPersonaRegistry().lookupByName(dispatch.personaId)?.slackUserId : undefined;
@@ -1722,6 +3052,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           const hit = parseSlashCommand(mgrText);
           const allowed =
             (hit?.kind === "remote" && (hit.action === "off" || hit.action === "status")) ||
+            (hit?.kind === "env" && (hit.action === "off" || hit.action === "status")) ||
             (hit?.kind === "one-on-one" && hit.action === "off");
           if (!allowed) {
             console.log(`[slack-rx] drop ch=${channelId} user=${userId} thread=${threadTs} — remote mode, 1on1 locked to ${lock.locked_user}`);
@@ -1732,7 +3063,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       }
     }
 
-    const botUserId = (await client.auth.test()).user_id as string;
+    // A channel session's recording: never a command, keeps its text as written.
+    const recordingOnly = dispatch?.channelSession === true && suppress;
+    const botUserId = recordingOnly ? await getBotId(args) : ((await client.auth.test()).user_id as string);
     // Strip bot mention + persona mention (e.g. "@Noah /model" → "/model").
     const personaUserId = dispatch?.personaId
       ? getPersonaRegistry().lookupByName(dispatch.personaId)?.slackUserId
@@ -1742,14 +3075,102 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       .replace(personaUserId ? new RegExp(`<@${personaUserId}>`, "g") : /(?!x)/g, "")
       .trim();
     const hasFiles = Array.isArray(event.files) && event.files.length > 0;
-    if (!stripped && !hasFiles) return;
+    if (!(recordingOnly ? text : stripped) && !hasFiles) return;
 
-    const session = await agent.ensureSession({
-      team_id: teamId,
-      channel_id: channelId,
-      thread_ts: threadTs,
-      persona_id: dispatch?.personaId,
-    });
+    // Slash commands: /mode, /abort, /help. Handled locally; do not forward to model.
+    const parsed = recordingOnly ? null : parseSlashCommand(stripped);
+    // `/new` is a command only at a channel session's root. Anywhere else it is
+    // text: it reaches the model, or a skill named `new`, as it did before.
+    const slash = parsed?.kind === "new" && !dispatch?.channelSession ? null : parsed;
+    // A command at a channel session's root is answered at root, like its turns.
+    const slashThread = dispatch?.channelSession ? {} : { thread_ts: threadTs };
+    const reply = async (txt: string) => {
+      await outClientForPersona(dispatch?.personaId, app).chat.postMessage({ // runtime-ui: gateway notice, card or command reply
+        channel: channelId,
+        ...slashThread,
+        text: txt,
+        mrkdwn: true,
+      });
+    };
+    /**
+     * A refusal for the person who sent the command, shown to them alone: an
+     * ephemeral post to the sender at the channel session's root (no thread_ts).
+     * Anywhere else it is `reply`, unchanged. It never turns public: if the
+     * ephemeral cannot be posted (not in the channel, a missing scope, a
+     * transport without it) the error is logged and counted, and the sender's
+     * message gets the error reaction instead. Not rate limited: a retry shows again.
+     */
+    const replyPrivately = async (txt: string) => {
+      if (!dispatch?.channelSession) return reply(txt);
+      let out: ReturnType<typeof outClientForPersona> | undefined;
+      try {
+        out = outClientForPersona(dispatch?.personaId, app);
+        if (typeof out.chat.postEphemeral !== "function") throw new Error("postEphemeral unavailable");
+        await out.chat.postEphemeral({ channel: channelId, user: userId, text: txt }); // runtime-ui: gateway notice, card or command reply
+      } catch (err: unknown) {
+        metric.ephemeralReplyFailuresTotal.inc();
+        console.error(`[slack-rx] private reply failed ch=${channelId} user=${userId}: ${(err as any)?.data?.error ?? (err as Error)?.message ?? String(err)}`);
+        try {
+          await (out ?? client).reactions.add({ channel: channelId, timestamp: eventTs, name: REACT_ERROR });
+        } catch (e2: unknown) {
+          if ((e2 as any)?.data?.error !== "already_reacted") console.error(`[slack-rx] error reaction failed ch=${channelId} ts=${eventTs}: ${(e2 as Error)?.message ?? String(e2)}`);
+        }
+      }
+    };
+    // These answer before the session is looked up, so a refused command does
+    // not create one.
+    if (slash && dispatch?.channelSession) {
+      const refused = refusalAtRoot(slash);
+      if (refused) {
+        await replyPrivately(refused);
+        return;
+      }
+      // /mode here persists for every later speaker and wake of the channel.
+      if (slash.kind === "mode" && !(await isManagerOrApprover(dispatch.personaId, userId, channelId, teamId))) {
+        await replyPrivately("Only a manager or this channel's approvers can change this channel's permission mode.");
+        return;
+      }
+    }
+    if (slash?.kind === "new" && dispatch?.channelSession) {
+      if (!(await isManagerOrApprover(dispatch.personaId, userId, channelId, teamId))) {
+        await replyPrivately("Only a manager or this channel's approvers can start the session over.");
+        return;
+      }
+      const current = await Sessions.findByThread({ team_id: teamId, channel_id: channelId, thread_ts: channelSessionKey(channelId), persona_id: dispatch.personaId });
+      if (!current) {
+        await replyPrivately("This channel has no session to start over yet.");
+        return;
+      }
+      await Sessions.archiveChannelSession(current.id, channelId, Date.now());
+      // Whatever the old session was doing ends here: a pending card is torn
+      // down with its turn, a turn on a node stops, and no done will come for a
+      // reloaded session, so its working reaction and status go now, while the
+      // route still names the client that set them.
+      if (queueDispatch) await queueDispatch.abort(current.id).catch((e) => console.error("[slaude] abort publish failed:", e));
+      // Before the abort, which frees what waits behind a wake: a mention held
+      // there must not boot on the archived session and spend a call with no route.
+      agent.dropQueuedInputs(current.id);
+      agent.abort(current.id);
+      agent.reload(current.id);
+      await reactions.clear(current.id);
+      presence.exit(current.id);
+      await status.clear(current.id);
+      routes.delete(current.id);
+      await reply("Started this channel's session over. The old one stays in the console.");
+      return;
+    }
+
+    // The reserved key only finds the session: this turn's threadTs stays the
+    // triggering message's ts, so nothing Slack-facing ever sees the key.
+    const session = await agent.ensureSession(
+      {
+        team_id: teamId,
+        channel_id: channelId,
+        thread_ts: dispatch?.channelSession ? channelSessionKey(channelId) : threadTs,
+        persona_id: dispatch?.personaId,
+      },
+      dispatch?.channelSession ? { workingDir: channelWorkspaceDir(await wakeToolDeps.agentId(dispatch.personaId ?? "default"), channelId) } : {},
+    );
     // Record the app the thread arrives through, so turns with no inbound
     // event (the operator panel) post as it on any replica (D1.2).
     if (app.apiAppId && session.slack_app_id !== app.apiAppId) {
@@ -1774,20 +3195,38 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       }
     }
 
-    // Slash commands: /mode, /abort, /help. Handled locally; do not forward to model.
-    const slash = parseSlashCommand(stripped);
     if (slash) {
-      const slashClient = outClientForPersona(dispatch?.personaId, app);
-      const reply = async (txt: string) => {
-        await slashClient.chat.postMessage({
-          channel: channelId,
-          thread_ts: threadTs,
-          text: txt,
-          mrkdwn: true,
-        });
-      };
       if (slash.kind === "help") {
-        await reply(helpText());
+        await reply(helpText({ channelSessionRoot: !!dispatch?.channelSession }));
+        return;
+      }
+      if (slash.kind === "heartbeat-status") {
+        const persona = dispatch?.personaId ?? "default";
+        // The heartbeat recipient (scheduler's personaManager, which reads a
+        // filesystem persona's own SOUL.md) is never refused.
+        const managerId = personaManager(persona);
+        if (!(await sameAt({ site: "gateway.heartbeat_status.manager_same", persona, teamId, userId, otherUserId: managerId })) && !(await managerAt("gateway.heartbeat_status.role", persona, userId, teamId))) {
+          await replyPrivately(":no_entry: only this agent's manager can see this");
+          return;
+        }
+        await reply(await wakeStatusText({ personaId: persona, agentId: await backgroundAgentId(persona), managerId, budget: budgetConfigFor(persona), now: new Date() }));
+        return;
+      }
+      if (slash.kind === "heartbeat-now") {
+        const persona = dispatch?.personaId ?? "default";
+        // Same check as status: roleOf on the persona, plus the heartbeat's own recipient.
+        const managerId = personaManager(persona);
+        if (!(await sameAt({ site: "gateway.heartbeat_now.manager_same", persona, teamId, userId, otherUserId: managerId })) && !(await managerAt("gateway.heartbeat_now.role", persona, userId, teamId))) {
+          await replyPrivately(":no_entry: only this agent's manager can do this");
+          return;
+        }
+        if (!dispatch?.channelSession || !channelSessionWakes(persona).includes(channelId)) {
+          await replyPrivately(HEARTBEAT_NOW_WHERE);
+          return;
+        }
+        const now = new Date();
+        const result = await (opts.__wakeNow ?? wakeNow)({ personaId: persona, personaIds: [persona], agentId: await backgroundAgentId(persona), slot: `now-${now.getTime()}`, now, timeZone: budgetConfigFor(persona).timeZone }, channelId, { call: brainCall, slack: backgroundSlack });
+        await (result === "woke" ? reply : replyPrivately)(result === "woke" ? "On it." : result === "busy" ? "This channel is busy right now, with another wake or someone's turn. Try again when it finishes." : `Did not start: ${result}.`);
         return;
       }
       if (slash.kind === "mode-help") {
@@ -1820,35 +3259,16 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         // runs the job; it points to the replacement. Code kept for now (see
         // knowledge/ingest.ts @deprecated); slated for removal.
         await reply(
-          ":warning: `/ingest` is *deprecated* — knowledge is captured automatically via brain memoize now, so the raw/→wiki synthesis no longer runs.",
+          ":warning: `/ingest` is *deprecated*: knowledge is saved to memory automatically now, so the raw/→wiki synthesis no longer runs.",
         );
         return;
       }
       if (slash.kind === "remote") {
-        const remoteSurface = surfaceFactoryFor(dispatch?.personaId, app)({
-          conversationId: channelId,
-          threadRef: threadTs,
-          inboundRef: threadTs,
-          userId,
-          teamId,
-          requestApproval: async () => { throw new Error("approval is not part of /remote"); },
-          reloadSession: () => false,
-        });
-        const soul = soulData();
-        await handleRemoteCommand(slash, {
-          teamId, channelId, threadTs, userId, sessionId: session.id,
-          isManager: userId === soul.manager.userId || userId === soul.backupManager.userId,
-          reply,
-          sayPrivately: async (text) => {
-            if (remoteSurface.capabilities.has("ephemeral") && remoteSurface.sayEphemeral) {
-              await remoteSurface.sayEphemeral({ text, userId });
-              return;
-            }
-            await reply(":warning: `/remote` setup needs a surface that supports private replies.");
-          },
-          reload: () => { agent.reload(session.id); },
-          note: (text) => agent.noteSessionEvent(session.id, text),
-        });
+        await handleRemoteCommand(slash, await remoteCommandCtx({ teamId, channelId, threadTs, userId, sessionId: session.id, personaId: dispatch?.personaId, app }));
+        return;
+      }
+      if (slash.kind === "env") {
+        await handleEnvCommand(slash, await remoteCommandCtx({ teamId, channelId, threadTs, userId, sessionId: session.id, personaId: dispatch?.personaId, app }));
         return;
       }
       if (slash.kind === "workflow" || slash.kind === "participant") {
@@ -1877,8 +3297,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       if (slash.kind === "one-on-one") {
         if (slash.action === "on") {
           const prevTarget = await Remote.findTarget(channelId, threadTs);
-          if (prevTarget && prevTarget.user_id !== userId) await endRemoteForThread(channelId, threadTs, { sessionId: session.id });
-          await OneOnOne.lock({ channelId, threadTs, lockedUser: userId, createdBy: userId });
+          if (prevTarget && !(await sameAt({ site: "gateway.one_on_one_slash.prev_target_same", persona: dispatch?.personaId, teamId, userId, otherUserId: prevTarget.user_id, otherTeamId: prevTarget.team_id }))) await endRemoteForThread(channelId, threadTs, { sessionId: session.id, userMachineOnly: true });
+          await OneOnOne.lock({ channelId, threadTs, lockedUser: userId, createdBy: userId, teamId });
+          auditOneOnOne("one_on_one.locked", { userId, sessionId: session.id, channelId, threadTs, persona: dispatch?.personaId, lockedUser: userId, via: "slash" });
           agent.reload(session.id);
           await reply(`:lock: *1on1 mode* — only <@${userId}> and the manager will be heard in this thread. \`/1on1 off\` to release. Ask me to open it to guests when needed.`);
           // Onboarding unlocks this person's own integrations; it never gates
@@ -1914,7 +3335,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             await reply("No active 1on1 in this thread.");
             return;
           }
-          if (existing.locked_user !== userId && !(() => { const s = soulData(); return userId === s.manager.userId || userId === s.backupManager.userId; })()) {
+          if (!(await sameAt({ site: "gateway.one_on_one_relock.lock_owner", persona: dispatch?.personaId, teamId, userId, otherUserId: existing.locked_user, otherTeamId: existing.team_id })) && !(await managerAt("gateway.one_on_one_relock.role", dispatch?.personaId, userId, teamId))) {
             await reply(`:lock: only the session owner (<@${existing.locked_user}>) can lock it.`);
             return;
           }
@@ -1923,6 +3344,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             return;
           }
           await OneOnOne.setLocked(channelId, threadTs);
+          auditOneOnOne("one_on_one.locked", { userId, sessionId: session.id, channelId, threadTs, persona: dispatch?.personaId, lockedUser: existing.locked_user, via: "slash", mode: "relock" });
           agent.reload(session.id);
           await reply(`:lock: *1on1 re-locked* — only <@${existing.locked_user}> and the manager are heard again.`);
           return;
@@ -1932,15 +3354,16 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           await reply("No active 1on1 in this thread.");
           return;
         }
-        const r = await endRemoteForThread(channelId, threadTs, { sessionId: session.id });
+        const r = await endRemoteForThread(channelId, threadTs, { sessionId: session.id, userMachineOnly: true });
         await OneOnOne.unlock(channelId, threadTs);
+        auditOneOnOne("one_on_one.unlocked", { userId, sessionId: session.id, channelId, threadTs, persona: dispatch?.personaId, lockedUser: existing.locked_user, via: "slash" });
         agent.reload(session.id);
         await reply(":unlock: 1on1 released — the thread is open again." + (r.ended ? " Remote mode ended." : ""));
         return;
       }
       if (slash.kind === "mention-only") {
         if (slash.action === "on") {
-          await MentionOnly.set({ channelId, threadTs, createdBy: userId });
+          await MentionOnly.set({ channelId, threadTs, createdBy: userId, teamId });
           await reply(":speech_balloon: *mention-only* — I'll reply in this thread only when @-mentioned. `/mention-only off` to restore.");
           return;
         }
@@ -1955,17 +3378,23 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       if (slash.kind === "soul" || slash.kind === "soul-list" || slash.kind === "soul-clear") {
         // Manager-only — primary manager, NOT backup (owner: "only Manager").
         // Gate on the signed inbound Slack user id before any mutation.
+        // /soul writes soul_overrides, which apply to the default persona's soul
+        // only, so the gate is the default persona's role, from any app.
         const soul = soulData();
-        if (!soul.manager.userId || userId !== soul.manager.userId) {
-          await reply(":lock: `/soul` is manager-only.");
+        if (!soul.manager.userId || !(await sameAt({ site: "soul_override.slash_manager_same", persona: "default", teamId, userId, otherUserId: soul.manager.userId })) || !(await managerAt("soul_override.slash_role", "default", userId, teamId))) {
+          await replyPrivately(":lock: `/soul` is manager-only.");
           return;
         }
         if (slash.kind === "soul") {
           const res = await mutateOverride(
             { field: slash.field, action: slash.action, value: slash.value, by: userId },
-            { managerId: soul.manager.userId },
+            { managerId: soul.manager.userId, teamId, persona: "default" },
           );
           if (res.ok) {
+            auditSoulOverride("soul.override.set", {
+              userId, persona: dispatch?.personaId, sessionId: session.id, channelId, threadTs,
+              field: res.field, op: slash.action, value: res.value, via: "slash",
+            });
             agent.noteSessionEvent(session.id, `Soul ACL override: ${slash.action} \`${res.value}\` to \`${res.field}\` (shadows SOUL.md).`);
           }
           await reply(
@@ -1978,6 +3407,10 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         if (slash.kind === "soul-clear") {
           if (slash.field === "all") await SoulOverrides.clear();
           else await SoulOverrides.clear(FIELD_ALIASES[slash.field]);
+          auditSoulOverride("soul.override.cleared", {
+            userId, persona: dispatch?.personaId, sessionId: session.id, channelId, threadTs,
+            field: slash.field === "all" ? "all" : FIELD_ALIASES[slash.field], via: "slash",
+          });
           agent.noteSessionEvent(session.id, `Soul ACL overrides cleared (\`${slash.field}\`) — reverted to SOUL.md.`);
           await reply(`:leftwards_arrow_with_hook: soul overrides cleared (\`${slash.field}\`) — reverted to SOUL.md.`);
           return;
@@ -2021,7 +3454,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           }
           // A surface that cannot keep it private must not leak it: say nothing
           // useful rather than posting an onboarding link into a channel.
-          await reply(":warning: `/link` needs a surface that supports private replies.");
+          await replyPrivately(":warning: `/link` needs a surface that supports private replies.");
         };
         if (!env.portal.enabled()) {
           await sayPrivately(":information_source: the onboarding portal is not enabled on this deployment.");
@@ -2048,21 +3481,20 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         const lock = await OneOnOne.find(channelId, threadTs);
         let scope: ConnectScope;
         if (lock) {
-          if (lock.locked_user !== userId) {
+          if (!(await sameAt({ site: "gateway.mcp_slash.lock_owner", persona: dispatch?.personaId, teamId, userId, otherUserId: lock.locked_user, otherTeamId: lock.team_id }))) {
             await reply(`:lock: \`/mcp\` in a 1on1 thread is for the lock owner — only <@${lock.locked_user}> can connect here.`);
             return;
           }
           scope = "initiator";
         } else {
-          const soul = soulData();
-          if (userId !== soul.manager.userId && userId !== soul.backupManager.userId) {
-            await reply(":lock: global `/mcp` connect is manager-only — it wires the agent's shared identity. Run `/1on1` first to connect your *own* MCP servers instead.");
+          if (!(await managerAt("gateway.mcp_slash.role", dispatch?.personaId, userId, teamId))) {
+            await replyPrivately(":lock: global `/mcp` connect is manager-only: it wires the agent's shared identity. Run `/1on1` first to connect your *own* MCP servers instead.");
             return;
           }
           scope = "global";
         }
         if (opts.mcpConnectEnabled === false) {
-          await reply(":warning: `/mcp` connect is temporarily disabled (store-format canary failed) — see server logs.");
+          await replyPrivately(":warning: `/mcp` connect is temporarily disabled (store-format canary failed), see server logs.");
           return;
         }
         const httpServers = httpExternalServers(dispatch?.personaId);
@@ -2118,7 +3550,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         // action === "status": render the server status card.
         const statuses = await agent.mcpServerStatus(session.id);
         if (statuses === null) {
-          await reply("Send a message in this thread first so the session boots, then `/mcp` can read MCP server status.");
+          await replyPrivately("Send a message in this thread first so the session boots, then `/mcp` can read MCP server status.");
           return;
         }
         const lines = statuses.map((s) => `• \`${s.name}\` — ${s.status}`).join("\n") || "(no MCP servers mounted)";
@@ -2135,19 +3567,14 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           }
           blocks.push({ type: "actions", elements });
         }
-        await client.chat.postMessage({ channel: channelId, thread_ts: threadTs, blocks, text: "MCP servers", mrkdwn: true });
+        await client.chat.postMessage({ channel: channelId, ...slashThread, blocks, text: "MCP servers", mrkdwn: true }); // runtime-ui: gateway notice, card or command reply
         return;
       }
       if (slash.kind === "ignore" || slash.kind === "unignore") {
         if (slash.kind === "ignore") {
           if (slash.target === "user") {
-            const soul = soulData();
-            const managerId = soul.manager.userId;
-            const backupId = soul.backupManager.userId;
-            const isManager = (managerId && userId === managerId) || (backupId && userId === backupId);
-            const isApprover = soul.approvers.some((a) => a.userId === userId);
-            if (!isManager && !isApprover) {
-              await reply(":no_entry: only manager or approver can ignore users");
+            if (!(await isManagerOrApprover(dispatch?.personaId, userId, channelId, teamId))) {
+              await replyPrivately(":no_entry: only manager or approver can ignore users");
               return;
             }
             const duration = slash.duration;
@@ -2162,6 +3589,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             }
             await Ignores.remove({ targetType: "user", userId: slash.userId });
             await Ignores.create({ targetType: "user", userId: slash.userId, createdBy: userId, expiresAt, reason: "manual" });
+            auditIgnore("ignore.set", { by: userId, persona: dispatch?.personaId, sessionId: session.id, channelId, threadTs, targetType: "user", targetUser: slash.userId, expiresAt, via: "slash" });
             const durText = duration ? `for ${duration}` : "permanently";
             await reply(`:mute: ignoring <@${slash.userId}> ${durText}`);
           } else {
@@ -2176,7 +3604,8 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
               expiresAt = parsed.permanent ? undefined : Date.now() + parsed.minutes * 60 * 1000;
             }
             await Ignores.remove({ targetType: "thread", channelId, threadTs });
-            await Ignores.create({ targetType: "thread", channelId, threadTs, createdBy: userId, expiresAt, reason: "manual" });
+            await Ignores.create({ targetType: "thread", channelId, threadTs, teamId, createdBy: userId, expiresAt, reason: "manual" });
+            auditIgnore("ignore.set", { by: userId, persona: dispatch?.personaId, sessionId: session.id, channelId, threadTs, targetType: "thread", expiresAt, via: "slash" });
             const durText = duration ? `for ${duration}` : "permanently";
             await reply(`:mute: ignoring this thread ${durText}`);
           }
@@ -2185,19 +3614,16 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
 
         if (slash.kind === "unignore") {
           if (slash.target === "user") {
-            const soul = soulData();
-            const managerId = soul.manager.userId;
-            const backupId = soul.backupManager.userId;
-            const isManager = (managerId && userId === managerId) || (backupId && userId === backupId);
-            const isApprover = soul.approvers.some((a) => a.userId === userId);
-            if (!isManager && !isApprover) {
-              await reply(":no_entry: only manager or approver can unignore users");
+            if (!(await isManagerOrApprover(dispatch?.personaId, userId, channelId, teamId))) {
+              await replyPrivately(":no_entry: only manager or approver can unignore users");
               return;
             }
-            await Ignores.remove({ targetType: "user", userId: slash.userId });
+            const removed = await Ignores.remove({ targetType: "user", userId: slash.userId });
+            if (removed) auditIgnore("ignore.cleared", { by: userId, persona: dispatch?.personaId, sessionId: session.id, channelId, threadTs, targetType: "user", targetUser: slash.userId, via: "slash" });
             await reply(`:speaker: stopped ignoring <@${slash.userId}>`);
           } else {
-            await Ignores.remove({ targetType: "thread", channelId, threadTs });
+            const removed = await Ignores.remove({ targetType: "thread", channelId, threadTs });
+            if (removed) auditIgnore("ignore.cleared", { by: userId, persona: dispatch?.personaId, sessionId: session.id, channelId, threadTs, targetType: "thread", via: "slash" });
             await reply(":speaker: stopped ignoring this thread");
           }
           return;
@@ -2212,11 +3638,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         slash.kind === "cron-pause" ||
         slash.kind === "cron-resume"
       ) {
-        const soul = soulData();
-        const managerId = soul.manager.userId;
-        const backupId = soul.backupManager.userId;
-        const isManager = (managerId && userId === managerId) || (backupId && userId === backupId);
-        const isApprover = soul.approvers.some((a) => a.userId === userId);
+        const role = (await roleAt({ site: "gateway.cron.role", persona: dispatch?.personaId, teamId, userId, channelId, grants: await loadGrants(dispatch?.personaId) }));
+        const isManager = role === "manager";
+        const isApprover = role === "approver";
         const findJob = async (id: string) => {
           try {
             return await CronJobs.findByPrefix(id);
@@ -2235,7 +3659,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
 
         if (slash.kind === "cron-list") {
           if (!isManager && !isApprover) {
-            await reply(":no_entry: only manager or approver can list cron jobs");
+            await replyPrivately(":no_entry: only manager or approver can list cron jobs");
             return;
           }
           const jobs = await CronJobs.listActive();
@@ -2250,7 +3674,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
 
         if (slash.kind === "cron-remove") {
           if (!isManager && !isApprover) {
-            await reply(":no_entry: only manager or approver can remove cron jobs");
+            await replyPrivately(":no_entry: only manager or approver can remove cron jobs");
             return;
           }
           const job = await findJob(slash.id);
@@ -2270,7 +3694,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
 
         if (slash.kind === "cron-pause" || slash.kind === "cron-resume") {
           if (!isManager && !isApprover) {
-            await reply(`:no_entry: only manager or approver can ${slash.kind.replace("cron-", "")} cron jobs`);
+            await replyPrivately(`:no_entry: only manager or approver can ${slash.kind.replace("cron-", "")} cron jobs`);
             return;
           }
           const job = await findJob(slash.id);
@@ -2301,7 +3725,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
 
         if (slash.kind === "cron-edit") {
           if (!isManager && !isApprover) {
-            await reply(":no_entry: only manager or approver can edit cron jobs");
+            await replyPrivately(":no_entry: only manager or approver can edit cron jobs");
             return;
           }
           if (isApprover && !isManager) {
@@ -2311,9 +3735,10 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
               summary: `Edit cron job ${slash.id}: "${slash.prompt}" at "${slash.cronExpr}"`,
               category: "cron",
               app,
+              persona: dispatch?.personaId,
               risks: "Changes unattended scheduled agent execution.",
             });
-            if (!approval.approved) return void (await reply(":x: cron edit denied by manager"));
+            if (!approval.approved) return void (await replyPrivately(":x: cron edit denied by manager"));
           }
           const job = await findJob(slash.id);
           if (typeof job === "string") {
@@ -2346,7 +3771,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
 
         if (slash.kind === "cron-add") {
           if (!isManager && !isApprover) {
-            await reply(":no_entry: only manager or approver can add cron jobs");
+            await replyPrivately(":no_entry: only manager or approver can add cron jobs");
             return;
           }
 
@@ -2366,10 +3791,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
               summary: `Cron job: "${slash.prompt}" at "${slash.cronExpr}"`,
               category: "cron",
               app,
+              persona: dispatch?.personaId,
               risks: "Scheduled agent execution — runs unattended.",
             });
             if (!approval.approved) {
-              await reply(":x: cron job denied by manager");
+              await replyPrivately(":x: cron job denied by manager");
               return;
             }
           }
@@ -2407,9 +3833,9 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       }
 
       if (slash.kind === "model") {
-        const soul = effectiveSoulForChannel(channelId);
-        if (!canChangeModel(userId, soul)) {
-          await reply(":lock: `/model` — manager, approver, or DM-allowed users only.");
+        const soul = effectiveSoulForChannelFor(dispatch?.personaId, channelId);
+        if (!(await isManagerOrApprover(dispatch?.personaId, userId, channelId, teamId)) && !(await canChangeModel(userId, { ...soul, approvers: [] }, { persona: dispatch?.personaId, teamId }))) {
+          await replyPrivately(":lock: `/model`: manager, approver, or DM-allowed users only.");
           return;
         }
         // A persona on its own provider (WS-A §5.5) is not checked against the
@@ -2439,6 +3865,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         return;
       }
       if (slash.kind === "compact") {
+        // A wake is on this session. It is never merged with anything else, and the route is the wake's until it ends.
+        if (routes.get(session.id)?.wakeHold) {
+          await replyPrivately("I'm busy, try again shortly.");
+          return;
+        }
         const triggered = agent.triggerCommand(session.id, "/compact");
         if (!triggered) {
           // No live session — auto-boot and compact.
@@ -2447,9 +3878,20 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             existing.ctx.channel = channelId;
             existing.ctx.threadTs = threadTs;
             existing.ctx.inboundTs = eventTs;
+            existing.ctx.userId = userId;
+            existing.ctx.teamId = teamId;
+            existing.ctx.origin = "slack";
+            existing.ctx.postTarget = dispatch?.channelSession ? "channel" : undefined;
             if (app.apiAppId) existing.ctx.apiAppId = app.apiAppId;
             existing.spoke = false;
+            existing.passed = false;
+            existing.passReact = undefined;
+            existing.silent = false;
+            existing.implicit = false;
+            existing.engagedBefore = dispatch?.engagedBefore;
             existing.wasCompacting = true;
+            countTurn(existing);
+            noteTurnSender(session.id, existing.ctx);
           } else {
             const compactPersonaId = session.persona_id !== "default" ? session.persona_id : undefined;
             const ctx: SlackContext = {
@@ -2461,41 +3903,44 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
               userId,
               teamId,
               personaId: compactPersonaId,
+              origin: "slack",
+              ...(dispatch?.channelSession ? { postTarget: "channel" as const } : {}),
             };
             ctx.requestApproval = (req) =>
-              approvals.request({ channel: ctx.channel, threadTs: ctx.threadTs, sessionId: session.id, app: appOf(ctx), ...req });
+              approvals.request({ channel: ctx.channel, threadTs: ctx.threadTs, sessionId: session.id, app: appOf(ctx), ...req, persona: ctx.personaId });
             ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
+            noteTurnSender(session.id, ctx);
             routes.set(session.id, {
               ctx,
               surface: wrapSurface(surfaceForCtx(ctx), session.id),
               spoke: false,
+              engagedBefore: dispatch?.engagedBefore,
               wasCompacting: true,
+              personTurns: 1,
+              personTurnAt: Date.now(),
             });
           }
           void reactions.set(session.id, channelId, eventTs, REACT_WORKING);
           void (queueDispatch
-            ? queueDispatch.dispatch(session, "/compact", { teamId, channelId, threadTs, eventTs, userId, apiAppId: app.apiAppId })
+            ? queueDispatch.dispatch(session, "/compact", { teamId, channelId, threadTs, eventTs, userId, apiAppId: app.apiAppId, origin: "slack", ...(dispatch?.channelSession ? { postTarget: "channel" as const, channelSession: true } : {}) })
             : agent.sendMessage(session.id, "/compact")
           ).catch((e: any) => console.error("[slaude] compact auto-boot error:", e?.message ?? e));
           return;
         }
+        countTurn(routes.get(session.id));
         void reactions.set(session.id, channelId, eventTs, REACT_WORKING);
         return;
       }
       if (slash.kind === "bash") {
-        const soul = soulData();
-        const managerId = soul.manager.userId;
-        const backupId = soul.backupManager.userId;
-        const isManager = (managerId && userId === managerId) || (backupId && userId === backupId);
-        if (!isManager) {
-          await reply(":no_entry: `/bash` is manager-only");
+        if (!(await managerAt("gateway.bash.role", dispatch?.personaId, userId, teamId))) {
+          await replyPrivately(":no_entry: `/bash` is manager-only");
           return;
         }
         // A gateway holds the master key, the job secret, the node key and the
         // database settings, and the output is posted to Slack: never run a
         // shell next to them. Agent turns run on nodes; so does a shell.
         if (env.role() === "gateway") {
-          await reply(
+          await replyPrivately(
             ":no_entry: `/bash` is not available on a gateway: it would run next to the gateway's secrets. " +
               "Run the command on a node (`kubectl exec` into a node pod) or in a `/remote` thread.",
           );
@@ -2528,10 +3973,15 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       }
     }
 
-    let userText = stripped;
-    const skillHit = matchSkillInvocation(stripped, discoverSkills(session.persona_id));
+    let userText = recordingOnly ? text : stripped;
+    if (dispatch?.channelSession) userText = neutraliseEnvelopeTags(userText);
+    const skillHit = recordingOnly ? null : matchSkillInvocation(stripped, allowedSkillsOf(discoverSkills(session.persona_id), skillsAllowedFor(session.persona_id)));
     if (skillHit) {
-      userText = buildSkillInvocation(skillHit.skill, skillHit.args, session.id);
+      userText = buildSkillInvocation(skillHit.skill, dispatch?.channelSession ? neutraliseEnvelopeTags(skillHit.args) : skillHit.args, session.id);
+      // A `/<slug>` invocation is a use too (it never reaches the Skill tool). Best effort, off the turn's path.
+      void backgroundAgentId(session.persona_id ?? "default")
+        .then((agentId) => recordSkillUse(agentId, skillHit.skill.slug))
+        .catch((e) => console.error(`[skills] could not record a use of /${skillHit.skill.slug}: ${e instanceof Error ? e.message : String(e)}`));
     }
 
     // Resolve username and download any file attachments into the session dir.
@@ -2540,11 +3990,31 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     // fallback in Socket Mode only: in HTTP mode it is absent by design (D1.1).
     const inboundFiles = (event.files ?? []) as SlackFile[];
     let attachToken: string | undefined;
-    if (inboundFiles.length) {
+    // A channel session's recording names its files; only a turn downloads them.
+    if (inboundFiles.length && !recordingOnly) {
       attachToken = context?.botToken ?? (env.slack.mode() === "socket" ? env.slack.botToken() : undefined);
       if (!attachToken) console.error(`[slack-attach] no bot token for the event's app — skipping ${inboundFiles.length} file(s)`);
     }
-    const [userName, files] = await Promise.all([
+    // Take this message's place in the session's dispatch order before the
+    // reads whose time varies (see takeDispatchSlot).
+    const order = takeDispatchSlot(session.id);
+    slot.release = order.release;
+    const oneOnOneLock = await OneOnOne.find(channelId, threadTs);
+    // The thread head goes to the session's first REAL turn only. The marker is a durable compare-and-set
+    // on the session row, taken AFTER the prompt pieces are built (so a failure while building loses
+    // nothing) and released if the dispatch then fails. A recording never claims it, so a thread first seen
+    // as a recording still gets its head on its first real turn; two quick first messages cannot both inject
+    // it; and a turn that cannot take a head (a root, a DM, a locked thread) still spends the marker, so a
+    // later turn never gets one mid-conversation. A session that had already started before the thread head
+    // existed spends it silently (Sessions.THREAD_HEAD_EPOCH_MS).
+    const pastFirstTurn = Sessions.hadFirstTurnBeforeThreadHead(session);
+    const headPending = suppress ? false : await Sessions.threadHeadPending(session.id).catch(() => false);
+    const wantHead =
+      headPending && !pastFirstTurn && !isDM && !!event.thread_ts && event.thread_ts !== eventTs && !oneOnOneLock && env.threadHeadMessages() > 0;
+    const proactiveBlock = suppress
+      ? Promise.resolve({ text: "", hasReply: false })
+      : turnProactiveBlock({ channel: channelId, threadTs, eventTs, personaId: dispatch?.personaId, firstTurn: !session.claude_started });
+    const [userName, files, memoryContext, proactive, builtHead] = await Promise.all([
       resolveUserName(client, userId),
       attachToken
         ? downloadAttachments({
@@ -2554,7 +4024,38 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             inboundTs: eventTs,
           })
         : Promise.resolve([]),
+      // A suppressed message is recorded only; no turn runs, so no context.
+      suppress
+        ? ""
+        : turnMemoryBlock({ channel: channelId, threadTs, userId, teamId, personaId: dispatch?.personaId, lockedUser: oneOnOneLock?.locked_user ?? null, lockedTeamId: oneOnOneLock?.team_id ?? null }),
+      proactiveBlock,
+      // Skipped when a proactive post's own context is in the prompt (the post is the context).
+      wantHead
+        ? proactiveBlock.then((p) => (p.hasReply ? "" : threadHeadBlock({ args, client, channel: channelId, threadTs, eventTs, teamId, personaId: dispatch?.personaId })))
+        : "",
     ]);
+    let threadHead = "";
+    let headClaim: number | null = null;
+    if (headPending) {
+      const at = Date.now();
+      let won = false;
+      for (let attempt = 0; attempt < 2 && !won; attempt++) {
+        try {
+          won = await Sessions.claimThreadHead(session.id, at);
+          break;
+        } catch (e) {
+          console.warn(`[thread-head] could not claim the marker session=${session.id}: ${e instanceof Error ? e.message : typeof e}`);
+        }
+      }
+      if (won) {
+        headClaim = at;
+        threadHead = builtHead;
+      }
+    }
+    const releaseHead = (): void => {
+      if (headClaim !== null) void Sessions.releaseThreadHead(session.id, headClaim).catch(() => {});
+    };
+    const proactiveContext = proactive.text;
     if (env.metricsPerUser()) {
       metric.userTurnsTotal.inc({ user_id: userId, user_name: userName });
     }
@@ -2568,100 +4069,165 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           )
           .join("\n") +
         "\n"
-      : "";
+      : recordingOnly && inboundFiles.length
+        ? "\n" + inboundFiles.map((f) => `<attachment name="${escapeAttr(f.name || f.title || f.id)}" not_downloaded="true" />`).join("\n") + "\n"
+        : "";
 
     // Per-turn channel trust hint so the agent calibrates info exposure:
     //   trusted    — internal team channel, free to show MCP/skills/internals
     //   allowed    — public channel, answer but mind exposure
     //   restricted — DM or unlisted (manager-only by the gate above)
     const trust = (() => {
-      const soul = soulData();
+      const soul = trustSoulFor(session.persona_id);
       if (channelType !== "im" && soul.trustedChannels.includes(channelId)) return "trusted";
       if (channelType !== "im" && soul.allowedChannels.includes(channelId)) return "allowed";
       return "restricted";
     })();
 
     // Wrap inbound in a channel envelope so the agent has slack context
-    // and a clear directive to reply via the MCP tool — not as plain text.
-    const oneOnOneLock = await OneOnOne.find(channelId, threadTs);
+    // and a clear directive to reply (or pass) via the MCP tools — not as plain text.
     const oneOnOneAttr = oneOnOneLock
       ? ` one_on_one="true" locked_user="<@${oneOnOneLock.locked_user}>"`
       : ` one_on_one="false" locked_user=""`;
     const envelope =
+      threadHead +
       `<channel source="slack" channel_id="${channelId}" thread_ts="${threadTs}" ` +
       `inbound_ts="${eventTs}" user_id="${userId}" user_name="${escapeAttr(userName)}" ` +
       `trust="${trust}"${oneOnOneAttr}>\n` +
       `${userText}${attachmentBlock}\n</channel>\n\n` +
+      memoryContext +
+      proactiveContext +
       (files.length
         ? `User attached ${files.length} file(s); paths above are local — Read them directly.\n`
         : "") +
-      (suppress
+      (recordingOnly
+        ? `This message was posted in the channel and is recorded for context only. Do NOT reply to it.`
+        : suppress
         ? `You are currently disengaged from this thread, so this message is recorded ` +
           `for context only — do NOT reply to it. You will catch up on it when re-engaged.`
-        : `Reply to the user by calling the \`mcp__${SLACK_MCP_NAME}__reply\` tool. ` +
+        : (implicit
+            ? `This message was not an @mention of you. It may be addressed to someone else or need no reply from you. ` +
+              `If it does not need you, call \`mcp__${SURFACE_MCP_NAME}__pass\` and say nothing. Do not mention this note in a reply.\n`
+            : "") +
+          (threadHead
+            ? `The <thread-head> above is earlier context from this thread, not part of the request. Answer the message in the <channel> envelope and ` +
+              `reply in the thread, never at the channel root. Do not say that you read the thread or that you were not mentioned. ` +
+              `If the message turns out not to be for you, call \`mcp__${SURFACE_MCP_NAME}__pass\`.\n`
+            : "") +
+          `Reply by calling \`mcp__${SURFACE_MCP_NAME}__reply\`, or call ` +
+          `\`mcp__${SURFACE_MCP_NAME}__pass\` if the message is not for you or needs nothing from you. ` +
           `Plain assistant text is not delivered to Slack — only tool calls reach the user.`);
 
-    permissions.bindSession(session.id, channelId, threadTs, app);
+    // The previous message's tail first (arrival order).
+    await order.ready;
 
-    // First turn for this session → seed the SlackContext + route.
-    // Subsequent turns → mutate the existing context so the bound MCP tools
-    // keep targeting the right thread / inbound message.
-    const existing = routes.get(session.id);
-    if (existing) {
-      existing.ctx.channel = channelId;
-      existing.ctx.threadTs = threadTs;
-      existing.ctx.inboundTs = eventTs;
-      existing.ctx.userId = userId;
-      existing.ctx.botToken = context?.botToken;
-      existing.ctx.apiAppId = app.apiAppId;
-      existing.ctx.personaId = dispatch?.personaId;
-      existing.ctx.client = outClientForPersona(dispatch?.personaId, appOf(existing.ctx));
-      existing.ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
-      existing.spoke = false;
-      existing.todoRef = undefined;       // fresh tracker per user turn
-      existing.todosSnapshot = undefined;
-      existing.pendingTaskCreate = undefined;
-      // tasksRef/tasksMap are cleared in the done handler so mid-turn inbound
-      // messages don't wipe in-flight task state from the previous turn.
-      existing.suppress = suppress;
-    } else {
-      const ctx: SlackContext = {
-        client: outClientForPersona(dispatch?.personaId, app),
-        apiAppId: app.apiAppId,
-        channel: channelId,
-        threadTs,
-        inboundTs: eventTs,
-        userId,
-        teamId,
-        botToken: context?.botToken,
-        personaId: dispatch?.personaId,
-      };
-      ctx.requestApproval = (req) =>
-        approvals.request({
-          channel: ctx.channel,
-          threadTs: ctx.threadTs,
-          sessionId: session.id,
-          app: appOf(ctx),
-          ...req,
-        });
-      ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
-      routes.set(session.id, { ctx, surface: wrapSurface(surfaceForCtx(ctx), session.id), spoke: false, suppress });
-    }
+    // During a channel wake the route stays the wake's: this message reaches
+    // the agent now (which runs it after the wake) and its route state applies
+    // when the wake ends. The received reaction goes on now: it can wait a while.
+    const applyRoute = () => {
+      // A recording that arrives during a running turn runs behind it: the turn
+      // keeps its own message, speaker and cards. Its done is left to the flag.
+      const existingRoute = routes.get(session.id);
+      const behindRunningTurn = recordingOnly && (existingRoute?.personTurns ?? 0) > 0;
+      if (behindRunningTurn) existingRoute!.recordingBehind = true;
+      if (!behindRunningTurn) permissions.bindSession(session.id, channelId, threadTs, app, session.persona_id);
 
-    // After the route is in place, so the reaction and status resolvers read
-    // THIS turn's app and persona rather than the previous turn's (or, for a
-    // new session, no route at all).
-    if (!suppress) {
-      // 👀 received
-      void reactions.set(session.id, channelId, eventTs, REACT_RECEIVED);
-      presence.enter(session.id, STATUS_THINKING);
-      void status.set(session.id, channelId, threadTs, "thinking…");
-    }
+      // First turn for this session → seed the SlackContext + route.
+      // Subsequent turns → mutate the existing context so the bound MCP tools
+      // keep targeting the right thread / inbound message.
+      const existing = existingRoute;
+      if (behindRunningTurn) {
+        // Nothing to change on the route.
+      } else if (existing) {
+        existing.ctx.channel = channelId;
+        existing.ctx.threadTs = threadTs;
+        existing.ctx.inboundTs = eventTs;
+        existing.ctx.userId = userId;
+        if (!suppress) existing.ctx.answers = userId;
+        existing.ctx.teamId = teamId;
+        existing.ctx.origin = "slack";
+        existing.ctx.postTarget = dispatch?.channelSession ? "channel" : undefined;
+        existing.ctx.botToken = context?.botToken;
+        existing.ctx.apiAppId = app.apiAppId;
+        existing.ctx.personaId = dispatch?.personaId;
+        existing.ctx.client = outClientForPersona(dispatch?.personaId, appOf(existing.ctx));
+        existing.ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
+        existing.spoke = false;
+        existing.passed = false;
+        existing.passReact = undefined;
+        // A person's message: the Stop guard applies again even when the route
+        // was last a cron run's (silent), as a node guards a Slack job.
+        existing.silent = false;
+        // An implicit message merged into a person's running turn does not relax that turn's guard.
+        if (!suppress) existing.implicit = implicit ? ((existing.personTurns ?? 0) > 0 ? existing.implicit === true : true) : false;
+        // A message merged into a running turn carries no mention result
+        // (undefined) and must not erase the running mention's; the done
+        // handler clears it at the end of every turn.
+        if (dispatch?.engagedBefore !== undefined) existing.engagedBefore = dispatch.engagedBefore;
+        existing.todoRef = undefined;       // fresh tracker per user turn
+        existing.todosSnapshot = undefined;
+        existing.pendingTaskCreate = undefined;
+        // tasksRef/tasksMap are cleared in the done handler so mid-turn inbound
+        // messages don't wipe in-flight task state from the previous turn.
+        existing.suppress = suppress;
+        if (!suppress) countTurn(existing);
+        else if (recordingOnly) existing.recordingAhead = true;
+        noteTurnSender(session.id, existing.ctx);
+      } else {
+        const ctx: SlackContext = {
+          client: outClientForPersona(dispatch?.personaId, app),
+          apiAppId: app.apiAppId,
+          channel: channelId,
+          threadTs,
+          inboundTs: eventTs,
+          userId,
+          ...(suppress ? {} : { answers: userId }),
+          teamId,
+          botToken: context?.botToken,
+          personaId: dispatch?.personaId,
+          origin: "slack",
+          ...(dispatch?.channelSession ? { postTarget: "channel" as const } : {}),
+        };
+        ctx.requestApproval = (req) =>
+          approvals.request({
+            channel: ctx.channel,
+            threadTs: ctx.threadTs,
+            sessionId: session.id,
+            app: appOf(ctx),
+            ...req,
+            persona: ctx.personaId,
+          });
+        ctx.reloadSession = (prompt?) => agent.reload(session.id, prompt);
+        noteTurnSender(session.id, ctx);
+        routes.set(session.id, { ctx, surface: wrapSurface(surfaceForCtx(ctx), session.id), spoke: false, suppress, engagedBefore: dispatch?.engagedBefore, ...(implicit ? { implicit: true } : {}), personTurns: suppress ? 0 : 1, ...(suppress ? {} : { personTurnAt: Date.now() }), ...(recordingOnly ? { recordingAhead: true } : {}) });
+      }
+
+      // After the route is in place, so the reaction and status resolvers read
+      // THIS turn's app and persona rather than the previous turn's (or, for a
+      // new session, no route at all).
+      // An implicit turn shows nothing until the model speaks: a pass leaves no flicker behind.
+      if (!suppress && !implicit) {
+        // 👀 received
+        void reactions.set(session.id, channelId, eventTs, REACT_RECEIVED);
+        presence.enter(session.id, STATUS_THINKING);
+        void status.set(session.id, channelId, threadTs, "thinking…");
+      }
+    };
+    if (routes.get(session.id)?.wakeHold && !suppress && !implicit) void reactions.set(session.id, channelId, eventTs, REACT_RECEIVED);
+    afterChannelWake(session.id, applyRoute);
 
     // The dispatch tail (queue enqueue in gateway role, in-process
     // AgentManager in mono). Extracted so the active-surface lock can defer
     // and later replay it verbatim.
     const runDispatch = async () => {
+      // Delivered now (a deferred message only when it is replayed). A
+      // suppressed message (disengaged thread, a bystander in someone's
+      // thread) is recorded but never reaches the agent, and a voice turn's
+      // events stay off the stream: neither is shown.
+      if (!suppress && !voiceTurns.active(session.id)) streamUserMessage(session.id, { userId, userName, text: stripped });
+      // On-match Guidance an inbound trigger matched: matched here, on the
+      // gateway; on nodes the text travels with the job.
+      const guidance = suppress ? [] : await inboundGuidance(dispatch?.personaId || "default", channelId, stripped).catch(() => []);
       if (queueDispatch) {
         // Gateway role: the turn runs on a node (spec §2). Suppression rides on
         // the message so the node's suppress hook records without running the
@@ -2677,20 +4243,29 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
             userId,
             personaId: dispatch?.personaId,
             apiAppId: app.apiAppId,
+            origin: "slack",
             suppress,
+            ...(implicit ? { implicit: true } : {}),
+            ...(dispatch?.channelSession ? { postTarget: "channel" as const, channelSession: true } : {}),
+            ...(guidance.length ? { guidance } : {}),
           });
         } catch (e: any) {
           console.error("[slaude] dispatch threw:", e?.message ?? e, e?.stack);
+          releaseHead();
+          if (recordingOnly) metric.channelSessionRecordFailuresTotal.inc();
         }
         return;
       }
 
       console.log(`[slaude] sendMessage session=${session.id} cwd=${session.working_dir} model=${session.model}`);
       if (suppress) agent.suppressNextTurn(session.id);
+      agent.offerGuidance(session.id, guidance);
       try {
-        await agent.sendMessage(session.id, envelope);
+        await agent.sendMessage(session.id, envelope, { sender: { userId, teamId: teamId || null, origin: "slack", text: stripped } });
       } catch (e: any) {
         console.error("[slaude] sendMessage threw:", e?.message ?? e, e?.stack);
+        releaseHead();
+        if (recordingOnly) metric.channelSessionRecordFailuresTotal.inc();
       }
     };
 
@@ -2713,13 +4288,14 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         // exactly once regardless of which replica each message lands on.
         let shouldNotice = false;
         try {
-          shouldNotice = await panelInfra.panelLock.noticeOnce(session.id);
+          // Nobody is waiting on a recording, so it neither posts the notice nor spends it.
+          shouldNotice = !recordingOnly && (await panelInfra.panelLock.noticeOnce(session.id));
         } catch {
           /* Redis hiccup — skip the notice rather than risk a duplicate */
         }
         if (shouldNotice) {
           try {
-            await outClientForPersona(dispatch?.personaId, app).chat.postMessage({
+            await outClientForPersona(dispatch?.personaId, app).chat.postMessage({ // runtime-ui: gateway notice, card or command reply
               channel: channelId,
               thread_ts: threadTs,
               text: "⏸ handled in ops panel — I'll catch up on your messages here when the operator hands back.",
@@ -2766,6 +4342,18 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const row = await Sessions.findByThread({ team_id: teamId, channel_id: channelId, thread_ts: threadTs, persona_id: personaId });
     if (row) await Sessions.setEngaged(row.id, value);
   };
+  /** A mention engages the thread and returns whether it was engaged before
+   *  (no row, a first mention, is `false`). A second delivery of an event that
+   *  was already handled (app_mention and message carry the same ts) writes
+   *  nothing: it would re-engage a thread that the first delivery's turn gave
+   *  back by passing. handleMessage drops that delivery as a duplicate. */
+  const engageOnMention = async (teamId: string | undefined, channelId: string, threadTs: string, eventTs: string, personaId = "default") => {
+    if (!teamId) return undefined;
+    if (await SeenEvents.has(`${channelId}:${eventTs}`)) return undefined;
+    const prior = await Sessions.findByThread({ team_id: teamId, channel_id: channelId, thread_ts: threadTs, persona_id: personaId });
+    await persistEngaged(teamId, channelId, threadTs, true, personaId);
+    return !!prior && !!prior.engaged;
+  };
 
   // Bot identities (D1.4). With several registered apps in one channel, every
   // message reaches every app, so "self" must be the union of ALL registered
@@ -2773,12 +4361,12 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   // echo, or the bots answer each other. "This bot" (whom a mention engages)
   // is the delivering app's own bot user. Each app's ids come from its own
   // client's auth.test, cached per app.
-  const botIdsCache = new Map<string, { userId: string; botId: string }>();
-  const botIdsOf = async (key: string, client: any): Promise<{ userId: string; botId: string }> => {
+  const botIdsCache = new Map<string, { userId: string; botId: string; name?: string }>();
+  const botIdsOf = async (key: string, client: any): Promise<{ userId: string; botId: string; name?: string }> => {
     const hit = botIdsCache.get(key);
     if (hit) return hit;
     const res = await client.auth.test();
-    const ids = { userId: res.user_id as string, botId: (res as any).bot_id as string };
+    const ids = { userId: res.user_id as string, botId: (res as any).bot_id as string, ...(typeof (res as any).user === "string" ? { name: (res as any).user as string } : {}) };
     botIdsCache.set(key, ids);
     return ids;
   };
@@ -2877,15 +4465,678 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     return ids;
   };
 
+  // Decision gate (phase B): consulted before a mention or an engaged plain
+  // reply starts a turn. Off until the boot-time runner resolves; a boot
+  // failure leaves it off.
+  let gateRunner: GateRunner | null = opts.gateRunner ?? null;
+  if (!opts.gateRunner) {
+    const resolver = providerSecretResolver();
+    void gateRunnerFromEnv({ resolveSecret: (ref) => resolver.resolve(parseRef(ref), { persona: "default" }) })
+      .then((r) => {
+        gateRunner = r;
+        if (r.mode !== "off") console.log(`[gate] mode=${r.mode}`);
+      })
+      .catch((e: any) => console.error(`[gate] boot failed (${e?.name ?? "error"}); decision gate off`));
+  }
+
+  /**
+   * The gate's view of who the agent is. The identity addressed is the named
+   * persona when the event is routed to one (its mentions become `<agent>`),
+   * else the delivering bot. Every identity of this deployment (each app's bot,
+   * each persona user, the post-as-user identity) authors role "agent" posts.
+   */
+  const gateSelfIds = async (args: any, personaId?: string) => {
+    const registry = getPersonaRegistry();
+    const persona = personaId && personaId !== "default" ? registry.lookupByName(personaId) : null;
+    const bots = await getSelfBots(args);
+    const userIds = new Set<string>([...bots.userIds, ...(await getSelfUserIds())]);
+    for (const p of registry.list()) if (p.slackUserId) userIds.add(p.slackUserId);
+    return { botUserId: persona?.slackUserId ?? (await getBotId(args)), botIds: bots.botIds, userIds };
+  };
+
+  /**
+   * Why an event is dropped before any turn, or null if it is not. The early
+   * filters, in handleMessage's order: missing team or user, self bot echo,
+   * self user echo, ignore gate, admission for the persona (the /1on1 lock
+   * is checked after, by each caller). `reason` is the slackDropsTotal label
+   * and `log` the line handleMessage prints; `log: null` is a silent drop
+   * (no line, no metric). Read-only itself (no log, no metric); any claim
+   * belongs to the caller's `afterSelfEcho` step.
+   * `afterSelfEcho` is a caller step run after the self-echo checks and
+   * before the ignore gate (handleMessage's dedup claim); the gate passes none.
+   */
+  // Both handleMessage and the decision gate (ingressDrops) depend on this: a filter added here reaches both.
+  const preTurnDropReason = async (
+    args: any,
+    o: {
+      personaId?: string;
+      afterSelfEcho?: () => Promise<PreTurnDrop | null>;
+      /** handleMessage's step: told of an inbound guardrail verdict (deny or
+       *  audit) to record it. The gate passes none: it never records or posts. */
+      onGuardrail?: (v: InboundVerdict) => void;
+    } = {},
+  ): Promise<PreTurnDrop | null> => {
+    const e: any = args.event;
+    const teamId: string | undefined = args.context?.teamId ?? e.team;
+    const channelId: string = e.channel;
+    const userId: string | undefined = e.user;
+    const eventTs: string = e.ts;
+    const channelType: string = e.channel_type ?? "";
+    if (!teamId || !userId) return { reason: "missing_identity", log: null };
+    // Drop only self-echoes; other bots' messages flow through so slaude can
+    // see CI alerts, summarizer bots, etc. in shared threads.
+    if (await isSelfBotEcho(args, e)) {
+      return { reason: "self_bot", log: `[slack-rx] drop ch=${channelId} ts=${eventTs} — self bot echo` };
+    }
+    // Self-echo when posting as a real user (xoxp) — default identity or a named
+    // persona: own posts carry our user id and no bot_id. Drop them to avoid
+    // re-ingesting our own output.
+    if ((await getSelfUserIds()).has(userId)) {
+      return { reason: "self_user", log: `[slack-rx] drop ch=${channelId} ts=${eventTs} — self user echo` };
+    }
+    if (o.afterSelfEcho) {
+      const drop = await o.afterSelfEcho();
+      if (drop) return drop;
+    }
+    // First sight: whoever reaches this point is a real Slack user, admitted or about to be
+    // refused below (blocked, not granted, ignored), so every outcome records the actor.
+    observeSlackUser({ teamId, userId });
+    observeSlackChannel({ teamId, channelId });
+    // Ignore gate: temp/permanent ignores for users or threads. /unignore* must
+    // bypass it — otherwise a thread-ignore drops the very message meant to lift it
+    // (the /unignore-thread is in the ignored thread), and the thread is stuck
+    // ignored forever. The admission check below still applies, so this
+    // doesn't grant a non-allowed user any new reach.
+    {
+      const text: string = (e.text || "").toString().trim();
+      const threadTs: string = e.thread_ts || eventTs;
+      // botUserId isn't resolved yet here; strip any leading user-mention so a
+      // "<@bot> /unignore-thread" still parses.
+      const peek = parseSlashCommand(text.replace(/<@[^>]+>/g, "").trim());
+      const isUnignore = peek?.kind === "unignore";
+      if (!isUnignore && (await ignoreGate.shouldDrop(userId, channelId, threadTs))) {
+        return { reason: "ignored", log: `[slack-rx] drop ch=${channelId} user=${userId} thread=${threadTs} — ignored` };
+      }
+    }
+    // Admission over the persona's effective grants (soul-derived plus stored):
+    // a deny drops (blocked_user, before anything else, never reaches Claude);
+    // the manager is admitted anywhere; a DM needs a member grant (the soul's DM
+    // allowlist or a stored member); a channel needs a channel grant (the soul's
+    // trusted and allowed channels), a stored member grant or a workspace grant.
+    // Approvers can still click Approve / Deny on request_approval blocks but
+    // cannot chat on that right alone.
+    {
+      const persona = o.personaId || "default";
+      const verdict = (await admitAt({ site: "gateway.admit", persona, teamId, userId, channelId, isDM: channelType === "im", grants: await loadGrants(persona) }));
+      if (!verdict.ok && verdict.reason === "blocked_user") {
+        return { reason: "blocked_user", log: `[slack-rx] drop ch=${channelId} user=${userId} — blocked user` };
+      }
+      if (!verdict.ok) {
+        return {
+          reason: "whitelist",
+          log:
+            `[slack-rx] drop ch=${channelId} user=${userId} persona=${persona}: not granted here` +
+            (soulDataFor(persona).manager.userId ? "" : " (no manager set in SOUL.md)"),
+        };
+      }
+    }
+    // Owner inbound rules, after admission (design section 4): a deny drops
+    // the message with the rule's message as the reply; an audit lets it on.
+    {
+      const persona = o.personaId || "default";
+      const v = await inboundVerdict(persona, channelId, (e.text || "").toString());
+      if (v) o.onGuardrail?.(v);
+      if (v?.action === "deny") {
+        return { reason: "owner_guardrail", log: `[slack-rx] drop ch=${channelId} user=${userId} persona=${persona}: ${v.slug ? `owner guardrail ${v.slug}` : "owner guardrails unavailable"}`, reply: v.message };
+      }
+    }
+    return null;
+  };
+
+  /**
+   * Whether the decision gate must skip this event: handleMessage would drop
+   * it before any turn (preTurnDropReason, without the dedup claim), or it is
+   * a mention with no text. The gate never sees such a message, so nothing
+   * the agent is configured never to read leaves the deployment, and nobody
+   * it ignores gets a 🤔. Read-only: no claim, no log, no metric.
+   */
+  const ingressDrops = async (args: any, personaId?: string): Promise<boolean> => {
+    if (await preTurnDropReason(args, { personaId })) return true;
+    const e: any = args.event;
+    const text: string = (e.text || "").toString().trim();
+    const hasFiles = Array.isArray(e.files) && e.files.length > 0;
+    return !text.replace(/<@[^>]+>/g, "").trim() && !hasFiles;
+  };
+
+  /**
+   * Whether handleMessage would handle this event itself, with no turn: a
+   * slaude text command (parsed after stripping the bot and persona mention,
+   * exactly as handleMessage strips them) or, while a paste-back connect flow
+   * is parked for this person in this thread, a possible pasted callback.
+   * Commands bypass the gate (spec §7.2): a doubted /help must still answer,
+   * and /abort must not wait for a decision.
+   */
+  const ingressHandlesLocally = async (args: any, personaId?: string): Promise<boolean> => {
+    const e: any = args.event;
+    const text: string = (e.text || "").toString().trim();
+    const botUserId = await getBotId(args);
+    const personaUserId = personaId ? getPersonaRegistry().lookupByName(personaId)?.slackUserId : undefined;
+    const stripped = text
+      .replace(new RegExp(`<@${botUserId}>`, "g"), "")
+      .replace(personaUserId ? new RegExp(`<@${personaUserId}>`, "g") : /(?!x)/g, "")
+      .trim();
+    const hit = parseSlashCommand(stripped);
+    // `/new` is only a command at a channel session's root; elsewhere it takes the gate like any text.
+    if (hit && (hit.kind !== "new" || inChannelMode(e, personaId))) return true;
+    const threadTs: string = e.thread_ts || e.ts;
+    return Boolean(await SlackOauthFlows.peekFlow(pasteKey(e.channel, threadTs, e.user)));
+  };
+
+  /** Synchronous: with no runner or an off runner the call sites never await the gate. */
+  const gateActive = (): boolean => gateRunner !== null && gateRunner.mode !== "off";
+
+  /**
+   * The gate's action for this event, or undefined for today's path: the gate
+   * off, the thread under a /1on1 lock, a message the ingress would drop or
+   * handle itself (a text command, a pasted connect callback), or any error.
+   * `actual` is what the caller does today for this message: "run" on every
+   * mention path (every existing call site passes "run").
+   *
+   * An implicit consult (`o.implicit` set: no mention, the channel opted in)
+   * reads `undefined` as PASS, never run: off, /1on1, an ingress drop, a
+   * timeout, an error and a missing adapter all mean the message does not get
+   * a turn. For such a consult the returned `source` says who decided; a
+   * `rules` source is a pass (the runner already turns it into "drop").
+   */
+  const consultGateWithSource = async (
+    args: any,
+    o: { mentionsAgent: boolean; personaId?: string; continuation?: boolean; implicit?: ImplicitLevel },
+    actual: GateAction,
+  ): Promise<GateConsult | undefined> => {
+    const runner = gateRunner;
+    // An implicit consult is independent of the deployment gate mode (the
+    // channel's engage mode rules); the mention paths honor it as always.
+    if (!runner || (!o.implicit && runner.mode === "off")) return undefined;
+    const e: any = args.event;
+    const key = gateKey({
+      channel: e.channel,
+      ts: e.ts,
+      persona: o.personaId,
+      app: args.context?.apiAppId,
+      continuation: o.continuation,
+      implicit: o.implicit,
+    });
+    try {
+      const threadTs: string = e.thread_ts || e.ts;
+      if (await OneOnOne.find(e.channel, threadTs)) return undefined;
+      if (await ingressDrops(args, o.personaId)) return undefined;
+      if (await ingressHandlesLocally(args, o.personaId)) return undefined;
+      const teamId: string | undefined = args.context?.teamId ?? e.team;
+      const client = args.client ?? t.client;
+      const input = async () => {
+        // An implicit message has no engaged thread to lean on: the model must
+        // not be told it is already in the conversation.
+        const engaged = o.implicit
+          ? false
+          : o.mentionsAgent
+          ? !!teamId &&
+            !!(await Sessions.findByThread({ team_id: teamId, channel_id: e.channel, thread_ts: threadTs, persona_id: o.personaId ?? "default" }))?.engaged
+          : true;
+        // Deliberately NO teamId: without a team resolveBrainScope adds no
+        // profile source, so a person's profile never feeds the hit score sent
+        // to the external decision classifier. Do not "fix" by adding teamId
+        // (tests/gateway/core/decision-gate.test.ts pins this).
+        const ctx = { channel: e.channel, threadTs, userId: e.user, personaId: o.personaId } as SlackContext;
+        const deps: GateContextDeps = {
+          replies: (channel, thread, limit) => threadTail(client, channel, thread, e.ts, limit),
+          kbSearch: brainEnabled()
+            ? async (q) => gather(q, await resolveBrainScope({ ...(await brainGateFor(ctx)), kbSources: personaKbSourceIds(o.personaId) }))
+            : null,
+          selfIds: await gateSelfIds(args, o.personaId),
+        };
+        const gi = await buildGateInput(
+          { channel: e.channel, ts: e.ts, thread_ts: e.thread_ts, text: (e.text ?? "").toString() },
+          { mentionsAgent: o.mentionsAgent, engaged, channelTrust: GATE_TRUST[channelTrustFor(e.channel, trustSoulFor(o.personaId))], contextMessages: runner.contextMessages },
+          deps,
+        );
+        return o.implicit ? { ...gi, implicit: o.implicit, continuation: !!o.continuation } : gi;
+      };
+      if (o.implicit) {
+        return await runner.consultImplicit(key, input, { level: o.implicit, continuation: !!o.continuation });
+      }
+      return await runner.consult(key, input, actual);
+    } catch {
+      console.error(`[gate] error key=${key}`);
+      return undefined;
+    }
+  };
+
+  const consultGate = async (
+    args: any,
+    o: { mentionsAgent: boolean; personaId?: string },
+    actual: GateAction,
+  ): Promise<GateAction | undefined> => (await consultGateWithSource(args, o, actual))?.action;
+
+  /** The doubt reaction on a mention; the other copy of the same mention may have added it already. */
+  const reactDoubt = async (args: any, personaId?: string): Promise<void> => {
+    const e: any = args.event;
+    try {
+      await outClientForPersona(personaId, { apiAppId: args.context?.apiAppId, teamId: args.context?.teamId ?? e.team }).reactions.add({
+        channel: e.channel, timestamp: e.ts, name: REACT_DOUBT,
+      });
+    } catch (err: any) {
+      if (err?.data?.error !== "already_reacted") {
+        console.error(`[gate] doubt reaction failed ch=${e.channel} ts=${e.ts}:`, err?.data?.error ?? err?.message);
+      }
+    }
+  };
+
+  /**
+   * record_doubt on a mention: react, record into the persona's existing
+   * session (suppressed), never engage. No session: nothing to record into.
+   */
+  const recordDoubt = async (args: any, personaId?: string): Promise<void> => {
+    const e: any = args.event;
+    const teamId: string | undefined = args.context?.teamId ?? e.team;
+    const threadTs: string = e.thread_ts || e.ts;
+    // Already claimed by handleMessage (the other copy of this mention ran or
+    // was recorded): no 🤔 on a message the agent may be answering, and the
+    // record below would be deduped anyway.
+    if (await SeenEvents.has(`${e.channel}:${e.ts}`)) return;
+    await reactDoubt(args, personaId);
+    const row = teamId
+      ? await Sessions.findByThread({ team_id: teamId, channel_id: e.channel, thread_ts: threadTs, persona_id: personaId ?? "default" })
+      : null;
+    if (row) {
+      console.log(`[slack-rx] record ch=${e.channel} ts=${e.ts} user=${e.user} — gate doubt, suppressed`);
+      return await handleMessage(args, { suppress: true, personaId });
+    }
+    console.log(`[slack-rx] drop ch=${e.channel} ts=${e.ts} user=${e.user} — gate doubt, no session to record into`);
+  };
+
+  /** An engaged plain reply the gate records rather than runs. */
+  const recordEngaged = async (args: any, personaId?: string): Promise<void> => {
+    const e: any = args.event;
+    console.log(`[slack-rx] record ch=${e.channel} ts=${e.ts} user=${e.user} — gate record, suppressed`);
+    return await handleMessage(args, { suppress: true, personaId });
+  };
+
   // app_mention is a guaranteed delivery path even if message.channels event
   // subscription isn't enabled. Engage the thread, then defer to handleMessage.
   // (handleMessage's seen_events dedup prevents double-handling when the same
   //  ts also arrives via the message event.)
+  // Feedback on proactive posts (phase E): replies go through the message
+  // router below; a reaction is recorded as an outcome (never a mute).
+  const proactiveFeedbackDeps = (args: any): FeedbackDeps => ({
+    call: brainCall,
+    now: () => new Date(),
+    reply: async (channel, threadTs, text) => {
+      await (args.client ?? t.client).chat.postMessage({ channel, thread_ts: threadTs, text }); // runtime-ui: gateway notice, card or command reply
+    },
+    once: (key) => SeenEvents.tryInsert(key),
+  });
+  /**
+   * Is this copy of a reply under a proactive post the copy of the app that
+   * made the post? Slack delivers a channel message to every app installed
+   * there, and the thread must be taken (its session stamped with the
+   * receiving app) by the bot that posted. The root's author
+   * (`parent_user_id`) being this app's bot decides it. A root posted as a
+   * real user (xoxp), or an event without `parent_user_id`, names no app:
+   * taken only when no other registered app's bot is in the channel (a
+   * single-app deploy); a failed member lookup reads as one being there.
+   */
+  const postedThroughThisApp = async (args: any, e: any): Promise<boolean> => {
+    const own = await getBotId(args);
+    if (e.parent_user_id && e.parent_user_id === own) return true;
+    if (e.parent_user_id && !(await getSelfUserIds()).has(e.parent_user_id)) return false;
+    const others = [...(await getSelfBots(args)).userIds].filter((u) => u && u !== own);
+    return !others.length || !(await anyInChannel(args.client ?? t.client, e.channel, others));
+  };
+  t.event("reaction_added", async (args: any) => {
+    const e: any = args.event;
+    if (e?.item?.type !== "message" || !e.user || !brainEnabled() || !brainReady()) return;
+    if ((await getSelfUserIds()).has(e.user) || (await getSelfBots(args)).userIds.has(e.user)) return;
+    try {
+      await onProactiveReaction({ channel: e.item.channel, messageTs: e.item.ts, userId: e.user, reaction: String(e.reaction ?? "") }, proactiveFeedbackDeps(args));
+    } catch (err) {
+      console.error(`[proactive] reaction on ch=${e.item.channel} failed: ${redactSecrets(err instanceof Error ? err.message : String(err))}`);
+    }
+  });
+
+  /** The agents this delivery speaks for: the app's own, or every agent sharing this app. A persona with its own app is left to that app's copy. */
+  const channelSessionAgents = async (args: any): Promise<(string | undefined)[]> => {
+    const own = appPersonaOf(args);
+    if (own) return [own];
+    const apps = await registeredApps();
+    const personaHasOwnApp = (name: string) => apps.some((a) => a.personaId === name);
+    return [undefined, ...getPersonaRegistry().list().map((p) => p.name).filter((n) => n !== "default" && !personaHasOwnApp(n))];
+  };
+  const inChannelMode = (e: any, persona: string | undefined): boolean =>
+    isRootChannelEvent(e) && channelSessionOn(persona ?? "default", e.channel);
+  /** Whether a message names the agent: a named persona's own Slack user, or the app's bot for the app's own agent. */
+  const mentionsAgent = (args: any, persona: string | undefined, mentions: (string | undefined)[], botId: string): boolean => {
+    if (persona === appPersonaOf(args) && mentions.includes(botId)) return true;
+    const user = persona ? getPersonaRegistry().lookupByName(persona)?.slackUserId : undefined;
+    return !!user && mentions.includes(user);
+  };
+  /**
+   * The client engagement reads Slack with (the classifier's input, the debounce
+   * re-check, the users list): the delivering app's no-retry lookup client, as the
+   * thread head uses, which rejects a rate-limited call instead of waiting on
+   * Retry-After. Where no bot token is known the delivery's own client is the
+   * fallback, exactly as for the thread head.
+   */
+  const engageReader = (args: any): any => {
+    let token: string | undefined = args?.context?.botToken;
+    if (!token && env.slack.mode() === "socket") {
+      try {
+        token = env.slack.botToken();
+      } catch {
+        token = undefined;
+      }
+    }
+    return (token ? lookupClients.forToken(token) : null) ?? args?.client ?? t.client;
+  };
+  /** Aborted when this gateway stops: pending classifier timers are cancelled and their jobs dropped. */
+  const shadowAbort = new AbortController();
+  /** At most this many messages are asked of Slack for one engagement read, always one page. */
+  const ENGAGE_READ_LIMIT = 15;
+  /** A thread read looks only at the most recent stretch of the thread (a single page is the oldest of its window). */
+  const ENGAGE_THREAD_WINDOW_S = 1200;
+  const withinMs = <T,>(p: Promise<T>, ms: number): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    p.catch(() => {});
+    return Promise.race([p, new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("deadline")), ms); })]).finally(() => clearTimeout(timer));
+  };
+  /**
+   * Phase 1: what the shadow classifier needs for one delivery. With no adapter
+   * configured the classifier is null (a counted pass, no input, no Slack read).
+   * `admit` refuses, before any budget is spent, a message the ingress would not
+   * hear (a blocked or ignored author, an owner deny rule, a /1on1 thread, a
+   * command); the input builder then makes one single-page Slack read.
+   */
+  const shadowFor = (args: any, personaId: string | undefined): ShadowDeps => {
+    const runner = gateRunner;
+    const e: any = args.event;
+    const teamId: string | undefined = args.context?.teamId ?? e.team;
+    const reader = engageReader(args);
+    const readFailed = (what: string, err: unknown): never => {
+      // The error code only: never a message, a token or a body.
+      console.warn(`[engage] ${what} read failed code=${errorCode(err)}`);
+      throw err;
+    };
+    return {
+      classifier: runner && runner.hasAdapter ? gateClassifier(runner) : null,
+      ...(teamId ? { tenant: teamId } : {}),
+      signal: shadowAbort.signal,
+      admit: async () => {
+        if (await OneOnOne.find(e.channel, e.thread_ts || e.ts)) return false;
+        if (await ingressDrops(args, personaId)) return false;
+        if (await ingressHandlesLocally(args, personaId)) return false;
+        return true;
+      },
+      // A top-level question waited for a human answer: look once more, on one bounded history page since the message.
+      recheck: async () => {
+        const r: any = await withinMs<any>(reader.conversations.history({ channel: e.channel, oldest: e.ts, inclusive: true, limit: ENGAGE_READ_LIMIT }), 2000).catch((err) => readFailed("recheck", err));
+        if (!r?.ok) return readFailed("recheck", { data: { error: r?.error } });
+        const msgs: any[] = r.messages ?? [];
+        const me = msgs.find((x) => x.ts === e.ts);
+        if (!me || me.edited) return "stale";
+        const ids = await gateSelfIds(args, personaId);
+        const self = new Set<string>([ids.botUserId, ...ids.userIds].filter(Boolean));
+        const human = (u: unknown): boolean => typeof u === "string" && u !== e.user && !self.has(u);
+        // Any reply at all (a colleague, the author, a bot or the agent itself) means the thread has moved on.
+        if ((Number(me.reply_count) || 0) > 0 || (Array.isArray(me.reply_users) && me.reply_users.length > 0)) return "answered";
+        if (msgs.some((x) => Number(x.ts) > Number(e.ts) && !x.bot_id && human(x.user))) return "answered";
+        return "ok";
+      },
+      buildInput: async (req) => {
+        const persona = personaId ?? "default";
+        const own = await ownIdentities(args, personaId);
+        const grants = await loadGrants(persona);
+        const isSelf = (x: { user?: string; bot_id?: string }) => (x.user ? own.has(`u:${x.user}`) : false) || (x.bot_id ? own.has(`b:${x.bot_id}`) : false);
+        const filter = makeAuthorFilter({
+          isSelf,
+          isAdmitted: async (userId) => (await admitAt({ site: "gateway.engage_input.admit", persona, teamId, userId, channelId: e.channel, isDM: false, grants })).ok,
+          // The user-level ignore; a thread-level one is judged per message (dropMessage), for that message's own thread.
+          isIgnored: async (userId) => (await Ignores.findActiveForUser(userId)) != null,
+          textDenied: async (text) => (await inboundVerdict(persona, e.channel, text))?.action === "deny",
+        });
+        const ids = await gateSelfIds(args, personaId);
+        const reg = personaId && personaId !== "default" ? getPersonaRegistry().lookupByName(personaId) : null;
+        const key = `${args?.context?.apiAppId ?? ""}:${args?.context?.teamId ?? e.team ?? ""}`;
+        const names = [personaId && personaId !== "default" ? personaId : "", reg?.config?.name ?? "", ...(personaId === appPersonaOf(args) ? [botIdsCache.get(key)?.name ?? ""] : []), ...aliasesFor(personaId)].filter(Boolean);
+        return await buildImplicitInput(
+          {
+            replies: async (thread) => {
+              const r = await reader.conversations.replies({ channel: e.channel, ts: thread, latest: e.ts, inclusive: true, oldest: String(Math.max(0, Number(e.ts) - ENGAGE_THREAD_WINDOW_S)), limit: ENGAGE_READ_LIMIT });
+              if (!r?.ok) throw new Error("conversations.replies failed");
+              return (r.messages ?? []) as any[];
+            },
+            history: async () => {
+              const r = await reader.conversations.history({ channel: e.channel, latest: e.ts, inclusive: false, limit: ENGAGE_READ_LIMIT });
+              if (!r?.ok) throw new Error("conversations.history failed");
+              return [...((r.messages ?? []) as any[])].reverse();
+            },
+            filter,
+            dropMessage: async (m) => (await Ignores.findActiveForThread(e.channel, m.thread_ts ?? req.thread ?? m.ts)) != null,
+            isSelf,
+            selfUserIds: new Set<string>([ids.botUserId, ...ids.userIds].filter(Boolean)),
+            botUserId: ids.botUserId,
+            names,
+            channelTrust: GATE_TRUST[channelTrustFor(e.channel, trustSoulFor(personaId))],
+            contextMessages: runner?.contextMessages,
+          },
+          { ts: e.ts, text: String(e.text ?? ""), threadTs: req.thread, level: req.level, continuation: req.continuation },
+          String(e.user ?? ""),
+        ).catch((err) => readFailed("input", err));
+      },
+    };
+  };
+  /**
+   * Implicit engagement, phases 0 and 1: for a message the agent is not going to
+   * answer, count what the deterministic tiers would have done and, with an
+   * adapter configured, what a classifier would. Observe only. Does nothing at
+   * all (no read, no counter) while the channel is at level `mention`, the
+   * default, and never throws or changes what happens next.
+   */
+  const observeImplicit = async (args: any, personaId: string | undefined, site: "drop" | "channel_session"): Promise<boolean> => {
+    // Whether the agent took part (handleMessage was called as for a mention): the caller then does not record the message itself.
+    let acted = false;
+    try {
+      const e: any = args.event;
+      const setting = e?.channel ? engageFor(personaId, e.channel) : null;
+      if (!setting || setting.level === "mention") return false;
+      const threadTs: string = e.thread_ts || e.ts;
+      // Observing never holds the recording path: each lookup is cut off, and a miss reads as "unknown".
+      const bound = <T,>(p: Promise<T>, fallback: T): Promise<T> =>
+        Promise.race([p.catch(() => fallback), new Promise<T>((r) => setTimeout(() => r(fallback), 100).unref?.())]);
+      const key = `${args?.context?.apiAppId ?? ""}:${args?.context?.teamId ?? e.team ?? ""}`;
+      const [botId, oneOnOne, agents] = await Promise.all([
+        bound(getBotId(args), ""),
+        bound(OneOnOne.find(e.channel, threadTs).then((r) => r != null), false),
+        bound(channelSessionAgents(args), [] as (string | undefined)[]),
+      ]);
+      // Phase 2 acts only in a channel whose mode is on; the hooks are not even built otherwise.
+      const act = setting.mode === "on"
+        ? {
+            deferrable: site === "drop",
+            run: async (d: ImplicitRun): Promise<void> => {
+              acted = (await actImplicit(args, personaId, d, site)) || acted;
+            },
+          }
+        : undefined;
+      const shadow = shadowFor(args, personaId);
+      await observeEngage({
+        event: e,
+        teamId: args.context?.teamId ?? e.team,
+        loadUsers: async () => {
+          // The agent's own Slack users are not colleagues who share its name.
+          const ids = await gateSelfIds(args, personaId);
+          return loadUserNames(engageReader(args), { exclude: new Set<string>([ids.botUserId, ...ids.userIds].filter(Boolean)) });
+        },
+        // An awaited classifier call (mode on) is bounded by the decision config's own deadline.
+        shadow: act ? { ...shadow, deadlineMs: gateRunner?.timeoutMs ?? 1000 } : shadow,
+        ...(act ? { act } : {}),
+        personaId,
+        appId: args.context?.apiAppId,
+        botId,
+        // More than one persona behind this app's bot: a root it posted cannot be told to be this persona's.
+        sharedBot: personaId !== appPersonaOf(args) || agents.length > 1,
+        // The bot's cached user name (from the auth.test the id lookup already made); only for the persona that is this app's own.
+        ...(personaId === appPersonaOf(args) && botIdsCache.get(key)?.name ? { botName: botIdsCache.get(key)!.name } : {}),
+        locks: { oneOnOne, mentionOnly: false, disengaged: false },
+        threadEngaged: false,
+        site,
+      });
+    } catch {
+      /* observing must never reach the handler */
+    }
+    return acted;
+  };
+  /**
+   * Phase 2: take part in a message nobody @mentioned, as if it had been (the same access checks, the same
+   * handler), with the turn marked implicit. In order: the ingress checks (a classifier job has done
+   * them already), the one-owner claim across personas and apps, the channel's hourly cap, then the mention
+   * path. Never throws. True once handleMessage was called.
+   */
+  const actImplicit = async (args: any, personaId: string | undefined, d: ImplicitRun, site: "drop" | "channel_session"): Promise<boolean> => {
+    const e: any = args.event;
+    const teamId: string | undefined = args.context?.teamId ?? e.team;
+    const count = (outcome: string) => metric.engageActTotal.inc({ tier: String(d.tier), outcome, level: d.level });
+    const seenKey = site === "channel_session" ? `${e.channel}:${e.ts}:${personaId ?? "default"}` : `${e.channel}:${e.ts}`;
+    try {
+      if (d.deferred) {
+        // Fired from the timer: everything the router decides is decided again for the thread as it is now.
+        if (env.engageForceShadow()) {
+          count("forced_shadow");
+          return false;
+        }
+        const now = engageFor(personaId, e.channel);
+        if (now.level === "mention" || now.mode !== "on") {
+          console.log(`[engage] act skipped channel=${e.channel} tier=${d.tier} reason=mode`);
+          return false;
+        }
+        const rootTs: string = e.thread_ts || e.ts;
+        if (await MentionOnly.find(e.channel, rootTs)) {
+          console.log(`[engage] act skipped channel=${e.channel} tier=${d.tier} reason=mention_only`);
+          return false;
+        }
+        // Any session row for the thread (engaged, disengaged, or one a mention started meanwhile) settles it elsewhere.
+        if (teamId && (await Sessions.findAnyByThread({ team_id: teamId, channel_id: e.channel, thread_ts: rootTs }))) {
+          console.log(`[engage] act skipped channel=${e.channel} tier=${d.tier} reason=session_exists`);
+          return false;
+        }
+      }
+      // Already claimed by another copy or an earlier delivery: nothing to do, nothing to count.
+      if (await SeenEvents.has(seenKey)) return false;
+      if (!d.admitted) {
+        const admit = shadowFor(args, personaId).admit!;
+        if (!(await admit())) {
+          console.log(`[engage] act skipped channel=${e.channel} tier=${d.tier} reason=admit`);
+          return false;
+        }
+      }
+      const state = engageState();
+      if (!(await state.claimAct(e.channel, String(e.ts)))) {
+        count("lost_claim");
+        return false;
+      }
+      const slot = await state.actSlot(e.channel, env.engageActPerHour(), teamId);
+      if (slot !== "ok") {
+        count(slot === "cap" ? "cap" : "error");
+        return false;
+      }
+      count("acted");
+      console.log(`[engage] act channel=${e.channel} level=${d.level} tier=${d.tier} source=${d.source} reason=${d.reason} ts=${e.ts} persona=${personaId ?? "default"} site=${site}`);
+      if (site === "channel_session") {
+        await handleMessage(args, { personaId, channelSession: true, implicit: true });
+        return true;
+      }
+      // The mention path: engage the thread, remember whether it was engaged before so a pass gives it back.
+      const engagedBefore = await engageOnMention(teamId, e.channel, e.thread_ts || e.ts, e.ts, personaId);
+      await handleMessage(args, { personaId, engagedBefore, implicit: true });
+      return true;
+    } catch (err) {
+      count("error");
+      // A channel session records the message when the agent does not take part: free the claim the failed attempt consumed.
+      if (site === "channel_session") await SeenEvents.remove(seenKey).catch(() => {});
+      console.error(`[engage] act failed channel=${e.channel} ts=${e.ts}: ${redactSecrets(err instanceof Error ? err.message : String(err))}`);
+      return false;
+    }
+  };
+  /** A human message handled some other way (a mention, a reply in an engaged thread) makes the agent's last-speaker record stale. */
+  const staleRecord = (e: any, personaId: string | undefined): void =>
+    clearAgentRecord({ channel: e?.channel, thread: e?.thread_ts && e.thread_ts !== e.ts ? e.thread_ts : null, persona: personaId });
+  /** The agent's own message, seen as an echo: remember it for the next human message. Observe only. */
+  const noteEcho = (args: any, e: any): void => {
+    try {
+      if (!e?.channel || !e?.ts) return;
+      // The runtime's own cards (buttons, sections) and its waiting-for-approval and refusal notices are not the agent speaking.
+      // (A tracker or status text posted as plain text cannot be told apart here and is recorded.)
+      if (Array.isArray(e.blocks) && e.blocks.some((b: any) => b?.type && b.type !== "rich_text")) return;
+      if (/^:(hourglass_flowing_sand|no_entry_sign|warning):/.test(String(e.text ?? ""))) return;
+      const reg = getPersonaRegistry();
+      const named = e.user ? reg.lookupByUserId(e.user)?.name : undefined;
+      const viaOtherApp = Boolean(e.bot_profile?.app_id && args.context?.apiAppId && e.bot_profile.app_id !== args.context.apiAppId);
+      const persona = named ?? (viaOtherApp ? undefined : appPersonaOf(args));
+      noteAgentMessage({
+        channel: e.channel,
+        thread: e.thread_ts && e.thread_ts !== e.ts ? e.thread_ts : null,
+        ts: e.ts,
+        persona,
+        app: e.bot_profile?.app_id ?? args.context?.apiAppId ?? null,
+        fromEcho: true,
+      });
+    } catch {
+      /* observing must never reach the handler */
+    }
+  };
+  /** Handles a root message for the agents in channel mode here. True when no agent is left for today's path. */
+  const routeChannelSession = async (args: any, mentioned: (persona: string | undefined) => boolean): Promise<boolean> => {
+    const e = args.event;
+    if (!isRootChannelEvent(e)) return false;
+    // System messages (a join, a topic change) are not conversation: today's path drops them.
+    if (e.subtype && e.subtype !== "file_share" && e.subtype !== "me_message") return false;
+    const all = await channelSessionAgents(args);
+    const agents = all.filter((p) => channelSessionOn(p ?? "default", e.channel));
+    if (!agents.length) return false;
+    for (const personaId of agents) {
+      const isMentioned = mentioned(personaId);
+      // One agent's failure does not lose the message for the others.
+      try {
+        if (isMentioned) {
+          const act = gateActive() ? await consultGate(args, { mentionsAgent: true, personaId }, "run") : undefined;
+          if (act === "record_doubt") await reactDoubt(args, personaId);
+          await handleMessage(args, { personaId, channelSession: true, ...(act === "record_doubt" ? { suppress: true } : {}) });
+        } else {
+          // Mode on and a run decision: the agent takes part as for a root mention here; nothing is recorded separately.
+          if (!(await observeImplicit(args, personaId, "channel_session"))) await handleMessage(args, { personaId, channelSession: true, suppress: true });
+        }
+      } catch (err) {
+        console.error(`[slack-rx] channel session ch=${e.channel} ts=${e.ts} persona=${personaId ?? "default"} failed: ${redactSecrets(err instanceof Error ? err.message : String(err))}`);
+        if (!isMentioned) metric.channelSessionRecordFailuresTotal.inc();
+      }
+    }
+    return agents.length === all.length;
+  };
+
   t.event("app_mention", async (args: any) => {
     const e: any = args.event;
     const ts: string = e.thread_ts || e.ts;
-    await persistEngaged(args.context?.teamId ?? e.team, e.channel, ts, true);
-    await handleMessage(args);
+    const personaId = appPersonaOf(args);
+    if (isRootChannelEvent(e)) {
+      const botId = await getBotId(args);
+      const inText = Array.from(((e.text || "") as string).matchAll(/<@([A-Z0-9]+)>/g)).map((m) => m[1]);
+      if (await routeChannelSession(args, (p) => p === personaId || mentionsAgent(args, p, inText, botId))) return;
+      // Handled above as a channel-session turn; a classic agent of this app continues below.
+      if (inChannelMode(e, personaId)) return;
+    }
+    const act = gateActive() ? await consultGate(args, { mentionsAgent: true, personaId }, "run") : undefined;
+    if (act === "record_doubt") return await recordDoubt(args, personaId);
+    staleRecord(e, personaId);
+    const engagedBefore = await engageOnMention(args.context?.teamId ?? e.team, e.channel, ts, e.ts, personaId);
+    await handleMessage(args, { personaId, engagedBefore });
   });
 
   // Single message router: every non-bot message goes here so we can manage
@@ -2896,6 +5147,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     // Drop only self bot-echoes (any registered app's bot); other bots flow through.
     if (await isSelfBotEcho(args, e)) {
       metric.slackDropsTotal.inc({ reason: "self_bot" });
+      noteEcho(args, e);
       return;
     }
     if (!e.user) return;
@@ -2905,7 +5157,30 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     const selfUserIds = await getSelfUserIds();
     if (selfUserIds.has(e.user)) {
       metric.slackDropsTotal.inc({ reason: "self_user" });
+      noteEcho(args, e);
       return;
+    }
+    // A reply under a proactive post (phase E): recorded as an outcome; a
+    // "stop" mutes that topic for the replier and ends here. Any other reply
+    // continues in a proactive thread (spec §5 Stitching): the agent started
+    // it, so the decision gate is never consulted there, and a thread with no
+    // session yet is engaged for the post's persona below.
+    let proactive: { personaId: string | undefined } | null = null;
+    if (e.thread_ts && e.thread_ts !== e.ts && brainEnabled() && brainReady()) {
+      try {
+        const fb = await onProactiveReply(
+          { channel: e.channel, threadTs: e.thread_ts, ts: e.ts, userId: e.user, teamId: args.context?.teamId ?? e.team ?? null, text: String(e.text ?? "") },
+          proactiveFeedbackDeps(args),
+        );
+        if (fb.result === "muted") return;
+        // The post's agent is a named persona's Slack user, else the default persona's.
+        if (fb.post && (await postedThroughThisApp(args, e))) {
+          const name = getPersonaRegistry().lookupByUserId(fb.post.agentId)?.name;
+          proactive = { personaId: name && name !== "default" ? name : undefined };
+        }
+      } catch (err) {
+        console.error(`[proactive] feedback on ch=${e.channel} ts=${e.ts} failed: ${redactSecrets(err instanceof Error ? err.message : String(err))}`);
+      }
     }
 
     const channelId: string = e.channel;
@@ -2915,11 +5190,14 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
 
     // DMs: always handle, no engagement tracking needed.
     if (e.channel_type === "im") {
-      return await handleMessage(args);
+      return await handleMessage(args, { personaId: appPersonaOf(args) });
     }
 
     const mentions = Array.from(text.matchAll(/<@([A-Z0-9]+)>/g)).map((m) => m[1]);
     const mentionsBot = mentions.includes(botId);
+    // Before the other-app drop below: a mention of someone else is still recorded here.
+    // The proactive feedback path above only looks at replies in threads.
+    if (await routeChannelSession(args, (p) => mentionsAgent(args, p, mentions, botId))) return;
     // A mention of ANOTHER registered app's bot is addressed to that app, which
     // gets its own copy of the message: this app neither answers it nor reads
     // it as a mention of a colleague (which would disengage the thread).
@@ -2949,9 +5227,19 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       (u) => u && u !== botId && (!selfBotUsers.has(u) || absentAppBots.has(u)) && !registry.lookupByUserId(u),
     );
 
+    // No gate in a proactive thread (see above); everything else unchanged.
+    const gated = (): boolean => !proactive && gateActive();
+
+    // The persona of the app this copy arrived through: the "bot's own" identity below.
+    const appPersona = appPersonaOf(args);
     if (mentionsBot) {
-      await persistEngaged(teamId, channelId, ts, true);
-      return await handleMessage(args);
+      // Already run as a channel-session turn above.
+      if (inChannelMode(e, appPersona)) return;
+      const act = gated() ? await consultGate(args, { mentionsAgent: true, personaId: appPersona }, "run") : undefined;
+      if (act === "record_doubt") return await recordDoubt(args, appPersona);
+      staleRecord(e, appPersona);
+      const engagedBefore = await engageOnMention(teamId, channelId, ts, e.ts, appPersona);
+      return await handleMessage(args, { personaId: appPersona, engagedBefore });
     }
     if (!mentionedPersona) {
       // A retired persona's identity stops routing: drop what is addressed to it
@@ -2967,8 +5255,14 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     if (mentionedPersona) {
       // Re-engage the persona's row if it was disengaged; a first mention has
       // no row yet and the session is born engaged.
-      await persistEngaged(teamId, channelId, ts, true, mentionedPersona.name);
-      return await handleMessage(args, { personaId: mentionedPersona.name });
+      const personaId = mentionedPersona.name;
+      // Already run as a channel-session turn above.
+      if (inChannelMode(e, personaId)) return;
+      const act = gated() ? await consultGate(args, { mentionsAgent: true, personaId }, "run") : undefined;
+      if (act === "record_doubt") return await recordDoubt(args, personaId);
+      staleRecord(e, mentionedPersona.name);
+      const engagedBefore = await engageOnMention(teamId, channelId, ts, e.ts, mentionedPersona.name);
+      return await handleMessage(args, { personaId: mentionedPersona.name, engagedBefore });
     }
     if (mentionsOther) {
       // Disengage the bot AND every persona in this thread (the user is
@@ -2986,7 +5280,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         console.log(
           `[slack-rx] disengage ch=${channelId} ts=${e.ts} user=${e.user} — recording (suppressed), thread now disengaged`,
         );
-        return await handleMessage(args, { suppress: true });
+        return await handleMessage(args, { suppress: true, personaId: row.persona_id && row.persona_id !== "default" ? row.persona_id : undefined });
       }
       console.log(
         `[slack-rx] drop ch=${channelId} ts=${e.ts} user=${e.user} — mention to other user, no session to populate`,
@@ -3005,7 +5299,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         : null;
       if (row) {
         console.log(`[slack-rx] record ch=${channelId} ts=${e.ts} user=${e.user} — mention-only, suppressed`);
-        return await handleMessage(args, { suppress: true });
+        return await handleMessage(args, { suppress: true, personaId: row.persona_id && row.persona_id !== "default" ? row.persona_id : undefined });
       }
       console.log(`[slack-rx] drop ch=${channelId} ts=${e.ts} user=${e.user} — mention-only, no @mention`);
       metric.slackDropsTotal.inc({ reason: "mention_only" });
@@ -3031,10 +5325,13 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       return true;
     };
     if (teamId) {
-      const def = await Sessions.findByThread({ team_id: teamId, channel_id: channelId, thread_ts: ts, persona_id: "default" });
+      const def = await Sessions.findByThread({ team_id: teamId, channel_id: channelId, thread_ts: ts, persona_id: appPersona ?? "default" });
       if (def?.engaged) {
         if (otherApp(def)) return;
-        return await handleMessage(args);
+        staleRecord(e, appPersona);
+        const act = gated() ? await consultGate(args, { mentionsAgent: false, personaId: appPersona }, "run") : undefined;
+        if (act === "record") return await recordEngaged(args, appPersona);
+        return await handleMessage(args, { personaId: appPersona });
       }
       // Multi-persona: a plain reply continues whichever persona is engaged in this thread.
       if (registry.isMultiPersonaMode()) {
@@ -3042,6 +5339,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           const row = await Sessions.findByThread({ team_id: teamId, channel_id: channelId, thread_ts: ts, persona_id: p.name });
           if (row?.engaged) {
             if (otherApp(row)) return;
+            staleRecord(e, p.name);
+            const act = gated() ? await consultGate(args, { mentionsAgent: false, personaId: p.name }, "run") : undefined;
+            if (act === "record") {
+              return await recordEngaged(args, p.name);
+            }
             return await handleMessage(args, { personaId: p.name });
           }
         }
@@ -3060,6 +5362,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         // Engaged session outside the registry (e.g. persona removed from
         // config) — keep handling plain replies as that persona.
         const restoredPersonaId = any.persona_id !== "default" ? any.persona_id : undefined;
+        staleRecord(e, restoredPersonaId);
+        const act = gated() ? await consultGate(args, { mentionsAgent: false, personaId: restoredPersonaId }, "run") : undefined;
+        if (act === "record") {
+          return await recordEngaged(args, restoredPersonaId);
+        }
         return await handleMessage(args, { personaId: restoredPersonaId });
       }
       // Explicitly disengaged (row.engaged=0): record plain messages into the
@@ -3074,10 +5381,18 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         return await handleMessage(args, { suppress: true, personaId: disengagedPersonaId });
       }
     }
+    // A reply under a proactive post with no session in the thread yet (an
+    // inform post): the session handleMessage creates is born engaged. A
+    // thread disengaged since (a colleague mention) stays disengaged above.
+    if (proactive) {
+      console.log(`[slack-rx] engage ch=${channelId} ts=${e.ts} user=${e.user} — reply under a proactive post`);
+      return await handleMessage(args, { personaId: proactive.personaId });
+    }
     console.log(
       `[slack-rx] drop ch=${channelId} ts=${e.ts} user=${e.user} — channel msg, thread not engaged (no @mention)`,
     );
     metric.slackDropsTotal.inc({ reason: "engagement" });
+    await observeImplicit(args, appPersona, "drop");
   });
 
   // REST /v1 (spec §3), built inside the gateway so the tool plane runs THE
@@ -3094,7 +5409,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   // config; files only with the operator's opt-in). mono
   // never calls it: its sessions mount external MCP directly, as before.
   const mcpBridge = createMcpBridge({
-    servers: (claims) => bridgeExternalMcp(claims.persona && claims.persona !== "default" ? claims.persona : undefined),
+    servers: bridgeServers,
     onNeedsAuth: (claims, server, scope, reason) => postBridgeConnectCard(claims, server, scope, reason),
   });
   /** The `/mcp` connect card, posted in the turn's thread when a bridged server
@@ -3104,72 +5419,130 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   async function postBridgeConnectCard(claims: JobClaims, server: string, scope: ConnectScope, reason: "connect" | "reauth"): Promise<void> {
     const personaId = claims.persona && claims.persona !== "default" ? claims.persona : undefined;
     const runAs = parseRunAs(claims.runAs);
-    const userId = scope === "initiator" ? (runAs?.kind === "user" ? runAs.slackUserId : "") : soulData().manager.userId;
+    const userId = scope === "initiator" ? (runAs?.kind === "user" ? runAs.slackUserId : "") : soulDataFor(personaId).manager.userId;
     if (!userId) return; // nobody could click it
+    // The agent's shared identity is the manager's: shadow that the soul's manager holds the role (value unused).
+    if (scope !== "initiator" && env.access.source() !== "legacy") {
+      // Detached: nothing here may delay or fail the card.
+      void (async () => (await roleAt({ site: "gateway.connect_notify_target", persona: personaId, teamId: claims.team, userId, grants: await loadGrants(personaId) })))().catch(() => {});
+    }
     const text = `:warning: ${reason === "connect" ? connectText(server) : reauthText(server)}.`;
+    // A channel session's or a wake's turn has no thread: its key is not a Slack ts.
+    const threadTs = isSyntheticThread(claims.thread) ? "" : claims.thread;
     const button = await connectButton(claims.session, {
-      channelId: claims.channel, threadTs: claims.thread, userId, serverName: server, scope, personaName: personaKey(personaId),
+      channelId: claims.channel, threadTs, userId, serverName: server, scope, personaName: personaKey(personaId),
     });
-    await outClientForPersona(personaId, { apiAppId: claims.app, teamId: claims.team }).chat.postMessage({
+    await outClientForPersona(personaId, { apiAppId: claims.app, teamId: claims.team }).chat.postMessage({ // runtime-ui: gateway notice, card or command reply
       channel: claims.channel,
-      thread_ts: claims.thread,
+      thread_ts: threadTs || undefined,
       text,
       blocks: [{ type: "section", text: { type: "mrkdwn", text } }, { type: "actions", elements: [button] }],
       mrkdwn: true,
     });
   }
+  /** The /v1 tool plane's SlackContext for a verified job token: everything
+   *  (speaker, team, origin, persona, app) comes from the signed claims. */
+  const v1SlackCtx = (claims: JobClaims): SlackContext => {
+    const personaId = claims.persona && claims.persona !== "default" ? claims.persona : undefined;
+    // The turn's app rides in the signed token; an older token carries
+    // only the team, which resolves when it is unambiguous (D1.2).
+    const app: AppRef = { apiAppId: claims.app, teamId: claims.team };
+    const ctx: SlackContext = {
+      client: outClientForPersona(personaId, app),
+      apiAppId: claims.app,
+      resolveBotToken: () => t.botTokenFor?.(app),
+      channel: claims.channel,
+      threadTs: claims.thread,
+      // No live inbound message on the REST path — reactions and default
+      // react targets anchor on the thread root.
+      inboundTs: claims.thread,
+      userId: claims.initiator,
+      teamId: claims.team,
+      personaId,
+      sessionId: claims.session,
+      // Signed at dispatch; absent (an older gateway) reads as not interactive.
+      ...(claims.origin ? { origin: claims.origin } : {}),
+      // Signed at dispatch: a root turn on a channel session posts at the root.
+      ...(claims.post === "channel" ? { postTarget: "channel" as const } : {}),
+      // The job's recorded senders (merged messages included); mono and a
+      // token with no job claim have none, which refuses a profile write.
+      turnSenders: async () => (queueDispatch && claims.job ? queueDispatch.turns.turnSenders(claims.job) : null),
+    };
+    ctx.requestApproval = claims.wake
+      ? refuseApprovalInWake
+      : (req) => approvals.request({ channel: ctx.channel, threadTs: ctx.threadTs, app, ...req, persona: ctx.personaId });
+    // Only a channel session's wake has these tools; a pre-rc.14 `wake:` job just ends without them.
+    if (claims.wake && claims.bgRun && isChannelSessionKey(claims.thread)) ctx.wake = { runId: claims.bgRun, deps: wakeToolDeps, channelSession: claims.channel };
+    // A signed wake has nobody to approve a held reply, with or without a run.
+    if (claims.wake) ctx.unattended = true;
+    // A held reply is decided before the job token expires, or not posted.
+    if (typeof claims.exp === "number") ctx.turnDeadline = claims.exp * 1000 - 30_000;
+    ctx.reloadSession = (prompt?) => agent.reload(claims.session, prompt);
+    return ctx;
+  };
+  /** A node turn's tool permission card (the /v1 can_use_tool relay). */
+  /** The job's recorded senders, or null (no queue, no job claim, or a failed read). */
+  const jobSenders = async (claims: JobClaims) => {
+    if (!queueDispatch || !claims.job) return null;
+    const job = claims.job;
+    try {
+      return await queueDispatch.turns.turnSenders(job);
+    } catch {
+      return null;
+    }
+  };
+  const nodeOpenPermission: ToolPlaneDeps["openPermission"] = async (claims, args) =>
+    permissions.open({
+      sessionId: claims.session,
+      toolName: args.toolName,
+      input: args.input,
+      toolUseId: args.toolUseId,
+      channel: claims.channel,
+      threadTs: claims.thread,
+      decisionReason: args.decisionReason,
+      suggestions: args.suggestions,
+      ...(args.forced ? { forced: args.forced } : {}),
+      app: { apiAppId: claims.app, teamId: claims.team },
+      persona: claims.persona,
+      // The job's recorded senders (merged follow-ups included): the
+      // token's initiator only when it is the job's sole Slack sender.
+      // A node runs one job per session at a time (session lock), and a
+      // follow-up either merges into a waiting job (and joins its
+      // senders) or waits for its own job and token, so a later message
+      // cannot re-stamp this prompt or decide it with its own token.
+      // A failed senders read stamps no initiator (an approver or manager
+      // must decide) rather than failing the open.
+      turn: stampFromSenders(await jobSenders(claims), {
+        origin: claims.origin,
+        expect: claims.initiator,
+      }),
+    });
+  // The plugin inventory view (design: plugin inventory): the snapshot the
+  // bridge and the portal read synchronously. Nodes exist only with a queue;
+  // started in start() so it is loaded before this gateway serves.
+  let pluginInventory: { stop(): void } | null = null;
   const v1 = createV1Api({
     tools: {
       mcpBridge,
-      slackCtx: (claims) => {
-        const personaId = claims.persona && claims.persona !== "default" ? claims.persona : undefined;
-        // The turn's app rides in the signed token; an older token carries
-        // only the team, which resolves when it is unambiguous (D1.2).
-        const app: AppRef = { apiAppId: claims.app, teamId: claims.team };
-        const ctx: SlackContext = {
-          client: outClientForPersona(personaId, app),
-          apiAppId: claims.app,
-          resolveBotToken: () => t.botTokenFor?.(app),
-          channel: claims.channel,
-          threadTs: claims.thread,
-          // No live inbound message on the REST path — reactions and default
-          // react targets anchor on the thread root.
-          inboundTs: claims.thread,
-          userId: claims.initiator,
-          teamId: claims.team,
-          personaId,
-          sessionId: claims.session,
-        };
-        ctx.requestApproval = (req) =>
-          approvals.request({ channel: ctx.channel, threadTs: ctx.threadTs, app, ...req });
-        ctx.reloadSession = (prompt?) => agent.reload(claims.session, prompt);
-        return ctx;
-      },
+      slackCtx: v1SlackCtx,
       surfaceFor: (ctx) => wrapSurface(surfaceForCtx(ctx), ctx.sessionId ?? ""),
       surfaceOpts: (claims, ctx) => ({
         initiator: () => ctx.userId,
+        auditContext: () => ({
+          persona: ctx.personaId, sessionId: claims.session,
+          channelId: ctx.channel, threadTs: ctx.threadTs ?? ctx.inboundTs,
+        }),
         setOneOnOne: (action, scope) => agentOneOnOne(claims.session, ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(ctx, active),
         ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(claims.session, ctx) } : {}),
         ...(env.workflow.active() ? workflowTools(claims.session, ctx) : {}),
       }),
       connect: (claims, ctx, server) => agentConnect(claims.session, ctx, server),
-      brainDeps: brainDepsFor,
+      brainDeps: (ctx, surface, claims) => brainDepsFor(ctx, surface, undefined, claims),
       // Non-blocking gate opens (spec §3 "Blocking tools"): the node long-polls
       // /v1/pending/:id; ANY replica's Block Kit click settles the durable row
       // and publishes gate:<id> for the instant wakeup.
-      openPermission: (claims, args) =>
-        permissions.open({
-          sessionId: claims.session,
-          toolName: args.toolName,
-          input: args.input,
-          toolUseId: args.toolUseId,
-          channel: claims.channel,
-          threadTs: claims.thread,
-          decisionReason: args.decisionReason,
-          suggestions: args.suggestions,
-          app: { apiAppId: claims.app, teamId: claims.team },
-        }),
+      openPermission: nodeOpenPermission,
       openApproval: (claims, args) =>
         approvals.open({
           channel: claims.channel,
@@ -3177,6 +5550,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           sessionId: claims.session,
           app: { apiAppId: claims.app, teamId: claims.team },
           ...args,
+          persona: claims.persona,
         }),
     },
     // Instant long-poll wakeup on gate clicks when Redis is configured;
@@ -3211,6 +5585,10 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   // in-process AgentManager in mono. The operator identity rides as the turn
   // initiator/userId.
   async function panelEnqueue(session: SessionRow, text: string, operatorId: string): Promise<void> {
+    // Archived by /new: the channel has moved on, and a turn here would resume
+    // a session nothing routes to any more.
+    if (session.slack_thread_ts?.startsWith("channel-archived:")) throw new PanelChatRefused("This channel session was archived with /new, so it is read-only. To talk to the agent, use the channel's current session.");
+    if (routes.get(session.id)?.wakeHold) throw new PanelChatRefused("This channel's session is busy with its own work. Try again when it finishes.");
     const eventTs = `${Date.now() / 1000}`;
     const meta = panelDispatchMeta(session, operatorId, eventTs);
     const { channelId, threadTs } = meta;
@@ -3218,23 +5596,47 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     // may still know it; with neither, the token carries the team alone.
     const liveApp = routes.get(session.id)?.ctx.apiAppId;
     if (!meta.apiAppId && liveApp) meta.apiAppId = liveApp;
+    countTurn(routes.get(session.id));
+    await spendThreadHead(session.id);
     const envelope =
       `<channel source="panel" channel_id="${channelId}" thread_ts="${threadTs}" ` +
       `inbound_ts="${eventTs}" user_id="${operatorId}" user_name="${escapeAttr(operatorId)}" ` +
       `trust="restricted" one_on_one="false" locked_user="">\n${text}\n</channel>\n\n` +
-      `Reply to the user by calling the \`mcp__${SLACK_MCP_NAME}__reply\` tool. ` +
+      `Reply by calling \`mcp__${SURFACE_MCP_NAME}__reply\`, or call ` +
+      `\`mcp__${SURFACE_MCP_NAME}__pass\` if the message is not for you or needs nothing from you. ` +
       `Plain assistant text is not delivered — only tool calls reach the operator.`;
     if (queueDispatch) {
       await queueDispatch.dispatch(session, envelope, meta);
     } else {
-      await agent.sendMessage(session.id, envelope);
+      // Mono: the route's context is the speaker the tools see. Without this
+      // the panel turn would run as the last Slack speaker, and as interactive
+      // for them; the operator is the speaker, as the node token's initiator is.
+      const route = routes.get(session.id);
+      if (route) {
+        route.ctx.userId = operatorId;
+        route.ctx.origin = "panel";
+        if (meta.postTarget) route.ctx.postTarget = meta.postTarget;
+        // A new turn: the Stop guard starts over and forces a silent end, as
+        // a node does for a panel job.
+        route.spoke = false;
+        route.passed = false;
+        route.passReact = undefined;
+        route.silent = false;
+        route.implicit = undefined;
+        noteTurnSender(session.id, route.ctx);
+      }
+      await agent.sendMessage(session.id, envelope, { sender: { userId: operatorId, teamId: meta.teamId || null, origin: "panel" } });
     }
   }
 
   // The end-user portal is its own mount with its own guard: an ordinary user
   // never reaches an operator route, and the panel's guard is not relaxed.
   // createPortalApi returns null for every request while SLAUDE_PORTAL is off.
-  const portalApi = createPortalApi();
+  // Channel, user and workspace names for display in the console and the
+  // portal, looked up through the bot of the row's app (or the persona's
+  // latest app), cached. One instance, one cache.
+  const slackNames = createSlackNames({ clientFor: panelNameClient });
+  const portalApi = createPortalApi({ names: slackNames });
   // Reuses whichever pub/sub this gateway already holds; with none (mono, no
   // Redis) the reload is local-only, which is all there is to notify.
   // With a queue, a persona whose runsOn no live node carries is reported as a
@@ -3271,7 +5673,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
   const workflowPost = async (row: WorkflowThreadRow, text: string) => {
     const session = await Sessions.findById(row.session_id);
     const app: AppRef = { apiAppId: session?.slack_app_id ?? undefined, teamId: session?.slack_team_id ?? undefined };
-    await botClientFor(app).chat.postMessage({ channel: row.channel_id, thread_ts: row.thread_ts, text });
+    await botClientFor(app).chat.postMessage({ channel: row.channel_id, thread_ts: row.thread_ts, text }); // runtime-ui: workflow stage card or notice
   };
   const threadInSandbox = async (row: WorkflowThreadRow) => !!(await Sandbox.find(row.channel_id, row.thread_ts));
   const freshRunner = createFreshRunner({
@@ -3320,6 +5722,16 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         onUnlock: (sessionId) => { agent.reload(sessionId); },
         // The persona view says where a persona's stdio MCP servers run.
         role: queueDispatch ? "gateway" : "mono",
+        // The read-only Plugins page: nodes exist only with a queue.
+        plugins: queueDispatch
+          ? dbInventorySources((ids) => queueDispatch.registry.liveNodeIds(ids))
+          : null,
+        names: slackNames,
+        // Mono: sessions run here, so liveness is the manager's live map
+        // (nothing registers in the node registry).
+        local: queueDispatch
+          ? null
+          : { isWarm: (id) => agent.isLive(id), turnInFlight: (id) => agent.turnInFlight(id), count: () => agent.liveCount() },
         // Label status (node labels spec §4.7): only with a node queue.
         labels: queueDispatch
           ? (() => {
@@ -3338,18 +5750,33 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     : null;
 
   return {
-    start: () => t.start(),
+    start: async () => {
+      if (queueDispatch) {
+        pluginInventory = await startPluginInventory(dbInventorySources((ids) => queueDispatch.registry.liveNodeIds(ids)));
+      }
+      await t.start();
+    },
     stop: async () => {
+      // Pending shadow classifier timers (a root question's wait) are cancelled and their jobs dropped.
+      shadowAbort.abort();
       // End live voice calls first, while the transport can still carry each
       // call's summary turn; bounded so shutdown never hangs on a call.
       await drainVoiceCalls(voiceCalls, VOICE_SHUTDOWN_GRACE_MS);
       cancelNightlyMaintenance();
       await cronLeader?.stop().catch(() => {});
+      // Aborts a pass in flight; bounded (STOP_GRACE_MS, 10 s) so shutdown never waits out a review.
+      await backgroundScheduler?.stop().catch(() => {});
       cronScheduler.stop();
+      stopSkillVersionReconciler();
+      await stopBoundaryFill().catch(() => {});
+      stopOwnerGuardrails();
+      pluginInventory?.stop();
+      unsetMergeNoticeSender();
       if (panelSweeper) clearInterval(panelSweeper);
       await panelResumeUnsub?.().catch(() => {});
       await panelHoldUnsub?.().catch(() => {});
       await mcpBridge.close().catch(() => {});
+      await backgroundBridge?.close().catch(() => {});
       await t.stop();
       // Never rejects (errors are logged above). While closing, the KB import
       // stops before its next KB, so shutdown does not wait for a full import.
@@ -3361,10 +5788,23 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     fetchDeploy: (req: Request) => deployApi.fetch(req),
     fetchBrainImport: (req: Request) => brainImportApi.fetch(req),
     fetchWorkflow: (req: Request) => workflowApi(req),
+    __consultGate: consultGateWithSource,
     __pendingSource: () => v1.pendingSource,
     __sessionCtx: (sessionId: string) => sessionCtx.get(sessionId),
     __resolveMcp: (sessionId: string) => mcpResolver(sessionId),
+    __promises: backgroundSlack.promises!,
+    __proactive: backgroundSlack.proactive!,
+    __wake: backgroundSlack.wake!,
     __voiceCalls: voiceCalls,
+    __brainGate: async (sessionId: string) => {
+      const route = routes.get(sessionId);
+      return route ? brainGateFor(route.ctx) : undefined;
+    },
+    __brainGateForClaims: (claims: JobClaims) => brainGateFor(v1SlackCtx(claims)),
+    __v1SlackCtx: v1SlackCtx,
+    __postBridgeConnectCard: postBridgeConnectCard,
+    __openPermissionForClaims: nodeOpenPermission,
+    __panelChat: (session: SessionRow, text: string, operatorId: string) => panelEnqueue(session, text, operatorId),
     __agentConnect: (sessionId: string, server: string) => {
       const route = routes.get(sessionId);
       if (!route) return Promise.resolve("no active thread for this session");

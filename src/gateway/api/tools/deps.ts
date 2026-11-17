@@ -31,7 +31,7 @@ export interface ToolPlaneDeps {
   connect(claims: JobClaims, ctx: SlackContext, server: string): Promise<string>;
   /** Brain tool deps (scope/gate/approval) for the context; undefined when the
    *  brain is disabled. */
-  brainDeps(ctx: SlackContext, surface: Surface): BrainToolDeps | undefined;
+  brainDeps(ctx: SlackContext, surface: Surface, claims?: JobClaims): BrainToolDeps | undefined;
   /** Non-blocking permission gate open (runtime/can_use_tool, spec §3
    *  "Blocking tools"): immediate policy decision, or a pendingId the node
    *  long-polls on /v1/pending/:id. */
@@ -43,6 +43,8 @@ export interface ToolPlaneDeps {
       toolUseId: string;
       decisionReason?: string;
       suggestions?: unknown[];
+      /** An owner guardrail's approve card, already re-evaluated by the route. */
+      forced?: { ruleId: string; message: string; ttlMs: number };
     },
   ): Promise<{ decision: PermissionDecision } | { pendingId: string }>;
   /** Non-blocking plan-approval open (surface/request_approval over REST):

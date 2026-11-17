@@ -7,16 +7,22 @@ import type { Keys } from "../../src/queue/keys";
 
 const prefix = testPrefix("turns");
 
-function turn(sessionId: string, texts: string[], token = "tok"): TurnJob {
+function turn(sessionId: string, texts: string[], token = "tok", user = "U1", origin: string | null = "slack"): TurnJob {
   return {
     sessionId,
     tenantId: "t_1",
     personaId: "p_1",
-    messages: texts.map((text, i) => ({ ts: `${Date.now()}.${i}`, user: "U1", text })),
+    messages: texts.map((text, i) => ({ ts: `${Date.now()}.${i}`, user, text })),
+    senders: [{ userId: user, teamId: "T1", origin }],
     jobToken: token,
     enqueuedAt: Date.now(),
   };
 }
+
+/** A JWT-shaped token naming job `job` (unsigned: the queue only reads the
+ *  `job` claim, to key the turn-senders record). */
+const jwt = (claims: Record<string, unknown>): string =>
+  `${Buffer.from('{"alg":"HS256"}').toString("base64url")}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
 
 describe.skipIf(!realEnabled)("queue/turns against real Redis", () => {
   let redis: Redis;
@@ -114,6 +120,149 @@ describe.skipIf(!realEnabled)("queue/turns against real Redis", () => {
     expect(await queues.queue("turns").getWaitingCount()).toBe(1);
     await job!.remove();
     await redis.del(keys.coalesce("s-coal"));
+  });
+
+  // A promise check (phase E) defers while a message waits to be claimed;
+  // a stale coalesce index (its job gone) is not "pending".
+  test("hasPending: a waiting job is pending; no index, or an index whose job is gone, is not", async () => {
+    await ready;
+    expect(await queues.hasPending("s-pend")).toBe(false);
+    const first = await queues.enqueueTurn(turn("s-pend", ["one"], "tok1"), { label: "default" });
+    expect(await queues.hasPending("s-pend")).toBe(true);
+    const job = await queues.queue("turns").getJob(first.jobId);
+    await job!.remove();
+    expect(await redis.exists(keys.coalesce("s-pend"))).toBe(1);
+    expect(await queues.hasPending("s-pend")).toBe(false);
+    await redis.set(keys.coalesce("s-pend"), "not json");
+    expect(await queues.hasPending("s-pend")).toBe(false);
+    await redis.del(keys.coalesce("s-pend"));
+  });
+
+  test("turn senders: a fresh job records its sender; a merge from another person or origin adds theirs", async () => {
+    await ready;
+    const { classifyBrainOp } = await import("../../src/knowledge/gated-dispatch");
+    const { profileSourceId, resolveBrainScope } = await import("../../src/knowledge/scope");
+    /** Whether the brain gate lets U1's Slack turn write U1's profile with these senders. */
+    const profileWrite = async (senders: unknown) => {
+      const g = { userId: "U1", teamId: "T1", interactive: true, origin: "slack" as const, lockedUser: null, channelTrust: "trusted" as const, isManager: false, agentId: "A1", turnSenders: senders as any };
+      return (await classifyBrainOp("put_page", { ...(await resolveBrainScope({ ...g, kbSources: [] })), sourceId: profileSourceId("T1", "U1") }, g));
+    };
+
+    // Same initiator: merges, still one sender, the profile write passes.
+    const a = await queues.enqueueTurn(turn("s-snd-same", ["one"], jwt({ job: "snd-a" })), { label: "default" }, "snd-a");
+    expect(await queues.turnSenders("snd-a")).toEqual([{ userId: "U1", teamId: "T1", origin: "slack" }]);
+    const a2 = await queues.enqueueTurn(turn("s-snd-same", ["two"], jwt({ job: "snd-a2" })), { label: "default" }, "snd-a2");
+    expect(a2).toEqual({ jobId: "snd-a", queue: "turns", coalesced: true });
+    expect(await queues.turnSenders("snd-a")).toEqual([{ userId: "U1", teamId: "T1", origin: "slack" }]);
+    expect((await profileWrite(await queues.turnSenders("snd-a")))).toBe("auto");
+
+    // Two initiators merged into one job: both recorded (data and record), the profile write is denied.
+    const b = await queues.enqueueTurn(turn("s-snd-two", ["alice"], jwt({ job: "snd-b" })), { label: "default" }, "snd-b");
+    await queues.enqueueTurn(turn("s-snd-two", ["bob"], jwt({ job: "snd-b2" }), "U2"), { label: "default" }, "snd-b2");
+    const merged = [{ userId: "U1", teamId: "T1", origin: "slack" }, { userId: "U2", teamId: "T1", origin: "slack" }];
+    expect(await queues.turnSenders("snd-b")).toEqual(merged);
+    expect(((await queues.queue("turns").getJob(b.jobId))!.data as TurnJob).senders).toEqual(merged);
+    expect((await profileWrite(await queues.turnSenders("snd-b")))).toBe("deny");
+
+    // Cron then Slack, same person: a different kind of turn, so no merge
+    // (see the coalescing-kind test below); the cron job's own sender is
+    // still not a Slack turn of U1's, so the write is denied.
+    await queues.enqueueTurn(turn("s-snd-cron", ["tick"], jwt({ job: "snd-c" }), "U1", "cron"), { label: "default" }, "snd-c");
+    const c2 = await queues.enqueueTurn(turn("s-snd-cron", ["hi"], jwt({ job: "snd-c2" })), { label: "default" }, "snd-c2");
+    expect(c2.coalesced).toBe(false);
+    expect((await profileWrite(await queues.turnSenders("snd-c")))).toBe("deny");
+    expect((await profileWrite(await queues.turnSenders("snd-c2")))).toBe("auto");
+
+    // A token with no job claim is keyed by the BullMQ id; a job without senders reads as unknown.
+    const d = await queues.enqueueTurn(turn("s-snd-plain", ["x"]), { label: "default" });
+    expect(await queues.turnSenders(d.jobId)).toEqual([{ userId: "U1", teamId: "T1", origin: "slack" }]);
+    const { senders: _s, ...old } = turn("s-snd-old", ["x"], jwt({ job: "snd-e" }));
+    await queues.enqueueTurn(old, { label: "default" }, "snd-e");
+    expect(await queues.turnSenders("snd-e")).toBeNull();
+    // (An older job of unknown origin is not merged with a Slack one: see the coalescing-kind test.)
+    await queues.enqueueTurn(turn("s-snd-old", ["y"], jwt({ job: "snd-e2" })), { label: "default" }, "snd-e2");
+    expect(await queues.turnSenders("snd-e")).toBeNull();
+    expect((await profileWrite(await queues.turnSenders("snd-e")))).toBe("deny");
+
+    for (const id of [a.jobId, b.jobId, "snd-c", "snd-c2", d.jobId, "snd-e", "snd-e2"]) await (await queues.queue("turns").getJob(id))?.remove();
+    for (const sid of ["s-snd-same", "s-snd-two", "s-snd-cron", "s-snd-plain", "s-snd-old"]) await redis.del(keys.coalesce(sid));
+  });
+
+  // A merged job runs under one token, whose origin, bgRun and wake decide
+  // how the node runs it (Stop guard, wake refusal, ledger run): jobs of
+  // different kinds are separate jobs, in both directions and across a relabel.
+  test("coalescing never mixes a person's turn with a wake, a promise check or a cron run", async () => {
+    await ready;
+    const wakeTok = (job: string) => jwt({ job, origin: "cron", bgRun: "run-w", wake: true });
+    const slackTok = (job: string) => jwt({ job, origin: "slack" });
+    const wake = (sid: string, job: string): TurnJob => ({ ...turn(sid, ["wake up"], wakeTok(job), "UAGENT", "cron"), bgRun: "run-w", wake: { maxTurns: 5 } });
+    const check = (sid: string, job: string): TurnJob => ({ ...turn(sid, ["check promise"], jwt({ job, origin: "cron", bgRun: "run-p" }), "U1", "cron"), bgRun: "run-p" });
+    const person = (sid: string, job: string, text = "hi"): TurnJob => turn(sid, [text], slackTok(job));
+    const data = async (id: string, q = "turns") => (await queues.queue(q).getJob(id))!.data as TurnJob;
+
+    // A Slack reply behind a queued wake: its own job, its own (slack) token.
+    await queues.enqueueTurn(wake("s-kind-1", "k1-w"), { label: "default" }, "k1-w");
+    const r1 = await queues.enqueueTurn(person("s-kind-1", "k1-p"), { label: "default" }, "k1-p");
+    expect(r1).toEqual({ jobId: "k1-p", queue: "turns", coalesced: false });
+    expect((await data("k1-w")).messages.map((m) => m.text)).toEqual(["wake up"]);
+    expect((await data("k1-p")).jobToken).toBe(slackTok("k1-p"));
+    expect((await data("k1-p")).wake).toBeUndefined();
+
+    // A promise check behind a pending Slack job keeps its bgRun.
+    await queues.enqueueTurn(person("s-kind-2", "k2-p"), { label: "default" }, "k2-p");
+    const r2 = await queues.enqueueTurn(check("s-kind-2", "k2-c"), { label: "default" }, "k2-c");
+    expect(r2.coalesced).toBe(false);
+    expect((await data("k2-c")).bgRun).toBe("run-p");
+    expect((await data("k2-p")).bgRun).toBeUndefined();
+    expect((await data("k2-p")).messages.map((m) => m.text)).toEqual(["hi"]);
+
+    // The index names the newest pending job (the check), so the next Slack
+    // message is its own job; one after it, of the same kind, merges into that.
+    const r3 = await queues.enqueueTurn(person("s-kind-2", "k2-p2", "again"), { label: "default" }, "k2-p2");
+    expect(r3).toEqual({ jobId: "k2-p2", queue: "turns", coalesced: false });
+    expect((await data("k2-p2")).messages.map((m) => m.text)).toEqual(["again"]);
+    const r4 = await queues.enqueueTurn(person("s-kind-2", "k2-p3", "third"), { label: "default" }, "k2-p3");
+    expect(r4).toEqual({ jobId: "k2-p2", queue: "turns", coalesced: true });
+    expect((await data("k2-p2")).messages.map((m) => m.text)).toEqual(["again", "third"]);
+
+    // A relabel does not merge different kinds either: the Slack job lands on the new label alone.
+    await queues.enqueueTurn({ ...wake("s-kind-3", "k3-w"), label: "default" }, { label: "default" }, "k3-w");
+    const r5 = await queues.enqueueTurn({ ...person("s-kind-3", "k3-p"), label: "finance" }, { label: "finance" }, "k3-p");
+    expect(r5).toEqual({ jobId: "k3-p", queue: "turns.label.finance", coalesced: false });
+    expect((await data("k3-w")).messages.map((m) => m.text)).toEqual(["wake up"]);
+    expect((await data("k3-p", "turns.label.finance")).messages.map((m) => m.text)).toEqual(["hi"]);
+
+    for (const id of ["k1-w", "k1-p", "k2-p", "k2-c", "k2-p2"]) await (await queues.queue("turns").getJob(id))?.remove();
+    await (await queues.queue("turns").getJob("k3-w"))?.remove();
+    await (await queues.queue("turns.label.finance").getJob("k3-p"))?.remove();
+    for (const sid of ["s-kind-1", "s-kind-2", "s-kind-3"]) await redis.del(keys.coalesce(sid));
+  });
+
+  test("turn senders survive a relabel: the moved job's record is the union", async () => {
+    await ready;
+    await queues.enqueueTurn({ ...turn("s-snd-rel", ["one"], jwt({ job: "snd-r1" })), label: "default" }, { label: "default" }, "snd-r1");
+    const moved = await queues.enqueueTurn({ ...turn("s-snd-rel", ["two"], jwt({ job: "snd-r2" }), "U2"), label: "finance" }, { label: "finance" }, "snd-r2");
+    expect(moved).toEqual({ jobId: "snd-r2", queue: "turns.label.finance", coalesced: true });
+    expect(await queues.turnSenders("snd-r2")).toEqual([{ userId: "U1", teamId: "T1", origin: "slack" }, { userId: "U2", teamId: "T1", origin: "slack" }]);
+    await (await queues.queue("turns.label.finance").getJob("snd-r2"))?.remove();
+    await redis.del(keys.coalesce("s-snd-rel"));
+  });
+
+  test("turn senders: forgetSenders deletes the record a job's token names (the worker calls it at ack)", async () => {
+    await ready;
+    await queues.enqueueTurn(turn("s-snd-ack", ["one"], jwt({ job: "snd-ack" })), { label: "default" }, "snd-ack");
+    expect(await queues.turnSenders("snd-ack")).not.toBeNull();
+    const ttl = await redis.pttl(keys.turnSenders("snd-ack"));
+    expect(ttl).toBeGreaterThan(0); // the TTL stays as the backstop
+    await queues.forgetSenders(jwt({ job: "snd-ack" }), "bull-id-unused");
+    expect(await redis.exists(keys.turnSenders("snd-ack"))).toBe(0);
+    // A token with no job claim names the BullMQ id.
+    const plain = await queues.enqueueTurn(turn("s-snd-ack2", ["x"]), { label: "default" });
+    expect(await queues.turnSenders(plain.jobId)).not.toBeNull();
+    await queues.forgetSenders("tok", plain.jobId);
+    expect(await redis.exists(keys.turnSenders(plain.jobId))).toBe(0);
+    for (const id of ["snd-ack", plain.jobId]) await (await queues.queue("turns").getJob(id))?.remove();
+    for (const sid of ["s-snd-ack", "s-snd-ack2"]) await redis.del(keys.coalesce(sid));
   });
 
   test("different sessions never coalesce", async () => {

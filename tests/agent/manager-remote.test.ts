@@ -29,7 +29,8 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 // `agentSdk.query` at call time, so the mock.module swap above applies even
 // when an earlier test file already imported AgentManager. Keeping the canonical
 // specifier means coverage is attributed to src/agent/manager.ts.
-const { AgentManager } = await import("../../src/agent/manager");
+const { AgentManager, SCHEDULER_TOOLS } = await import("../../src/agent/manager");
+const { WAKE_ONLY_TOOL_IDS } = await import("../../src/proactive/wake-guard");
 const Sessions = await import("../../src/db/sessions");
 const Sandbox = await import("../../src/db/sandbox");
 const Workflow = await import("../../src/db/workflow");
@@ -191,6 +192,11 @@ beforeEach(() => {
   process.env.SLAUDE_IDLE_MINUTES = "0";
 });
 
+// The mock outlives this file: without this, later files get the dispatcher.
+afterAll(() => {
+  currentQuery = passthrough;
+});
+
 const noopExec = async () => ({ stdout: "", stderr: "", code: 0, truncated: false, timedOut: false });
 
 describe("remote wiring", () => {
@@ -206,14 +212,43 @@ describe("remote wiring", () => {
     await until(() => fs.options !== null, 3000, "boot");
     expect(fs.options.mcpServers.remote).toBeDefined();
     expect(fs.options.toolAliases.Bash).toBe("mcp__remote__bash");
-    expect(fs.options.hooks.PreToolUse).toHaveLength(1);
+    // remote deny guard + git_push guard + local-exec guard + guardrail files + owner guardrails + skill gate + synthetic-turn profile-write guard
+    expect(fs.options.hooks.PreToolUse.flatMap((m: any) => m.hooks)).toHaveLength(7);
     expect(fs.options.systemPrompt.append).toContain("<remote-mode>");
     for (const b of ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]) {
       expect(fs.options.disallowedTools ?? []).not.toContain(b); // enabled + alias (spike §8)
     }
-    for (const t of ["NotebookEdit", "Monitor", "REPL", "Workflow", "EnterWorktree", "ExitWorktree", "Artifact"]) {
+    for (const t of ["NotebookEdit", "Monitor", "REPL", "Workflow", "EnterWorktree", "ExitWorktree", "Artifact", ...SCHEDULER_TOOLS]) {
       expect(fs.options.disallowedTools).toContain(t);
     }
+    await shutdown(mgr, row.id);
+  });
+
+  it("remote deny and skill gate both apply", async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(
+      async () => ({ teamId: "T1", userId: "U_A", addr: "tcA", dir: "/home/a/repo" }),
+      () => ({ exec: noopExec, release: async () => {}, dispose: async () => {} }),
+    );
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    const pre = fs.options.hooks.PreToolUse.flatMap((m: any) => m.hooks);
+    const run = async (tool_name: string) => {
+      const outs = await Promise.all(pre.map((h: any) =>
+        h({ hook_event_name: "PreToolUse", tool_name, tool_input: {} }, "tu", { signal: new AbortController().signal })));
+      return outs.map((o: any) => o?.hookSpecificOutput?.permissionDecisionReason).filter(Boolean);
+    };
+    // the remote guard denies a local built-in
+    expect(await run("NotebookEdit")).toEqual(["Remote mode is on: local file and shell tools are disabled for this thread."]);
+    // the skill gate denies a governed tool before its skill is loaded
+    expect(await run("mcp__slaude_skills__write_skill")).toEqual([
+      'Load `slaude:skill-authoring` first (call the Skill tool with skill "slaude:skill-authoring"), then retry.',
+    ]);
+    expect(await run("mcp__remote__bash")).toEqual([]);
+    // The skill gate's load tracker, the skill-usage counter, and pass ending the turn.
+    expect(fs.options.hooks.PostToolUse.flatMap((m: any) => m.hooks)).toHaveLength(3);
     await shutdown(mgr, row.id);
   });
 
@@ -255,8 +290,12 @@ describe("remote wiring", () => {
     await until(() => fs.options !== null, 3000, "boot");
     expect(fs.options.mcpServers?.remote).toBeUndefined();
     expect(fs.options.toolAliases).toBeUndefined();
-    expect(fs.options.hooks.PreToolUse).toBeUndefined();
-    expect(fs.options.disallowedTools).toBeUndefined();
+    // local-exec guard (a no-op here), guardrail files, owner guardrails, the skill gate and the profile-write guard: no remote deny guard
+    const pre = fs.options.hooks.PreToolUse.flatMap((m: any) => m.hooks);
+    expect(pre).toHaveLength(5);
+    for (const h of pre) expect(await h({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {} }, "tu", { signal: new AbortController().signal })).toEqual({});
+    // only the CLI scheduling built-ins (slaude has its own cron); no remote deny list
+    expect(fs.options.disallowedTools).toEqual([...SCHEDULER_TOOLS, ...WAKE_ONLY_TOOL_IDS]);
     await shutdown(mgr, row.id);
   });
 

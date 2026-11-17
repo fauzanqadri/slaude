@@ -40,10 +40,27 @@ describe("queue/keys", () => {
     expect(k.gateChannel("g1")).toBe("p:gate:g1");
     expect(k.eventsStream("s1")).toBe("p:events:s1");
     expect(k.turnDone("j1")).toBe("p:turn-done:j1");
+    expect(k.turnSenders("j1")).toBe("p:turn-senders:j1");
     expect(k.nodeLabels("n1")).toBe("p:nodelabels:n1");
     expect(k.jobMoved("j1")).toBe("p:job-moved:j1");
     // The labels key must never match the heartbeat SCAN pattern.
     expect(k.nodeLabels("n1").startsWith("p:nodes:")).toBe(false);
+  });
+
+  test("workspaceLock: stable per folder, distinct across folders, no '/' in the key", () => {
+    const k = makeKeys("p");
+    const a = k.workspaceLock("/w/agent-U0A/proactive");
+    expect(a).toBe(k.workspaceLock("/w/agent-U0A/proactive"));
+    expect(a).not.toBe(k.workspaceLock("/w/agent-U0B/proactive"));
+    expect(a).not.toContain("/");
+    expect(a).toMatch(/^p:lock:workspace:[0-9a-f]{32}$/);
+  });
+
+  test("workspaceLock: one key however the folder's path is spelled", () => {
+    const k = makeKeys("p");
+    const a = k.workspaceLock("/w/agent-U0A/proactive");
+    expect(k.workspaceLock("/w//agent-U0A/./proactive/")).toBe(a);
+    expect(k.workspaceLock("/w/agent-U0A/x/../proactive")).toBe(a);
   });
 
   test("queue names: shared is bare, per-node dots the nodeId in", () => {

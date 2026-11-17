@@ -1,5 +1,5 @@
 import { env } from "../../config/env";
-import * as Remote from "../../db/remote";
+import * as Envs from "../../db/environments";
 import * as Sandbox from "../../db/sandbox";
 import { SANDBOX_GONE_NOTE, destroySandbox, turnSandboxOff } from "../../remote/sandbox-destroy";
 import type { SlashHit } from "../slack/commands";
@@ -71,7 +71,7 @@ export async function handleSandboxCommand(hit: SandboxHit, ctx: SandboxCommandC
     return;
   }
   let replacedRemote = false;
-  if (await Remote.findTarget(channelId, threadTs)) {
+  if (await Envs.findBinding(channelId, threadTs)) {
     const r = await turnRemoteOff(ctx, deps.remoteCleanup ? { cleanup: deps.remoteCleanup } : undefined);
     if (!r.ok) {
       await ctx.reply(r.message);

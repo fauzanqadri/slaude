@@ -13,7 +13,6 @@ function fakeCtx(impl: {
   chatPostEphemeral?: () => any;
   reactionsAdd?: () => any;
   reactionsRemove?: () => any;
-  filesUploadV2?: () => any;
   filesInfo?: () => any;
   usersInfo?: (uid: string) => any;
   convInfo?: () => any;
@@ -46,7 +45,6 @@ function fakeCtx(impl: {
         remove: async () => impl.pinsRemove?.() ?? {},
       },
       files: {
-        uploadV2: async () => impl.filesUploadV2?.() ?? { files: [{ id: "F1" }] },
         info: async () => impl.filesInfo?.() ?? { file: {} },
       },
       users: { info: async ({ user }: any) => impl.usersInfo?.(user) ?? { user: {} } },
@@ -195,36 +193,6 @@ describe("slackHandlers", () => {
     expect(res.content[0]!.text).toContain("timeout");
   });
 
-  test("upload succeeds", async () => {
-    const ctx = fakeCtx({
-      filesUploadV2: () => ({ files: [{ files: [{ id: "F99" }] }] }),
-    });
-    const res = await slackHandlers.upload(ctx, { path: import.meta.path });
-    expect(res.isError).toBeUndefined();
-    expect(res.content[0]!.text).toContain("F99");
-  });
-
-  test("upload missing file returns error", async () => {
-    const ctx = fakeCtx({});
-    const res = await slackHandlers.upload(ctx, { path: "/tmp/does-not-exist-12345.txt" });
-    expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain("upload failed");
-  });
-
-  test("upload surfaces slack error", async () => {
-    const ctx = fakeCtx({
-      filesUploadV2: () => {
-        const e: any = new Error("fail");
-        e.data = { error: "invalid_file" };
-        throw e;
-      },
-    });
-    // Use a path that exists (the test file itself) so statSync passes
-    const res = await slackHandlers.upload(ctx, { path: import.meta.path });
-    expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain("invalid_file");
-  });
-
   test("get_user_profile returns structured profile", async () => {
     const ctx = fakeCtx({
       usersInfo: (uid) => ({
@@ -343,17 +311,32 @@ describe("slackHandlers", () => {
     expect(data.matches[0].text).toBe("deploy complete");
   });
 
-  test("search_messages surfaces slack errors", async () => {
-    const ctx = fakeCtx({
+  const searchFails = (code: string) =>
+    fakeCtx({
       searchMessages: () => {
         const e: any = new Error("search failed");
-        e.data = { error: "missing_scope" };
+        e.data = { error: code };
         throw e;
       },
     });
-    const res = await slackHandlers.search_messages(ctx, { query: "x" });
+
+  test("search_messages surfaces other slack errors raw", async () => {
+    const res = await slackHandlers.search_messages(searchFails("ratelimited"), { query: "x" });
     expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain("missing_scope");
+    expect(res.content[0]!.text).toBe("slack search.messages failed: ratelimited");
+  });
+
+  test("search_messages on a bot token says search needs a user token (#104)", async () => {
+    const res = await slackHandlers.search_messages(searchFails("not_allowed_token_type"), { query: "x" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain("needs a user token with search:read");
+    expect(res.content[0]!.text).toContain("runs on a bot token");
+  });
+
+  test("search_messages without search:read says so (#104)", async () => {
+    const res = await slackHandlers.search_messages(searchFails("missing_scope"), { query: "x" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain("has a token without search:read");
   });
 
   test("reply omits thread_ts when postTarget is channel", async () => {

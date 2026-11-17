@@ -39,6 +39,21 @@ export interface TurnMessage {
    *  the transcript via the suppress hook without running the model. A turn
    *  runs suppressed only when EVERY coalesced message is suppressed. */
   suppress?: boolean;
+  /** The message was not an @mention: implicit engagement started this turn, which may end in a pass.
+   *  The must-reply Stop guard is relaxed only when EVERY coalesced message is implicit. */
+  implicit?: boolean;
+  /** On-match owner Guidance this message's text triggered. The gateway
+   *  matches the trigger; the node hands it to the session, which takes each
+   *  guardrail at most once per boot. */
+  guidance?: Array<{ slug: string; name: string; body: string }>;
+}
+
+/** Who sent one of a turn's messages, as the gateway saw it at dispatch. */
+export interface TurnSender {
+  userId: string;
+  teamId: string | null;
+  /** "slack" | "panel" | "cron"; null = unknown. */
+  origin: string | null;
 }
 
 /** Payload of one turn job (spec §2). Imported by the node worker (P6). */
@@ -50,13 +65,38 @@ export interface TurnJob {
    *  is signed into jobToken. Absent on jobs from an older gateway = "default". */
   label?: string;
   messages: TurnMessage[];
+  /** Everyone whose messages this job holds, with each message's origin:
+   *  the dispatching message's sender, plus the sender of every message
+   *  merged in. Gateway-side bookkeeping, not a signed claim: a merged job
+   *  runs under its first token, whose initiator need not be every sender.
+   *  Absent (an older gateway) = unknown. */
+  senders?: TurnSender[];
   /** Identity the turn runs as when it is not the thread's /1on1 lock owner —
    *  currently a cron job's captured initiator. The node applies it before the
    *  turn so credential scoping matches an interactive 1on1. */
   oauthUser?: string;
+  /** The open ledger run this job carries (a promise check, phase E); the
+   *  same id is signed into jobToken as `bgRun`. The node finishes it with the
+   *  turn's usage only when the job holds that one message: a job a human
+   *  message was merged into leaves it open for the stale-run sweep. */
+  bgRun?: string;
+  /** Set when this job is a heartbeat wake: its caps. The same fact is signed
+   *  into jobToken as `wake`; these only tell the node how to run it. */
+  wake?: { maxBudgetUsd?: number; maxTurns?: number; maxMinutes?: number };
+  /** The session's working directory, set only when it is the agent's
+   *  proactive folder (shared by every heartbeat thread). The node then takes
+   *  that folder's lock inside the session lock, so one turn at a time runs
+   *  there across nodes. Not a signed claim: it only adds serialisation.
+   *  Absent = no folder lock. */
+  workspace?: string;
   /** Short-lived JWT minted by the gateway; nodes present it on tool calls. */
   jobToken: string;
   enqueuedAt: number;
+  /** Capabilities the node running this turn must advertise (an agent with
+   *  enforced owner guardrails: `guardrails/1`). The reaper moves such a job
+   *  only to a live node that has them, never to the label queue an older
+   *  node also consumes. Absent = none. */
+  requiresCaps?: string[];
   /** How many times the gateway re-dispatched this turn after a
    *  LABEL_MISMATCH failure (node labels spec §4.6). Bounded at one: a second
    *  mismatch is shown to the user instead. Absent = 0. */
@@ -166,11 +206,84 @@ export interface MoveOpts {
   claimed?: boolean;
   /** Also move an ACTIVE job whose lock is gone (a dead node's own queue). */
   rescueActive?: boolean;
+  /** Move to this queue instead of the label's (a capable node's own queue). */
+  queue?: string;
 }
 
 /** The larger relabelAttempts of two jobs being merged (absent = 0). */
 function maxAttempts(a: TurnJob, b: TurnJob): number {
   return Math.max(a.relabelAttempts ?? 0, b.relabelAttempts ?? 0);
+}
+
+/** How long a turn-senders record is kept: longer than any turn's token. */
+const SENDERS_TTL_MS = 24 * 60 * 60 * 1000;
+
+const senderKey = (s: TurnSender): string => `${s.userId}\u0000${s.teamId ?? ""}\u0000${s.origin ?? ""}`;
+
+/** The union of two jobs' senders, in first-seen order; undefined when
+ *  either side's is unknown (a job from an older gateway). */
+export function mergeSenders(a: readonly TurnSender[] | undefined, b: readonly TurnSender[] | undefined): TurnSender[] | undefined {
+  if (!a || !b) return undefined;
+  const seen = new Set<string>();
+  const out: TurnSender[] = [];
+  for (const s of [...a, ...b]) {
+    const k = senderKey(s);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
+}
+
+/** The `job` claim of a job token, read without verifying (the gateway
+ *  minted it; this only names the turn-senders record). */
+function tokenJobId(token: string): string | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const job = (JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as { job?: unknown }).job;
+    return typeof job === "string" && job ? job : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A job token's payload, read without verifying (the gateway minted it). */
+function tokenPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const p = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8"));
+    return p && typeof p === "object" ? (p as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What kind of turn a job is, for coalescing: its origin (the token's signed
+ * `origin`, else its first sender's), its background run, whether it is a
+ * wake and where it posts. A merged job runs under ONE token, whose origin,
+ * bgRun, wake and post decide how the node runs every message in it (the
+ * must-reply Stop guard, the wake refusal, the ledger run, root or thread
+ * replies), so two jobs merge only when these all agree.
+ */
+function turnKind(job: TurnJob): string {
+  const c = tokenPayload(job.jobToken);
+  const origin = (typeof c?.origin === "string" ? c.origin : undefined) ?? job.senders?.[0]?.origin ?? null;
+  const bgRun = job.bgRun ?? (typeof c?.bgRun === "string" ? c.bgRun : null);
+  const wake = !!job.wake || c?.wake === true;
+  // On a root job a recording never shares a token with a mention: the pending
+  // job's token is the one that runs, so its cards and initiator would be the
+  // bystander's. Classic jobs merge as they always have.
+  const root = c?.post === "channel";
+  const suppressed = root && job.messages.length > 0 && job.messages.every((m) => (m as { suppress?: boolean }).suppress === true);
+  return JSON.stringify([origin, bgRun, wake, root, suppressed]);
+}
+
+/** Two jobs may share one token and turn (see turnKind). */
+export function sameTurnKind(a: TurnJob, b: TurnJob): boolean {
+  return turnKind(a) === turnKind(b);
 }
 
 /** One message's identity for de-duplication: a re-delivered message is the
@@ -343,6 +456,25 @@ export class TurnQueues {
    * `first` says these messages are OLDER than the pending job's (a
    * re-dispatch of a failed turn) for when the ts cannot tell.
    */
+  /**
+   * True when the session has a turn job waiting to be claimed: the job a new
+   * message would be appended to (the coalesce index, checked as #tryAppend
+   * checks it). A stale index (the job claimed, done or removed) is false.
+   */
+  async hasPending(sessionId: string): Promise<boolean> {
+    const existing = await this.#connection.get(this.keys.coalesce(sessionId));
+    if (!existing) return false;
+    let ref: { queue: string; jobId: string };
+    try {
+      ref = JSON.parse(existing);
+    } catch {
+      return false;
+    }
+    const pending = await this.queue(ref.queue).getJob(ref.jobId);
+    if (!pending) return false;
+    return PENDING_STATES.has(await pending.getState()) && !(await this.#turnRan(pending));
+  }
+
   async enqueueTurn(
     job: TurnJob,
     target: TurnTarget = { label: DEFAULT_LABEL },
@@ -399,6 +531,12 @@ export class TurnQueues {
     if (!PENDING_STATES.has(await pending.getState())) return null; // already claimed
     if (await this.#turnRan(pending)) return null; // finished, then stalled back
     const prev = pending.data as TurnJob;
+    // A different kind of turn (a person's message behind a queued wake or
+    // promise check, or the reverse) never merges: the merged job would run
+    // under one of the two tokens, forcing a background run's reply or running
+    // a person's message under a wake's refusal. Null adds it as its own job;
+    // the session lock still runs the two in order.
+    if (!sameTurnKind(prev, job)) return null;
     // Only a LABEL change relocates (node labels spec §4.6). A warmth change
     // under the same label (the warm node came or went between messages)
     // appends in place exactly as before labels: same job id, same token.
@@ -415,8 +553,13 @@ export class TurnQueues {
       await this.#connection.pexpire(ckey, COALESCE_TTL_MS);
       return { jobId: pending.id!, queue: ref.queue, coalesced: true };
     }
+    // The merged job's senders, recorded before the data so a worker that
+    // claims in between reads a superset (a refusal, never a false "one sender").
+    const senders = fresh.length > 0 ? mergeSenders(prev.senders, job.senders) : prev.senders;
+    await this.#recordSenders(prev.jobToken, String(pending.id), senders);
     await pending.updateData({
       ...prev,
+      senders,
       messages: mergesFirst(prev, job, opts.first) ? [...fresh, ...prev.messages] : [...prev.messages, ...fresh],
       enqueuedAt: Math.min(prev.enqueuedAt ?? job.enqueuedAt, job.enqueuedAt),
       ...(attempts > 0 ? { relabelAttempts: attempts } : {}),
@@ -454,6 +597,9 @@ export class TurnQueues {
     opts: { first?: boolean } = {},
   ): Promise<EnqueueResult | null> {
     const prev = pending.data as TurnJob;
+    // The same rule as #tryAppend: the merged job takes this call's token, so
+    // a different kind of turn is added on its own instead.
+    if (!sameTurnKind(prev, job)) return null;
     const id = want.jobId ?? randomUUID();
     const attempts = maxAttempts(prev, job);
     const merged: TurnJob = {
@@ -461,9 +607,11 @@ export class TurnQueues {
       messages: mergesFirst(prev, job, opts.first)
         ? [...job.messages, ...newMessages(job.messages, prev.messages)]
         : [...prev.messages, ...newMessages(prev.messages, job.messages)],
+      senders: mergeSenders(prev.senders, job.senders),
       enqueuedAt: Math.min(prev.enqueuedAt ?? job.enqueuedAt, job.enqueuedAt),
       ...(attempts > 0 ? { relabelAttempts: attempts } : {}),
     };
+    await this.#recordSenders(merged.jobToken, id, merged.senders);
     // "done": the pending job's turn already ran; add only this call's messages.
     if ((await this.#swap(pending, want.queue, merged, id)) !== "moved") return null;
     await this.#connection.set(ckey, JSON.stringify({ queue: want.queue, jobId: id }), "PX", COALESCE_TTL_MS);
@@ -515,6 +663,40 @@ export class TurnQueues {
     return (await this.#connection.exists(this.keys.turnDone(String(job.id)))) === 1;
   }
 
+  /**
+   * Record the senders of the job that runs under `token`, keyed by the
+   * token's `job` claim (what a tool call's verified token names; a held copy
+   * carries its original's token), else by `fallbackId`. Unknown senders
+   * delete the record, so a reader sees "unknown", not a stale set.
+   */
+  async #recordSenders(token: string, fallbackId: string, senders: readonly TurnSender[] | undefined): Promise<void> {
+    const key = this.keys.turnSenders(tokenJobId(token) ?? fallbackId);
+    if (!senders) await this.#connection.del(key);
+    else await this.#connection.set(key, JSON.stringify(senders), "PX", SENDERS_TTL_MS);
+  }
+
+  /** Delete the senders record of the job that ran under `token` (keyed as
+   *  #recordSenders keys it). Called when the job is acked: its turn is over,
+   *  so nothing may read its senders any more; the TTL stays as the backstop
+   *  for a node that dies before the ack. */
+  async forgetSenders(token: string, fallbackId: string): Promise<void> {
+    await this.#connection.del(this.keys.turnSenders(tokenJobId(token) ?? fallbackId));
+  }
+
+  /** The senders of the job whose token names `jobId`, or null when unknown. */
+  async turnSenders(jobId: string): Promise<TurnSender[] | null> {
+    const raw = await this.#connection.get(this.keys.turnSenders(jobId));
+    if (!raw) return null;
+    try {
+      const v = JSON.parse(raw) as unknown;
+      if (!Array.isArray(v)) return null;
+      const ok = v.every((s) => s && typeof s.userId === "string" && (s.teamId === null || typeof s.teamId === "string") && (s.origin === null || typeof s.origin === "string"));
+      return ok ? (v as TurnSender[]) : null;
+    } catch {
+      return null;
+    }
+  }
+
   async #markMoved(fromJobId: string, to: MovedRef): Promise<void> {
     await this.#connection.set(this.keys.jobMoved(fromJobId), JSON.stringify(to), "PX", MOVED_TTL_MS);
   }
@@ -560,6 +742,7 @@ export class TurnQueues {
     // Index first: if the add below fails, the index points at a missing job,
     // which the next enqueue detects (getJob → null) and overwrites.
     await this.#connection.set(ckey, JSON.stringify({ queue: qname, jobId }), "PX", COALESCE_TTL_MS);
+    await this.#recordSenders(job.jobToken, jobId, job.senders);
     await this.queue(qname).add("turn", job, { ...this.defaultJobOpts(), jobId });
     return { jobId, queue: qname, coalesced: false };
   }
@@ -600,6 +783,8 @@ export class TurnQueues {
     const other = await this.queue(ref.queue).getJob(ref.jobId);
     if (!other || !PENDING_STATES.has(await other.getState())) return null;
     const data = job.data as TurnJob;
+    // A different kind of turn is moved on its own (see turnKind).
+    if (!sameTurnKind(other.data as TurnJob, data)) return null;
     const holdId = randomUUID();
     const hold = await this.queue(ref.queue).add("turn", data, { ...this.defaultJobOpts(), jobId: holdId, delay: SWAP_HOLD_MS });
     await this.#markMoved(id, { queue: ref.queue, jobId: holdId });
@@ -650,7 +835,7 @@ export class TurnQueues {
    * moved too; one whose lock is live is left alone.
    */
   async moveTo(job: Job, label: string, opts: MoveOpts = {}): Promise<EnqueueResult> {
-    const target = labelTurnsQueue(label);
+    const target = opts.queue ?? labelTurnsQueue(label);
     const from = job.queueName;
     const id = String(job.id);
     if (from === target) return { jobId: id, queue: target, coalesced: false };

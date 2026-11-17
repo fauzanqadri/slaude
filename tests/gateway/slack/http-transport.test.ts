@@ -308,6 +308,26 @@ describe("http slack transport — events", () => {
     const res = await postEvents(base, SECRET_A, { ...eventEnvelope(), team_id: "T0BBB" });
     expect(res.status).toBe(401);
   });
+
+  it("puts the persona the receiving app is registered for in the event context", async () => {
+    const rowB = appRow({
+      api_app_id: "A0HTTP",
+      team_id: "T0BBB",
+      persona_id: "alpha",
+      bot_token: encrypt("fake-token-alpha"),
+      signing_secret: encrypt(SECRET_B),
+      created_at: 2,
+    });
+    const seen: any[] = [];
+    const { t, base } = await boot([appRow(), rowB]);
+    t.event("message", async (a) => {
+      seen.push(a);
+    });
+    await postEvents(base, SECRET_A, eventEnvelope());
+    await postEvents(base, SECRET_B, { ...eventEnvelope({ team: "T0BBB" }), team_id: "T0BBB" });
+    await settle();
+    expect(seen.map((a) => a.context.personaId)).toEqual(["default", "alpha"]);
+  });
 });
 
 describe("http slack transport — interactions", () => {
@@ -333,6 +353,39 @@ describe("http slack transport — interactions", () => {
       body: raw,
     });
   }
+
+  it("dispatches a modal submission to its view handler by callback_id, not to actions", async () => {
+    const views: any[] = [];
+    const actionCalls: any[] = [];
+    const { t, base } = await boot();
+    t.action(/.*/, async () => { actionCalls.push(1); });
+    t.view!("slaude_remote:connect", async ({ ack, view, body }) => {
+      await ack(); // no-op after the HTTP 200
+      views.push({ callback_id: view.callback_id, meta: view.private_metadata, user: body.user?.id, values: view.state?.values });
+    });
+    const values = { remote_addr: { value: { value: "tcAddr" } } };
+    const { raw } = interactionBody({
+      type: "view_submission",
+      actions: undefined,
+      view: { callback_id: "slaude_remote:connect", private_metadata: "{\"s\":\"S1\"}", state: { values } },
+    });
+    const res = await postInteraction(base, SECRET_A, raw);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("");
+    await settle();
+    expect(views).toEqual([{ callback_id: "slaude_remote:connect", meta: "{\"s\":\"S1\"}", user: "U0CLICKER", values }]);
+    expect(actionCalls).toEqual([]);
+  });
+
+  it("a modal submission with no matching view handler is dropped", async () => {
+    const { t, base } = await boot();
+    const seen: any[] = [];
+    t.view!("other", async () => { seen.push(1); });
+    const { raw } = interactionBody({ type: "view_submission", actions: undefined, view: { callback_id: "slaude_remote:connect" } });
+    expect((await postInteraction(base, SECRET_A, raw)).status).toBe(200);
+    await settle();
+    expect(seen).toEqual([]);
+  });
 
   it("dispatches a Block Kit action and respond() posts to response_url", async () => {
     // Fake response_url receiver.

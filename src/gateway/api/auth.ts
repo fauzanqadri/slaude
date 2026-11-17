@@ -7,7 +7,8 @@
  *   - `X-Slaude-Job: <jwt>` — short-lived per-job token (HS256, secret
  *     SLAUDE_JOB_SECRET) minted by the gateway enqueue path; required on the
  *     tool plane and session endpoints. Claims: {tenant, persona, session,
- *     team, channel, thread, initiator, scope, exp}. The gateway derives the
+ *     team, channel, thread, initiator, scope, exp} plus optional ones (origin,
+ *     runAs, lock, label, ...). The gateway derives the
  *     Slack client, persona, and KB scope from the token — never from the
  *     request body.
  *
@@ -19,6 +20,8 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { env } from "../../config/env";
 import { m as metric } from "../../metrics";
+import type { RemoteClaim } from "../../remote/fingerprint";
+import { TURN_ORIGINS, type TurnOrigin } from "../../knowledge/gated-dispatch";
 import { LEGACY_NODE_ID, NodeCredentialVerifier, verifyNodeCredentialSync } from "../auth/node-credential";
 
 export interface JobClaims {
@@ -39,9 +42,11 @@ export interface JobClaims {
    *  from an older gateway still decode; the credential endpoint refuses its
    *  absence rather than defaulting. */
   runAs?: string;
-  /** Remote execution target for this turn (spec §4.5). Present only when the
-   *  thread's remote target belongs to the runAs user. Sensitive: the address. */
-  remote?: { addr: string; dir: string };
+  /** Remote execution environment for this turn (spec §4.5, environments spec
+   *  §6). Present when the thread's environment applies to this turn: a
+   *  user-machine environment of the runAs user, or a provisioned sandbox.
+   *  Sensitive: `addr` (tailcat only, for older nodes). */
+  remote?: RemoteClaim;
   /** Hash of (lock owner, remote target). A node reboots a warm session when it changes. */
   sessionConfigFp?: string;
   /** The thread's /sandbox switch at dispatch: true = tools run on the sandbox MCP
@@ -63,6 +68,24 @@ export interface JobClaims {
    *  §4.3). The gate requires it among the calling node's labels. Absent (a
    *  token from before the change) means "default". */
   label?: string;
+  /** What started the turn, signed at dispatch: "slack" (a person's Slack
+   *  message), "panel" (an operator), or "cron". Only slack and panel are
+   *  interactive; an absent claim (an older gateway) reads as NOT interactive
+   *  (fail closed). It describes the job's origin only: a synthetic turn the
+   *  node's manager injects under the same token (auto-evolve, a continuation
+   *  prompt) carries it too. See isInteractiveOrigin, AgentManager.isSyntheticTurn. */
+  origin?: TurnOrigin;
+  /** The open ledger run of a budgeted background turn this job carries (a
+   *  promise check, phase E), signed at dispatch. Only this run id may be
+   *  finished with the token (POST /v1/background/turn/finish). */
+  bgRun?: string;
+  /** This job is a heartbeat wake (bgRun is its run), signed at dispatch: the
+   *  tool plane applies the wake's allow-list. Absent = a normal turn. */
+  wake?: boolean;
+  /** Where this turn's replies go, signed at dispatch: "channel" is the channel
+   *  root (a root turn on a channel session), the `thread` claim stays the
+   *  turn's real Slack ts. Absent = in the thread. */
+  post?: "channel";
   /** First issue time (unix seconds), carried across token-refresh so the
    *  token's total life is capped. Absent = this token's own `iat`. */
   iat0?: number;
@@ -91,7 +114,7 @@ export function timingSafeStringEqual(a: string, b: string): boolean {
 
 const b64uJson = (v: unknown): string => Buffer.from(JSON.stringify(v)).toString("base64url");
 
-function sign(headerAndPayload: string, secret: string): string {
+export function sign(headerAndPayload: string, secret: string): string {
   return createHmac("sha256", secret).update(headerAndPayload).digest("base64url");
 }
 
@@ -155,13 +178,30 @@ export function verifyJobToken(
   if (claims.label !== undefined && (typeof claims.label !== "string" || claims.label === "")) {
     return { ok: false, reason: "bad_claims" };
   }
+  if (claims.bgRun !== undefined && (typeof claims.bgRun !== "string" || claims.bgRun === "")) {
+    return { ok: false, reason: "bad_claims" };
+  }
+  // A wake is always a budgeted run; a claim without one is not a real wake.
+  if (claims.wake !== undefined && (claims.wake !== true || !claims.bgRun)) {
+    return { ok: false, reason: "bad_claims" };
+  }
+  // An unknown origin is refused rather than read as some default.
+  if (claims.origin !== undefined && !TURN_ORIGINS.includes(claims.origin)) {
+    return { ok: false, reason: "bad_claims" };
+  }
   return { ok: true, claims };
 }
 
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-export type NodeIdentity = { id: string; labels: ReadonlySet<string>; legacy: boolean };
+export type NodeIdentity = {
+  id: string;
+  labels: ReadonlySet<string>;
+  legacy: boolean;
+  /** Unix seconds a signed credential was issued; absent for the legacy token. */
+  iat?: number;
+};
 
 export type NodeAuthResult =
   | { ok: true; node: NodeIdentity; expiresAt?: number }
@@ -288,7 +328,7 @@ export async function authenticateNode(req: Request): Promise<NodeAuthResult> {
     if (r.ok) {
       return {
         ok: true,
-        node: { id: r.claims.id, labels: new Set(r.claims.labels), legacy: false },
+        node: { id: r.claims.id, labels: new Set(r.claims.labels), legacy: false, iat: r.claims.iat },
         expiresAt: r.claims.exp,
       };
     }

@@ -30,25 +30,44 @@ export interface ApprovalResult {
   note?: string;
 }
 
+/** What a suppressing wrapper answers an upload call with when it did nothing. */
+export const UPLOAD_SUPPRESSED = Object.freeze({ suppressed: true as const });
+export type UploadSuppressed = typeof UPLOAD_SUPPRESSED;
+
 export interface Surface {
   readonly id: string;                          // real platform id, e.g. "slack"
   readonly capabilities: ReadonlySet<SurfaceCapability>;
 
   // core — every surface MUST implement:
-  reply(i: { text: string }): Promise<{ ref: string }>;
+  /** `runtime`: the runtime's own text (a todo list, a connect notice), formatted
+   *  but never held or refused by the owner's reply rules. A reply an owner rule
+   *  refuses throws OutboundRefusal; `note` says it was held and approved. */
+  /** `tracker`: the todo or task list the runtime renders from the model's items:
+   *  the owner's reply rules apply (redact), and a list a rule refuses or would
+   *  hold is shown as hidden instead. */
+  reply(i: { text: string; runtime?: boolean; tracker?: boolean }): Promise<{ ref: string; note?: string }>;
   getHistory(i: { limit?: number; includeReplies?: boolean }): Promise<{ messages: HistoryItem[]; hasMore: boolean }>;
   requestApproval(r: ApprovalRequest): Promise<ApprovalResult>;
 
   // optional — present iff the matching capability is declared:
-  edit?(i: { ref: string; text: string }): Promise<void>;        // cap: "edit"
+  edit?(i: { ref: string; text: string; runtime?: boolean; tracker?: boolean }): Promise<void | { note?: string }>; // cap: "edit"
   react?(i: { name: string; ref?: string }): Promise<void>;      // cap: "react"
   unreact?(i: { name: string; ref?: string }): Promise<void>;    // cap: "react" (rides with react)
   upload?(i: { path: string; title?: string; comment?: string; altText?: string }): Promise<void>; // cap: "upload"
+  /** Direct upload, first call: Slack's presigned URL for one file (cap: "upload"). The
+   *  caller sends the bytes to that URL itself. */
+  uploadBegin?(i: { filename: string; size: number; altText?: string }): Promise<{ uploadUrl: string; fileId: string } | UploadSuppressed>;
+  /** Direct upload, last call: finish the file into this conversation (cap: "upload").
+   *  Resolves UPLOAD_SUPPRESSED when the console holds the session and nothing was sent. */
+  uploadComplete?(i: { fileId: string; filename: string; title?: string; comment?: string }): Promise<void | UploadSuppressed>;
+  /** Whether an upload would be suppressed right now (the console holds the session).
+   *  Absent = never. Checked before an upload's Slack call or limiter budget is spent. */
+  uploadHeld?(): Promise<boolean>;
   typing?(i: { on: boolean }): Promise<void>;                    // cap: "typing"
   /** Post a message only `userId` can see (default: the binding's user).
    *  cap: "ephemeral". MUST throw rather than fall back to a public post —
    *  callers reach for it precisely because the content is not for the channel. */
-  sayEphemeral?(i: { text: string; userId?: string }): Promise<void>; // cap: "ephemeral"
+  sayEphemeral?(i: { text: string; userId?: string; blocks?: unknown[] }): Promise<void>; // cap: "ephemeral"
 }
 
 /** Neutral per-session binding the gateway builds from the inbound turn. A SurfaceFactory
@@ -58,9 +77,38 @@ export interface SessionBinding {
   threadRef?: string;         // slack: threadTs
   inboundRef: string;         // slack: inboundTs
   userId?: string;
+  /** The person the current turn answers (an interactive reply to a human), when there is one. */
+  replyTo?: string;
   teamId?: string;
   requestApproval: (r: ApprovalRequest) => Promise<ApprovalResult>;
   reloadSession: (prompt?: string) => boolean;
+  /** The session posting (owner reply rules: audit rows, the held reply's card). */
+  sessionId?: string;
+  /** Nobody is in this turn (a wake): an owner approve rule is a deny. */
+  unattended?: boolean;
+  /** The Slack app the session posts as (a held reply's card goes out as it). */
+  appId?: string;
+  /** The turn's abort: a held reply is not posted after its turn stopped. */
+  turnSignal?: AbortSignal;
+  /** Epoch ms the turn must be over by (a node's token expiry less a margin). */
+  turnDeadline?: number;
+  /** The session's working directory (its row's `working_dir`), or undefined when
+   *  it cannot be told. An upload is refused outside it, and when this is absent. */
+  workingDir?: () => Promise<string | undefined>;
 }
 
 export type SurfaceFactory = (b: SessionBinding) => Surface;
+
+/** The id of the Slack surface (SlackSurface.id). */
+export const SLACK_SURFACE_ID = "slack";
+
+/**
+ * The surface a session's conversation is on. Every session is created for a
+ * Slack thread today (Sessions.createForThread keys rows by team, channel and
+ * thread), so this is the one place that says so: the panel's session views,
+ * history lines, live-tail user messages and audit context all read it here.
+ * When a second surface lands, sessions carry their own and this reads it.
+ */
+export function surfaceOfSession(_row?: { slack_channel_id?: string | null } | null): typeof SLACK_SURFACE_ID {
+  return SLACK_SURFACE_ID;
+}

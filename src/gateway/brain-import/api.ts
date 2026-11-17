@@ -14,8 +14,9 @@ import { json, readBodyCapped } from "../api/http";
 import { applyLinks, applyPage, type OnConflict } from "../../brain-migrate/apply";
 import type { BundlePage } from "../../brain-migrate/bundle";
 import { embeddingMismatch, readEmbeddingInfo, type BrainConfigFile, type EmbeddingInfo } from "../../brain-migrate/embedding-info";
+import { normalizeEmbeddingModel } from "../../knowledge/embedding-guard";
 import type { MigrateEngine } from "../../brain-migrate/engine-types";
-import { agentSourceForPersona, allowedTarget, remapSource, validateMap } from "../../brain-migrate/remap";
+import { agentSourceForPersona, allowedTarget, isPersonSource, remapSource, validateMap } from "../../brain-migrate/remap";
 import { agentIdReady } from "../../knowledge/agent-identity";
 import { brainEnabled, brainHome, ensureSource as ensureBrainSource, getBrain } from "../../knowledge/brain";
 import { brainMode } from "../../knowledge/brain-config";
@@ -128,10 +129,15 @@ export function createBrainImportApi(deps: BrainImportDeps = {}) {
     const engine = await (deps.engine ?? (getBrain as unknown as () => Promise<MigrateEngine>))();
 
     // A bundle with no vectors has nothing to be incompatible with.
+    let relabelModel: string | undefined;
     if (b.pages.some((p) => p.chunks.some((c) => c.embedding !== null))) {
       const target = await (deps.brainConfig ? deps.brainConfig() : defaultBrainConfig(engine));
       const bad = embeddingMismatch(b.engine, target);
       if (bad) return json(409, { error: bad });
+      // Same model on both sides: label the carried vectors with it (the bundle's
+      // per-chunk labels are gbrain's default, not the model that made them).
+      const from = normalizeEmbeddingModel(b.engine.embeddingModel);
+      if (from && from === normalizeEmbeddingModel(target.embeddingModel)) relabelModel = from;
     }
 
     // Cheap and value-free: a wrong-width vector would fail deep inside the engine.
@@ -166,7 +172,7 @@ export function createBrainImportApi(deps: BrainImportDeps = {}) {
         }
       }
       const unmappable = p.links.length - linkTargets.length;
-      const r = await applyPage(engine, { page: p, target: t, linkTargets }, { onConflict, dryRun, ensureSource: ensure, deferLinks: true });
+      const r = await applyPage(engine, { page: p, target: t, linkTargets }, { onConflict, dryRun, ensureSource: ensure, deferLinks: true, relabelModel });
       const s = (sources[t] ??= { written: 0, skipped: 0, overwritten: 0, failed: 0, linksWritten: 0, linksDropped: 0, linksFailed: 0, linksOutOfScope: 0, noEmbedding: 0 });
       s[r.outcome]++; s.noEmbedding += r.noEmbedding;
       if (r.outcome === "written" || r.outcome === "overwritten" || r.outcome === "skipped") {
@@ -174,8 +180,9 @@ export function createBrainImportApi(deps: BrainImportDeps = {}) {
         if (!dryRun) pending.push({ slug: p.slug, target: t, linkTargets, unmappable });
       }
       if (r.outcome === "failed") {
-        // Slugs of a person's slice are that person's content; only non-user slices list them.
-        if (!t.startsWith("user-")) failedSlugs.push(p.slug);
+        // Slugs of a person's source (user or profile) are that person's content;
+        // only other slices list them.
+        if (!isPersonSource(t)) failedSlugs.push(p.slug);
         const why = r.reason === "error" ? `error:${r.errorName ?? "unknown"}` : (r.reason ?? "unknown");
         failedReasons[why] = (failedReasons[why] ?? 0) + 1;
       }

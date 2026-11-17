@@ -23,6 +23,7 @@ import { AgentManager } from "../../../src/agent/manager";
 import type { Transport } from "../../../src/gateway/core/transport";
 import { writeSoulFixture, WORLD } from "../../../src/gateway/sim/soul-fixture";
 import { soulData, setSoulData } from "../../../src/soul/extract";
+import { mintUploadHandle } from "../../../src/gateway/upload/handle";
 import { mintJobToken, JOB_HEADER } from "../../../src/gateway/api/auth";
 import { SERVERS } from "../../../src/gateway/api/tools";
 import * as CronJobs from "../../../src/db/cron-jobs";
@@ -54,7 +55,12 @@ function fakeTransport(): Transport {
       canvases: { edit: async () => ({ ok: true }) },
       users: { info: async () => ({ user: { real_name: "Test" } }), profile: { set: async () => ({}) } },
       search: { messages: async () => ({ messages: { matches: [], total: 0 } }) },
-      files: { uploadV2: async () => ({ files: [] }), info: async () => ({ file: {} }) },
+      files: {
+        uploadV2: async () => ({ files: [] }),
+        info: async () => ({ file: {} }),
+        getUploadURLExternal: async () => ({ ok: true, upload_url: "https://upload.invalid/roundtrip", file_id: "F_RT" }),
+        completeUploadExternal: async () => ({ ok: true, files: [{ id: "F_RT" }] }),
+      },
     } as any,
     action: () => {}, event: () => {}, use: () => {}, start: async () => {}, stop: async () => {},
   };
@@ -77,11 +83,14 @@ const FIXTURES: Record<string, Record<string, Fixture>> = {
   surface: {
     reply: { input: { text: "roundtrip" } },
     get_history: { input: {} },
+    pass: { input: { reason: "roundtrip pass", react: "eyes" } },
     request_approval: { input: { summary: "roundtrip approval" } }, // non-blocking: returns {pendingId} (spec §3)
     edit: { input: { ref: "1.1", text: "edited" } },
     react: { input: { name: "eyes" } },
     unreact: { input: { name: "eyes" } },
-    upload: { input: () => ({ path: uploadPath }) },
+    upload: { input: () => ({ path: uploadPath }), isErrorOk: true }, // confined to the session folder; the fixture session has no row (tests/gateway/api/upload-confinement.test.ts covers both outcomes)
+    upload_begin: { input: { filename: "roundtrip.txt", size: 10 } }, // REST-only: returns {uploadUrl, fileId, handle}
+    upload_complete: { input: () => ({ handle: mintUploadHandle({ tenant: "default", persona: "default", session: "S-roundtrip", team: "T1", channel: "C0TEAM", thread: "300.0", fileId: "F_RT", filename: "roundtrip.txt", size: 10 }) }) }, // REST-only
     typing: { input: { on: true }, expect: "not_mounted" }, // SlackSurface has no "typing" capability
     set_one_on_one: { input: { action: "off" } },
     set_mention_only: { input: { active: false } },
@@ -119,9 +128,14 @@ const FIXTURES: Record<string, Record<string, Fixture>> = {
     pause_cron_job: { input: () => ({ job_id: cronJobId }) },
     resume_cron_job: { input: () => ({ job_id: cronJobId }) },
     remove_cron_job: { input: () => ({ job_id: cronJobId }) },
+    proactive_rule: { input: { kind: "roundtrip items", scope: "here", level: "ignore", quote: "roundtrip" }, isErrorOk: true }, // the test home's brain may not be open
+    read_channel: { input: { channel: "C0EXAMPLE" }, isErrorOk: true }, // not in this persona's Read list
+    proactive_post: { input: { destination: "manager", kind: "roundtrip items", needs_reply: false, text: "t", evidence: "e", item_id: "i" }, isErrorOk: true }, // not a wake
+    finish_round: { input: { journal: "j" }, isErrorOk: true }, // not a wake
     trigger_ingest: { input: {}, isErrorOk: true }, // no slaude.json in the test home
     reload_session: { input: {}, isErrorOk: true }, // session not live in this process
     can_use_tool: { input: { tool_name: "Bash", input: { command: "ls" }, tool_use_id: "rt_perm_fixture" } }, // REST-only: returns {pendingId}
+    guardrail_event: { input: { kind: "delivery", slugs: ["none"] } }, // REST-only: records nothing for an unknown guardrail
   },
   connect: {
     connect_mcp: { input: { server: "nonexistent" } }, // manager scope → "unknown MCP server" text
@@ -142,7 +156,20 @@ const FIXTURES: Record<string, Record<string, Fixture>> = {
     kb_list_pages: { input: {}, expect: "not_mounted" },
     kb_graph: { input: { slug: "s" }, expect: "not_mounted" },
     kb_memoize: { input: { pages: [{ slug: "s", content: "c", summary: "m" }] }, expect: "not_mounted" },
+    memory_about: { input: { userId: "U0ALICE" }, expect: "not_mounted" },
+    kb_thread_history: { input: {}, expect: "not_mounted" },
     kb_delete_page: { input: { slug: "s", reason: "r" }, expect: "not_mounted" },
+    // memory_* names: the same handlers as the kb_* aliases above.
+    memory_stores: { input: {} },
+    memory_search_stores: { input: { query: "roundtrip" } },
+    memory_think: { input: { question: "q" }, expect: "not_mounted" },
+    memory_search: { input: { query: "q" }, expect: "not_mounted" },
+    memory_get: { input: { slug: "s" }, expect: "not_mounted" },
+    memory_list: { input: {}, expect: "not_mounted" },
+    memory_graph: { input: { slug: "s" }, expect: "not_mounted" },
+    memory_save: { input: { pages: [{ slug: "s", content: "c", summary: "m" }] }, expect: "not_mounted" },
+    memory_thread_history: { input: {}, expect: "not_mounted" },
+    memory_delete: { input: { slug: "s", reason: "r" }, expect: "not_mounted" },
   },
 };
 
@@ -153,6 +180,7 @@ let base = "";
 beforeAll(async () => {
   process.env.SLAUDE_NODE_TOKEN = NODE_TOKEN;
   process.env.SLAUDE_JOB_SECRET = JOB_SECRET;
+  process.env.SLAUDE_UPLOAD_ALLOWED_HOSTS = "upload.invalid";
   ensureHome();
   writeSoulFixture(WORLD);
   // request_approval must settle inside the test: 1s auto-deny.
@@ -183,6 +211,7 @@ afterAll(() => {
   server?.stop(true);
   delete process.env.SLAUDE_NODE_TOKEN;
   delete process.env.SLAUDE_JOB_SECRET;
+  delete process.env.SLAUDE_UPLOAD_ALLOWED_HOSTS;
   delete process.env.SLAUDE_BRAIN_DISABLED;
 });
 

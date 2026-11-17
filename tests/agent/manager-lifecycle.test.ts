@@ -199,6 +199,7 @@ beforeEach(() => {
   spawned = [];
   currentQuery = dispatcher;
   process.env.SLAUDE_AUTO_EVOLVE = "0";
+  delete process.env.SLAUDE_AUTO_EVOLVE_MIN_TOOLS;
   process.env.SLAUDE_IDLE_MINUTES = "0";
 });
 
@@ -318,6 +319,157 @@ describe("AgentManager lifecycle", () => {
     expect(mgr.getTokenSnapshot(row.id)).toBeNull();
   });
 
+  it("pairs tool results by tool_use id, names the tool, and measures the context from the last prompt", async () => {
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const synced: any[] = [];
+    mgr.setMemoryProvider({ prefetch: async () => null, syncTurn: async (t: any) => void synced.push(t) } as any);
+    const row = await mgr.ensureSession(thread());
+    const call = (id: string, name: string, input: unknown = {}) => ({ type: "tool_use", id, name, input });
+    const result = (id: string, r: unknown) => ({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "x" }] },
+      tool_use_result: r,
+    });
+    const usageAsst = (blocks: any[], usage: any) => ({ type: "assistant", message: { content: blocks, usage } });
+    plan((s) => {
+      s.onUser = () => {
+        // Two calls of the same tool in one message, results in reverse order.
+        s.emit(usageAsst([call("tu_a", "Bash", { command: "a" }), call("tu_b", "Bash", { command: "b" })], { input_tokens: 5, cache_read_input_tokens: 40_000, cache_creation_input_tokens: 0 }));
+        s.emit(result("tu_b", { stdout: "B" }));
+        s.emit(result("tu_a", { stdout: "A" }));
+        s.emit(usageAsst([call("tu_r", "mcp__slaude_surface__reply", { text: "the answer" })], { input_tokens: 5, cache_read_input_tokens: 50_000, cache_creation_input_tokens: 0 }));
+        s.emit(result("tu_r", [{ type: "text", text: "posted ref=panel-suppressed" }]));
+        // A result whose message carries no tool_result block: no id, no name.
+        s.emit({ type: "user", tool_use_result: { ok: 1 } });
+        s.emit(
+          res({
+            // Summed over three model calls: ~45% of the window, not the real fill.
+            usage: { input_tokens: 15, output_tokens: 30, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 0 },
+            modelUsage: { "claude-test": { contextWindow: 200_000 } },
+          }),
+        );
+      };
+    });
+    await mgr.sendMessage(row.id, "go");
+    await until(() => events.some((e) => e.type === "done"), 3000, "done");
+
+    const calls = events.filter((e) => e.type === "toolCall");
+    expect(calls.map((e) => e.toolUseId)).toEqual(["tu_a", "tu_b", "tu_r"]);
+    const results = events.filter((e) => e.type === "toolResult");
+    expect(results.map((e) => [e.toolUseId, e.tool])).toEqual([
+      ["tu_b", "Bash"],
+      ["tu_a", "Bash"],
+      ["tu_r", "mcp__slaude_surface__reply"],
+      [undefined, ""],
+    ]);
+    expect(results[0].result).toEqual({ stdout: "B" });
+
+    const usage = events.find((e) => e.type === "tokenUsage");
+    expect(usage.snapshot.totalInput).toBe(50_005);
+    expect(usage.snapshot.pctUsed).toBeCloseTo(0.25);
+
+    // The reply tool's text is the turn's answer in the conversation record.
+    await until(() => synced.length === 1, 3000, "memory sync");
+    expect(synced[0].assistant).toBe("the answer");
+    await shutdown(mgr, row.id);
+  });
+
+  describe("reply text in the turn record", () => {
+    const call = (id: string, name: string, input: unknown = {}) => ({ type: "tool_use", id, name, input });
+    const result = (id: string, r: unknown, isError = false) => ({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "x", ...(isError ? { is_error: true } : {}) }] },
+      tool_use_result: r,
+    });
+    const REPLY = "mcp__slaude_surface__reply";
+
+    /** One turn per scripted step list; returns what memory recorded per turn. */
+    async function turns(steps: Array<(s: FakeSession) => void>, env: Record<string, string> = {}) {
+      Object.assign(process.env, env);
+      const mgr = new AgentManager();
+      const events = record(mgr);
+      const synced: any[] = [];
+      mgr.setMemoryProvider({ prefetch: async () => null, syncTurn: async (t: any) => void synced.push(t) } as any);
+      const row = await mgr.ensureSession(thread());
+      let i = 0;
+      plan((s) => {
+        s.onUser = (um) => {
+          if (String(um.message.content).includes("<auto-evolve>")) return void steps.at(-1)!(s);
+          steps[i++]!(s);
+        };
+      });
+      for (let n = 0; n < steps.length - (env.SLAUDE_AUTO_EVOLVE === "1" ? 1 : 0); n++) {
+        const before = events.filter((e) => e.type === "done").length;
+        await mgr.sendMessage(row.id, `turn ${n}`);
+        await until(() => events.filter((e) => e.type === "done").length > before, 3000, `done ${n}`);
+      }
+      if (env.SLAUDE_AUTO_EVOLVE === "1") await until(() => events.filter((e) => e.type === "done").length === steps.length, 3000, "evolve done");
+      await Bun.sleep(20);
+      await shutdown(mgr, row.id);
+      return { synced, events };
+    }
+
+    it("records a delivered or held reply, never a refused or errored one", async () => {
+      const { synced } = await turns([
+        (s) => { s.emit(asst([call("a", REPLY, { text: "posted one" })])); s.emit(result("a", [{ type: "text", text: "posted ref=1.2" }])); s.emit(res()); },
+        (s) => { s.emit(asst([call("b", REPLY, { text: "held one" })])); s.emit(result("b", [{ type: "text", text: "posted ref=panel-suppressed" }])); s.emit(res()); },
+        (s) => { s.emit(asst([txt("thinking aloud"), call("c", REPLY, { text: "refused one" })])); s.emit(result("c", [{ type: "text", text: '{"refused":true}' }])); s.emit(res()); },
+        (s) => { s.emit(asst([txt("still here"), call("d", REPLY, { text: "errored one" })])); s.emit(result("d", [{ type: "text", text: "reply failed: channel_not_found" }], true)); s.emit(res()); },
+      ]);
+      expect(synced.map((t) => t.assistant)).toEqual(["posted one", "held one", "thinking aloud", "still here"]);
+    });
+
+    it("does not record the same text twice when the model also wrote it as text", async () => {
+      const { synced } = await turns([
+        (s) => { s.emit(asst([txt("Same answer."), call("a", REPLY, { text: "Same answer." })])); s.emit(result("a", "posted ref=1.2")); s.emit(res()); },
+      ]);
+      expect(synced[0].assistant).toBe("Same answer.");
+    });
+
+    it("never records the skill check's reply", async () => {
+      const { synced } = await turns(
+        [
+          (s) => { s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), call("u", REPLY, { text: "user answer" })])); s.emit(result("u", "posted ref=1")); s.emit(res()); },
+          (s) => { s.emit(asst([call("e", REPLY, { text: "evolve chatter" })])); s.emit(result("e", "posted ref=2")); s.emit(res()); },
+        ],
+        { SLAUDE_AUTO_EVOLVE: "1" },
+      );
+      expect(synced.map((t) => t.assistant).join("|")).not.toContain("evolve chatter");
+      expect(synced[0].assistant).toContain("user answer");
+    });
+
+    it("clears open calls at turn end: a late result names no tool and records no reply", async () => {
+      const { synced, events } = await turns([
+        // The call's result never arrives in its own turn.
+        (s) => { s.emit(asst([txt("first"), call("late", REPLY, { text: "late reply" })])); s.emit(res()); },
+        (s) => { s.emit(result("late", "posted ref=9")); s.emit(asst([txt("second")])); s.emit(res()); },
+      ]);
+      const r = events.find((e) => e.type === "toolResult");
+      expect(r.toolUseId).toBe("late");
+      expect(r.tool).toBe("");
+      expect(synced.map((t) => t.assistant)).toEqual(["first", "second"]);
+    });
+  });
+
+  it("a subagent's messages do not set the context fill", async () => {
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    plan((s) => {
+      s.onUser = () => {
+        s.emit({ type: "assistant", message: { content: [txt("main")], usage: { input_tokens: 10, cache_read_input_tokens: 30_000 } } });
+        // A subagent's own context is much bigger; it must not count.
+        s.emit({ type: "assistant", parent_tool_use_id: "tu_task", message: { content: [txt("sub")], usage: { input_tokens: 10, cache_read_input_tokens: 150_000 } } });
+        s.emit(res({ usage: { input_tokens: 20, output_tokens: 5, cache_read_input_tokens: 180_000, cache_creation_input_tokens: 0 }, modelUsage: { m: { contextWindow: 200_000 } } }));
+      };
+    });
+    await mgr.sendMessage(row.id, "go");
+    await until(() => events.some((e) => e.type === "tokenUsage"), 3000, "usage");
+    expect(events.find((e) => e.type === "tokenUsage").snapshot.totalInput).toBe(30_010);
+    await shutdown(mgr, row.id);
+  });
+
   it("suppresses a resume-miss result(is_error) but still surfaces other turn errors", async () => {
     const mgr = new AgentManager();
     const events = record(mgr);
@@ -435,6 +587,64 @@ describe("AgentManager lifecycle", () => {
     expect(await mgr.mcpServerStatus(row.id)).toBeNull();
 
     await shutdown(mgr, row.id);
+  });
+
+  it("mounts the built-in slaude plugin next to the $SLAUDE_HOME plugin", async () => {
+    const { BUILTIN_PLUGIN_DIR } = await import("../../src/soul/builtin");
+    const { paths } = await import("../../src/config/home");
+    const want = { type: "local", path: BUILTIN_PLUGIN_DIR, skipMcpDiscovery: true };
+    // gateway/mono, then a node (an MCP resolver installed)
+    for (const node of [false, true]) {
+      const mgr = new AgentManager();
+      if (node) mgr.setMcpResolver(async () => ({}));
+      const row = await mgr.ensureSession(thread());
+      const fs = plan();
+      await mgr.sendMessage(row.id, "hello");
+      await until(() => fs.options !== null, 3000, "boot");
+      expect(fs.options.plugins.slice(0, 2)).toEqual([
+        { type: "local", path: paths.home, skipMcpDiscovery: true },
+        want,
+      ]);
+      await shutdown(mgr, row.id);
+    }
+  });
+
+  it("warns loudly at boot when another plugin would also be named \"slaude\"", async () => {
+    const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { paths } = await import("../../src/config/home");
+    const { BUILTIN_PLUGIN_DIR } = await import("../../src/soul/builtin");
+    // An installed plugin whose directory is named "slaude" and has no manifest:
+    // the CLI names it after the basename, the built-in plugin's name.
+    const root = mkdtempSync(join(tmpdir(), "plugin-collide-"));
+    const collide = join(root, "slaude");
+    mkdirSync(collide);
+    const file = join(paths.claudeConfig, "plugins", "installed_plugins.json");
+    const before = existsSync(file) ? readFileSync(file, "utf8") : null;
+    mkdirSync(join(paths.claudeConfig, "plugins"), { recursive: true });
+    writeFileSync(file, JSON.stringify({ version: 2, plugins: { "x@mp": [{ scope: "user", installPath: collide }] } }));
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const mgr = new AgentManager();
+      const row = await mgr.ensureSession(thread());
+      const fs = plan();
+      await mgr.sendMessage(row.id, "hello");
+      await until(() => fs.options !== null, 3000, "boot");
+      expect(fs.options.plugins.map((p: any) => p.path)).toContain(collide);
+      const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("plugin name \"slaude\""));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(collide);
+      expect(lines[0]).toContain("built-in");
+      // the built-in plugin itself is never reported
+      expect(lines[0]).not.toContain(BUILTIN_PLUGIN_DIR);
+      await shutdown(mgr, row.id);
+    } finally {
+      warn.mockRestore();
+      if (before === null) rmSync(file, { force: true });
+      else writeFileSync(file, before);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   // WS-C §4.2: a node's async resolver returns the bridged servers next to the
@@ -579,7 +789,7 @@ describe("AgentManager lifecycle", () => {
           s.emit(res()); // silent NO from the agent
           return;
         }
-        s.emit(asst([tool("Bash"), tool("Write"), tool("Read"), txt("did the work")]));
+        s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("did the work")]));
         s.emit(res());
       };
     });
@@ -600,13 +810,126 @@ describe("AgentManager lifecycle", () => {
     await shutdown(mgr, row.id);
   });
 
+  it("evolve turn: blocked, load, then write succeeds", async () => {
+    // The fake SDK does not run hooks itself: the test calls the hooks wired in
+    // options exactly as the CLI would, around each tool call of the evolve turn.
+    process.env.SLAUDE_AUTO_EVOLVE = "1";
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const runHooks = async (event: string, input: any) => {
+      const outs: any[] = [];
+      for (const m of fs.options.hooks[event] ?? []) {
+        for (const h of m.hooks) outs.push(await h({ hook_event_name: event, session_id: "cli", transcript_path: "/t", cwd: "/w", ...input }, "tu", { signal: new AbortController().signal }));
+      }
+      return outs.find((o) => o?.hookSpecificOutput?.permissionDecision === "deny") ?? {};
+    };
+    const decisions: any[] = [];
+    const fs = plan((s) => {
+      s.onUser = (um) => {
+        const text = String(um.message.content);
+        if (!text.includes("<auto-evolve>")) {
+          s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("did the work")]));
+          s.emit(res());
+          return;
+        }
+        void (async () => {
+          const write = { tool_name: "mcp__slaude_skills__write_skill", tool_input: { slug: "x" }, tool_use_id: "w1" };
+          decisions.push(await runHooks("PreToolUse", write));
+          const load = { tool_name: "Skill", tool_input: { skill: "slaude:skill-authoring" }, tool_use_id: "k1" };
+          decisions.push(await runHooks("PreToolUse", load));
+          await runHooks("PostToolUse", { ...load, tool_response: { success: true, commandName: "slaude:skill-authoring" } });
+          decisions.push(await runHooks("PreToolUse", write));
+          s.emit(res());
+        })();
+      };
+    });
+
+    await mgr.sendMessage(row.id, "do a thing");
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "evolve done");
+    const evolve = String(fs.users[1].message.content);
+    expect(evolve).toContain("<auto-evolve>");
+    expect(evolve).toContain("Load `slaude:skill-authoring` with the Skill tool (skip if already loaded this session), then call `mcp__slaude_skills__list_skills`");
+    expect(decisions[0].hookSpecificOutput).toEqual({
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: 'Load `slaude:skill-authoring` first (call the Skill tool with skill "slaude:skill-authoring"), then retry.',
+    });
+    expect(decisions[1]).toEqual({});
+    expect(decisions[2]).toEqual({});
+
+    // A reboot needs the skill loaded again.
+    await shutdown(mgr, row.id);
+    const fs2 = plan();
+    await mgr.sendMessage(row.id, "again");
+    await until(() => fs2.options !== null, 3000, "reboot");
+    const pre = fs2.options.hooks.PreToolUse.flatMap((m: any) => m.hooks);
+    const outs = await Promise.all(pre.map((h: any) => h({ hook_event_name: "PreToolUse", tool_name: "mcp__slaude_skills__write_skill", tool_input: {} }, "tu", { signal: new AbortController().signal })));
+    expect(outs.some((o: any) => o?.hookSpecificOutput?.permissionDecision === "deny")).toBe(true);
+    await shutdown(mgr, row.id);
+  });
+
+  it("the skill gate and the usage counter share PostToolUse: one Skill load does both", async () => {
+    const mgr = new AgentManager();
+    const counted: Array<[string, string | undefined, string]> = [];
+    mgr.setSkillUsageRecorder(async (sessionId, persona, skill) => void counted.push([sessionId, persona, skill]));
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hi");
+    await until(() => fs.options !== null, 3000, "boot");
+    const post = fs.options.hooks.PostToolUse.flatMap((m: any) => m.hooks);
+    // The skill gate, the usage counter, and pass ending the turn.
+    expect(post).toHaveLength(3);
+    const load = { hook_event_name: "PostToolUse", tool_name: "Skill", tool_input: { skill: "slaude:skill-authoring" }, tool_response: { success: true } };
+    for (const h of post) await h(load, "tu", { signal: new AbortController().signal });
+    await until(() => counted.length === 1, 1000, "counted");
+    expect(counted).toEqual([[row.id, undefined, "slaude:skill-authoring"]]);
+    // The gate saw the same load: the governed tool is no longer denied.
+    const pre = fs.options.hooks.PreToolUse.flatMap((m: any) => m.hooks);
+    const outs = await Promise.all(pre.map((h: any) => h({ hook_event_name: "PreToolUse", tool_name: "mcp__slaude_skills__write_skill", tool_input: {} }, "tu", { signal: new AbortController().signal })));
+    expect(outs.some((o: any) => o?.hookSpecificOutput?.permissionDecision === "deny")).toBe(false);
+    await shutdown(mgr, row.id);
+  });
+
+  it("marks the evolution turn's tool, text and thinking events autoEvolve, and only those (#131)", async () => {
+    process.env.SLAUDE_AUTO_EVOLVE = "1";
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+
+    plan((s) => {
+      s.onUser = (um) => {
+        const text = String(um.message.content);
+        if (text.includes("<auto-evolve>")) {
+          s.emit(asst([{ type: "thinking", thinking: "worth a skill?" } as any, tool("Read"), txt("no skill needed")]));
+          s.emit(res());
+          return;
+        }
+        s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("did the work")]));
+        s.emit(res());
+      };
+    });
+
+    await mgr.sendMessage(row.id, "do a thing");
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "evolve done");
+    const firstDone = events.findIndex((e) => e.type === "done");
+    const userTurn = events.slice(0, firstDone).filter((e) => ["toolCall", "assistantText", "thinking"].includes(e.type));
+    const evolveTurn = events.slice(firstDone + 1).filter((e) => ["toolCall", "assistantText", "thinking"].includes(e.type));
+    expect(userTurn.map((e) => e.type)).toEqual(["toolCall", "toolCall", "toolCall", "toolCall", "assistantText"]);
+    expect(userTurn.every((e) => e.autoEvolve === undefined)).toBe(true);
+    expect(evolveTurn.map((e) => e.type)).toEqual(["thinking", "toolCall", "assistantText"]);
+    expect(evolveTurn.every((e) => e.autoEvolve === true)).toBe(true);
+
+    await shutdown(mgr, row.id);
+  });
+
   describe("auto-evolve during a voice call", () => {
     /** A turn that would normally trigger auto-evolve (>=2 substantive tools). */
     const evolving = () =>
       plan((s) => {
         s.onUser = (um) => {
           if (String(um.message.content).includes("<auto-evolve>")) return void s.emit(res());
-          s.emit(asst([tool("Bash"), tool("Write"), txt("done")]));
+          s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("done")]));
           s.emit(res());
         };
       });
@@ -669,6 +992,73 @@ describe("AgentManager lifecycle", () => {
       expect(String(fs.users[2].message.content)).toContain("<auto-evolve>");
       await shutdown(mgr, row.id);
     });
+  });
+
+  /** Run one user turn emitting `names`, wait for done, return the plan's user messages. */
+  async function runEvolveTurn(names: string[]) {
+    process.env.SLAUDE_AUTO_EVOLVE = "1";
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan((s) => {
+      s.onUser = (um) => {
+        if (String(um.message.content).includes("<auto-evolve>")) return void s.emit(res());
+        s.emit(asst([...names.map((n) => tool(n)), txt("did the work")]));
+        s.emit(res());
+      };
+    });
+    await mgr.sendMessage(row.id, "do a thing");
+    await until(() => events.some((e) => e.type === "done"), 3000, "done");
+    await Bun.sleep(60);
+    return { fs, mgr, row };
+  }
+
+  it("does not inject auto-evolve after 3 substantive tools", async () => {
+    const { fs, mgr, row } = await runEvolveTurn(["Bash", "Write", "Grep", "WebFetch"]);
+    expect(fs.users.length).toBe(1);
+    await shutdown(mgr, row.id);
+  });
+
+  it("does not inject auto-evolve after 4 read-only external tools (no mutating tool)", async () => {
+    const { fs, mgr, row } = await runEvolveTurn(["WebFetch", "WebFetch", "WebFetch", "WebFetch"]);
+    expect(fs.users.length).toBe(1);
+    await shutdown(mgr, row.id);
+  });
+
+  it("injects a system-tagged, announcement-free check after 4 substantive incl. a mutating tool", async () => {
+    const { fs, mgr, row } = await runEvolveTurn(["Bash", "Write", "WebFetch", "WebSearch"]);
+    expect(fs.users.length).toBe(2);
+    const text = String(fs.users[1].message.content);
+    expect(text.startsWith('<runtime-check kind="auto-evolve">')).toBe(true);
+    expect(text).toContain("<auto-evolve>");
+    expect(text).not.toContain("mcp__slaude_surface__reply");
+    expect(text).not.toContain("saved /");
+    await shutdown(mgr, row.id);
+  });
+
+  it("an external mcp__ tool counts as mutating", async () => {
+    const { fs, mgr, row } = await runEvolveTurn(["WebFetch", "WebFetch", "WebSearch", "mcp__ext__do_thing"]);
+    expect(fs.users.length).toBe(2);
+    await shutdown(mgr, row.id);
+  });
+
+  it("/remote read aliases are read-only and ignored, like their built-ins", async () => {
+    const { fs, mgr, row } = await runEvolveTurn(["mcp__remote__read", "mcp__remote__grep", "mcp__remote__glob", "mcp__remote__read"]);
+    expect(fs.users.length).toBe(1);
+    await shutdown(mgr, row.id);
+  });
+
+  it("/remote write aliases count as mutating, like their built-ins", async () => {
+    const { fs, mgr, row } = await runEvolveTurn(["mcp__remote__bash", "mcp__remote__edit", "WebFetch", "WebSearch"]);
+    expect(fs.users.length).toBe(2);
+    await shutdown(mgr, row.id);
+  });
+
+  it("SLAUDE_AUTO_EVOLVE_MIN_TOOLS overrides the bar", async () => {
+    process.env.SLAUDE_AUTO_EVOLVE_MIN_TOOLS = "2";
+    const { fs, mgr, row } = await runEvolveTurn(["Bash", "Write"]);
+    expect(fs.users.length).toBe(2);
+    await shutdown(mgr, row.id);
   });
 
   it("skips auto-evolve when the turn already wrote a skill", async () => {
@@ -1092,42 +1482,48 @@ describe("AgentManager on a node: provider credentials from the child-env resolv
 });
 
 describe("AgentManager reload: overlapping inputs and a CLI that never exits", () => {
-  it("a reload requested while an auto-evolve turn AND a queued user message are pending waits for BOTH results", async () => {
+  it("a reload requested during an auto-evolve turn with a user message waiting: the reload runs, and the message boots fresh", async () => {
     process.env.SLAUDE_AUTO_EVOLVE = "1";
     const mgr = new AgentManager();
     const events = record(mgr);
     const row = await mgr.ensureSession(thread());
     let finishEvolve: () => void = () => {};
-    let finishB: () => void = () => {};
     const fs = plan((s) => {
       s.onUser = (um) => {
         const text = String(um.message.content);
         if (text.includes("<auto-evolve>")) finishEvolve = () => s.emit(res());
-        else if (text === "B") finishB = () => s.emit(res());
         else {
-          s.emit(asst([tool("Bash"), tool("Write"), txt("did the work")]));
+          s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("did the work")]));
           s.emit(res());
         }
       };
     });
     await mgr.sendMessage(row.id, "A");
     // A is done and the auto-evolve prompt is in flight; the node would now
-    // release the lock, and the next job pushes B into the same session.
+    // release the lock, and the next job sends B. B must not enter that turn:
+    // the CLI folds it in, and B's own turn would never end.
     await until(() => fs.users.length === 2, 3000, "auto-evolve injected");
-    await mgr.sendMessage(row.id, "B");
-    await until(() => fs.users.length === 3, 3000, "B delivered");
+    let freshGotB = false;
+    const fresh = plan((s) => {
+      s.onUser = (um) => {
+        if (String(um.message.content) === "B") {
+          freshGotB = true;
+          s.emit(res());
+        }
+      };
+    });
+    const sent = mgr.sendMessage(row.id, "B");
+    await Bun.sleep(30);
+    expect(fs.users.length).toBe(2);
 
     expect(mgr.reloadAfterTurn(row.id)).toBe(true);
     finishEvolve();
-    await until(() => events.some((e) => e.type === "done" && e.autoEvolve), 3000, "evolve done");
-    await Bun.sleep(30);
-    // B is still in flight: input must stay open.
-    expect(fs.ended).toBe(false);
-    expect(mgr.isLive(row.id)).toBe(true);
-
-    finishB();
-    await until(() => !mgr.isLive(row.id), 3000, "reload after both results");
+    await until(() => freshGotB, 3000, "B in a fresh session");
+    await sent;
     expect(fs.ended).toBe(true);
+    expect(fs.users.some((u) => String(u.message.content) === "B")).toBe(false);
+    expect(fresh.users.some((u) => String(u.message.content) === "B")).toBe(true);
+    expect(events.some((e) => e.type === "done" && e.autoEvolve)).toBe(true);
     expect(events.filter((e) => e.type === "error")).toHaveLength(0);
   });
 
@@ -1251,6 +1647,7 @@ describe("a detached reloading session's late messages", () => {
 // Without this, the live child keeps taking messages (sendMessage pushes into it
 // and never re-resolves the persona) and runs as the default identity.
 const { setPersonaRegistry, __resetPersonaRegistry } = await import("../../src/persona/registry");
+const { hookTag, HOOK_IDS } = await import("../../src/agent/hook-tags");
 describe("a warm session whose persona is retired", () => {
   const reg = (managed: boolean, live: string[]) => ({
     lookupByUserId: () => null,
@@ -1448,6 +1845,19 @@ describe("AgentManager voice support", () => {
     expect(mgr.isTurnInFlight(row.id)).toBe(false);
   });
 
+  it("turnRunning is true from send until the turn's result", async () => {
+    const mgr = new AgentManager();
+    expect(mgr.turnRunning("nope")).toBe(false);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => mgr.isLive(row.id), 3000, "live");
+    expect(mgr.turnRunning(row.id)).toBe(true);
+    fs.emit(res());
+    await until(() => !mgr.turnRunning(row.id), 3000, "turn done");
+    await shutdown(mgr, row.id);
+  });
+
   it("holding a non-live id returns false and does not block a later session's idle", async () => {
     const spy = spyOn(env, "idleMs").mockReturnValue(30);
     try {
@@ -1598,11 +2008,14 @@ describe("AgentManager: store failures outside any caller", () => {
 
   it("a resume-retry reboot that fails signals sessionExit (a voice call on it must end)", async () => {
     const mgr = new AgentManager();
-    let boots = 0;
+    // Every read after the first boot reached the SDK fails: the retry
+    // reboot's read (reads before it, such as sendMessage's own, succeed).
+    let booted = false;
+    currentQuery = (args) => ((booted = true), dispatcher(args));
     const { dbSessionStore } = await import("../../src/agent/session-store");
     mgr.setSessionStore({
       ...dbSessionStore,
-      findById: (id: string) => (++boots > 1 ? Promise.reject(new Error("401 expired")) : dbSessionStore.findById(id)),
+      findById: (id: string) => (booted ? Promise.reject(new Error("401 expired")) : dbSessionStore.findById(id)),
     } as any);
     const exits: string[] = [];
     mgr.on("sessionExit", (id: string) => exits.push(id));
@@ -1616,5 +2029,332 @@ describe("AgentManager: store failures outside any caller", () => {
     });
     expect(exits).toEqual([row.id]);
     expect(mgr.isLive(row.id)).toBe(false);
+  });
+});
+
+describe("isSyntheticTurn: a prompt the runtime itself sent", () => {
+  /** Answer every input with a result; record isSyntheticTurn as each input arrives. */
+  const recorder = (mgr: InstanceType<typeof AgentManager>, id: () => string, seen: Array<[string, boolean]>, substantive = false) =>
+    (s: FakeSession) => {
+      s.onUser = (um) => {
+        const text = String(um.message.content);
+        seen.push([text, mgr.isSyntheticTurn(id())]);
+        if (substantive && !text.includes("<auto-evolve>") && seen.length === 1) {
+          s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("did the work")]));
+        }
+        s.emit(res());
+      };
+    };
+
+  it("false for a delivered turn, true during the auto-evolve turn, false again for the next human turn", async () => {
+    process.env.SLAUDE_AUTO_EVOLVE = "1";
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const seen: Array<[string, boolean]> = [];
+    plan(recorder(mgr, () => row.id, seen, true));
+
+    await mgr.sendMessage(row.id, "do a thing");
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "evolve done");
+    expect(seen.map(([t, s]) => [t.includes("<auto-evolve>") ? "evolve" : t, s])).toEqual([["do a thing", false], ["evolve", true]]);
+    expect(mgr.isSyntheticTurn(row.id)).toBe(false);
+
+    await mgr.sendMessage(row.id, "next question");
+    await until(() => events.filter((e) => e.type === "done").length === 3, 3000, "next done");
+    expect(seen[2]).toEqual(["next question", false]);
+    expect(mgr.isSyntheticTurn(row.id)).toBe(false);
+    await shutdown(mgr, row.id);
+  });
+
+  it("true for a reload_session continuation prompt; false for the human turn after it", async () => {
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const seen: Array<[string, boolean]> = [];
+    plan(recorder(mgr, () => row.id, seen));
+    plan(recorder(mgr, () => row.id, seen));
+
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => events.filter((e) => e.type === "done").length === 1, 3000, "first done");
+    expect(mgr.reload(row.id, "carry on")).toBe(true);
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "continuation done");
+    expect(seen).toEqual([["hello", false], ["carry on", true]]);
+
+    await mgr.sendMessage(row.id, "thanks");
+    await until(() => events.filter((e) => e.type === "done").length === 3, 3000, "human done");
+    expect(seen[2]).toEqual(["thanks", false]);
+    expect(mgr.isSyntheticTurn(row.id)).toBe(false);
+    await shutdown(mgr, row.id);
+  });
+
+  it("no live session: false", () => {
+    expect(new AgentManager().isSyntheticTurn("S-none")).toBe(false);
+  });
+
+  it("a voice-injected turn (mono and node runners) counts as synthetic: its profile write is denied", async () => {
+    const { monoRunner, nodeRunner } = await import("../../src/voice/runners");
+    const { SYNTHETIC_PROFILE_DENIAL, KB_MEMOIZE_TOOL } = await import("../../src/agent/profile-write-guard");
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const decisions: Array<[string, string | undefined]> = [];
+    const fs = plan((s) => {
+      s.onUser = async (um) => {
+        const text = String(um.message.content);
+        let reason: string | undefined;
+        for (const h of s.options.hooks.PreToolUse[0].hooks) {
+          const out = await h(
+            { hook_event_name: "PreToolUse", tool_name: KB_MEMOIZE_TOOL, tool_input: { target: "profile", pages: [] } },
+            "tu",
+            { signal: new AbortController().signal },
+          );
+          // Only the profile guard's answer (the skill gate also asks for slaude:memory).
+          const r = out?.hookSpecificOutput?.permissionDecisionReason;
+          if (r === SYNTHETIC_PROFILE_DENIAL) reason = r;
+        }
+        decisions.push([text, reason]);
+        s.emit(res());
+      };
+    });
+    await mgr.sendMessage(row.id, "hello", { sender: { userId: "U0ALICE", teamId: "T", origin: "slack" } });
+    await until(() => events.filter((e) => e.type === "done").length === 1, 3000, "first done");
+    const ro = { suppress: false, voice: true, cancelled: () => false };
+    await monoRunner(mgr, { check: async () => {}, pollMs: 5 }).run(row.id, "voice delegate (mono)", ro);
+    await nodeRunner({ agent: mgr, lock: (_sid, fn) => fn(new AbortController().signal), refreshToken: async () => {} }).run(
+      row.id,
+      "voice delegate (node)",
+      ro,
+    );
+    expect(decisions).toEqual([
+      ["hello", undefined],
+      ["voice delegate (mono)", SYNTHETIC_PROFILE_DENIAL],
+      ["voice delegate (node)", SYNTHETIC_PROFILE_DENIAL],
+    ]);
+    expect(mgr.isSyntheticTurn(row.id)).toBe(false);
+    void fs;
+    await shutdown(mgr, row.id);
+  });
+});
+
+describe("turnSenders: who sent the inputs the CLI is processing (phase C, invariant 2)", () => {
+  const A = { userId: "U0ALICE", teamId: "T", origin: "slack" };
+  const B = { userId: "U0BOB", teamId: "T", origin: "slack" };
+  const profileWrite = { pages: [{ slug: "profile", content: "Call me X.", summary: "name", type: "profile" }], target: "profile" as const };
+
+  /** kb_memoize target:"profile" as mono runs it: the live ctx speaker is
+   *  `ctxUser` (whoever spoke last), the senders come from the manager. */
+  async function memoizeAs(mgr: InstanceType<typeof AgentManager>, id: string, ctxUser: string) {
+    const { brainHandlers } = await import("../../src/knowledge/mcp-tools");
+    const { resolveBrainScope } = await import("../../src/knowledge/scope");
+    const { fakeBrain } = await import("../memory/fake-brain");
+    const brain = fakeBrain();
+    const senders = mgr.turnSenders(id);
+    const gate = {
+      userId: ctxUser, teamId: "T", interactive: true, origin: "slack" as const, lockedUser: null,
+      channelTrust: "trusted" as const, isManager: false, agentId: "AGENT1",
+      ...(senders ? { turnSenders: senders } : {}),
+    };
+    const written: string[] = [];
+    const r = await brainHandlers.kb_memoize(profileWrite, {
+      scope: async () => (await resolveBrainScope({ ...gate, kbSources: [] })),
+      gate: () => gate,
+      managers: () => [],
+      requestApproval: async () => ({ approved: false, by: "x" }),
+      call: async (name, params, scope) => {
+        if (name === "put_page") written.push(scope.sourceId);
+        return brain.call(name, params, scope);
+      },
+    });
+    return { text: r.content[0]!.text, written };
+  }
+
+  it("T1 Alice running, Bob queued as T2, T1 ends, Alice posts during T2: a profile write in T2 is refused", async () => {
+    const { profileSourceId } = await import("../../src/knowledge/scope");
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan(); // never answers on its own: the test ends each turn
+    await mgr.sendMessage(row.id, "T1: call me Al", { sender: A });
+    await until(() => fs.users.length === 1, 3000, "T1 delivered");
+    expect(mgr.turnSenders(row.id)).toEqual([A]);
+
+    await mgr.sendMessage(row.id, "T2: call me B", { sender: B }); // queued behind T1
+    expect(mgr.turnSenders(row.id)).toEqual([A, B]); // the CLI may fold it into T1
+    expect((await memoizeAs(mgr, row.id, "U0BOB")).text).toBe("refused: a profile is written only on that person's own turn");
+
+    fs.emit(res()); // T1 ends; T2 (Bob's words) runs
+    await until(() => events.filter((e) => e.type === "done").length === 1, 3000, "T1 done");
+    expect(mgr.turnSenders(row.id)).toEqual([B]);
+
+    await mgr.sendMessage(row.id, "T3: hi", { sender: A }); // Alice posts during T2; the ctx is now Alice
+    expect(mgr.turnSenders(row.id)).toEqual([B, A]);
+    const during = await memoizeAs(mgr, row.id, "U0ALICE");
+    expect(during.text).toBe("refused: a profile is written only on that person's own turn");
+    expect(during.written).toEqual([]);
+
+    fs.emit(res()); // T2 ends
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "T2 done");
+    expect(mgr.turnSenders(row.id)).toEqual([A]);
+    fs.emit(res()); // T3 ends: nothing outstanding
+    await until(() => events.filter((e) => e.type === "done").length === 3, 3000, "T3 done");
+    expect(mgr.turnSenders(row.id)).toBeNull();
+    expect(profileSourceId("T", "U0ALICE")).not.toBe(profileSourceId("T", "U0BOB"));
+    await shutdown(mgr, row.id);
+  });
+
+  it("turnTexts: the own text of every outstanding input; null when any came without one", async () => {
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "<channel>T1</channel> plus injected context", { sender: { ...A, text: "T1: just answer these" } });
+    await until(() => fs.users.length === 1, 3000, "T1 delivered");
+    expect(mgr.turnTexts(row.id)).toEqual(["T1: just answer these"]);
+    // The sender record a profile write reads is unchanged by the text.
+    expect(mgr.turnSenders(row.id)).toEqual([A]);
+    await mgr.sendMessage(row.id, "T2", { sender: A }); // no text: unknown
+    expect(mgr.turnTexts(row.id)).toBeNull();
+    fs.emit(res());
+    await until(() => events.filter((e) => e.type === "done").length === 1, 3000, "T1 done");
+    expect(mgr.turnTexts(row.id)).toBeNull();
+    fs.emit(res());
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "T2 done");
+    expect(mgr.turnTexts(row.id)).toBeNull();
+    await shutdown(mgr, row.id);
+  });
+
+  it("T2 with Bob as its sole sender writes Bob's profile, even while the ctx shows Alice", async () => {
+    const { profileSourceId } = await import("../../src/knowledge/scope");
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "T1", { sender: A });
+    await until(() => fs.users.length === 1, 3000, "T1 delivered");
+    await mgr.sendMessage(row.id, "T2: call me B", { sender: B });
+    fs.emit(res());
+    await until(() => events.filter((e) => e.type === "done").length === 1, 3000, "T1 done");
+    expect(mgr.turnSenders(row.id)).toEqual([B]);
+    const r = await memoizeAs(mgr, row.id, "U0ALICE");
+    expect(r.text).not.toContain("refused");
+    expect(r.written).toEqual([profileSourceId("T", "U0BOB")]);
+    await shutdown(mgr, row.id);
+  });
+
+  it("fails closed: no live session, an input without a sender, a synthetic input", async () => {
+    process.env.SLAUDE_AUTO_EVOLVE = "1";
+    const mgr = new AgentManager();
+    expect(mgr.turnSenders("S-none")).toBeNull();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const seen: Array<unknown> = [];
+    const fs = plan((s) => {
+      s.onUser = (um) => {
+        const text = String(um.message.content);
+        seen.push([text.includes("<auto-evolve>") ? "evolve" : text, mgr.turnSenders(row.id)]);
+        if (!text.includes("<auto-evolve>")) s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("did the work")]));
+        s.emit(res());
+      };
+    });
+    await mgr.sendMessage(row.id, "no sender");
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "evolve done");
+    expect(seen).toEqual([["no sender", null], ["evolve", null]]);
+    expect(fs.users.length).toBe(2);
+    await shutdown(mgr, row.id);
+  });
+});
+
+describe("profile writes on a synthetic turn (phase C, invariant 2)", () => {
+  it("the PreToolUse hook denies kb_memoize target:\"profile\" during the auto-evolve turn only", async () => {
+    // The fake SDK does not run hooks itself: the test calls the hooks wired in
+    // options exactly as the CLI would, around a tool call in each turn.
+    process.env.SLAUDE_AUTO_EVOLVE = "1";
+    const mgr = new AgentManager();
+    const events = record(mgr);
+    const row = await mgr.ensureSession(thread());
+    const runHooks = async (event: string, input: any) => {
+      const outs: any[] = [];
+      for (const m of fs.options.hooks[event] ?? []) {
+        for (const h of m.hooks) outs.push(await h({ hook_event_name: event, session_id: "cli", transcript_path: "/t", cwd: "/w", ...input }, "tu", { signal: new AbortController().signal }));
+      }
+      return outs.find((o) => o?.hookSpecificOutput?.permissionDecision === "deny") ?? {};
+    };
+    const runPre = (input: any) => runHooks("PreToolUse", input);
+    // kb_memoize is governed by slaude:memory (skill-gate): load it once in the
+    // human turn, as the model would, so only the profile guard can deny below.
+    const load = { tool_name: "Skill", tool_input: { skill: "slaude:memory" }, tool_use_id: "k1" };
+    const profile = { tool_name: "mcp__slaude_kb__kb_memoize", tool_input: { target: "profile", pages: [] }, tool_use_id: "p1" };
+    const mine = { tool_name: "mcp__slaude_kb__kb_memoize", tool_input: { target: "mine", pages: [] }, tool_use_id: "m1" };
+    const human: any[] = [];
+    const evolve: any[] = [];
+    const fs = plan((s) => {
+      s.onUser = (um) => {
+        const text = String(um.message.content);
+        void (async () => {
+          const into = text.includes("<auto-evolve>") ? evolve : human;
+          if (into === human) {
+            await runPre(load);
+            await runHooks("PostToolUse", { ...load, tool_response: { success: true, commandName: "slaude:memory" } });
+          }
+          into.push(await runPre(profile), await runPre(mine));
+          if (into === human) s.emit(asst([tool("Bash"), tool("Write"), tool("WebFetch"), tool("WebSearch"), txt("did the work")]));
+          s.emit(res());
+        })();
+      };
+    });
+
+    await mgr.sendMessage(row.id, "call me Al from now on");
+    await until(() => events.filter((e) => e.type === "done").length === 2, 3000, "evolve done");
+    expect(human).toEqual([{}, {}]);
+    expect(evolve[0].hookSpecificOutput).toEqual({
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: "A profile is written only on that person's own turn.",
+    });
+    expect(evolve[1]).toEqual({});
+    await shutdown(mgr, row.id);
+  });
+});
+
+describe("a sync reaches a warm session's skill list", () => {
+  const skillCall = async (fs: FakeSession, skill: string) => {
+    const hook = fs.options.hooks.PreToolUse[0].hooks.find((h: unknown) => hookTag(h) === HOOK_IDS.skillGate);
+    return hook({ hook_event_name: "PreToolUse", tool_name: "Skill", tool_input: { skill } }, undefined, { signal: new AbortController().signal });
+  };
+  const denied = (r: any) => r.hookSpecificOutput?.permissionDecision === "deny";
+  const registry = (skills: string[] | undefined) => {
+    const p = { name: "ana", slackUserId: "UANA", soulMd: "s", config: { slackUserId: "UANA", name: "ana" }, outClient: null, model: null, mcp: null, soulJson: {}, definition: skills ? { skills } : {} };
+    return { lookupByUserId: () => null, lookupByName: (n: string) => (n === "ana" ? p : null), list: () => [p], isMultiPersonaMode: () => true, isManaged: () => true, tombstonedPersonaFor: () => null, defaultPersona: () => ({ model: null, mcp: null }) } as any;
+  };
+
+  afterEach(() => __resetPersonaRegistry());
+
+  it("mono: the gate reads the registry, so a new snapshot applies to a live session", async () => {
+    setPersonaRegistry(registry(["old-skill"]));
+    const mgr = new AgentManager();
+    const row = await mgr.ensureSession({ ...thread(), persona_id: "ana" });
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.skills).toContain("old-skill");
+    expect(denied(await skillCall(fs, "new-skill"))).toBe(true);
+    setPersonaRegistry(registry(["new-skill"]));
+    expect(denied(await skillCall(fs, "new-skill"))).toBe(false);
+    expect(denied(await skillCall(fs, "old-skill"))).toBe(true);
+    await shutdown(mgr, row.id);
+  });
+
+  it("node: the gate reads the bundle on each call", async () => {
+    let skills: string[] = ["old-skill"];
+    const mgr = new AgentManager();
+    mgr.setPersonaSoulResolver(async () => ({ soulMd: "s", soulJson: {}, definition: { skills } }));
+    const row = await mgr.ensureSession({ ...thread(), persona_id: "ana" });
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(denied(await skillCall(fs, "new-skill"))).toBe(true);
+    skills = ["new-skill"];
+    expect(denied(await skillCall(fs, "new-skill"))).toBe(false);
+    await shutdown(mgr, row.id);
   });
 });

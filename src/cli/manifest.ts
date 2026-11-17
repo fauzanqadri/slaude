@@ -10,17 +10,22 @@
 // enabled on the gateway) it also emits oauth_config.redirect_urls pointing
 // at /slack/oauth/callback. No slash_commands section in either mode:
 // slaude parses slash-style commands from plain message text, so there are
-// no Slack-registered slash commands to route.
+// no Slack-registered slash commands to route. Registering /link and the rest
+// would make Slack send slash-command payloads that no gateway route handles,
+// so they stay unregistered: people put a space before the command or mention
+// the agent, since Slack rejects a message that starts with an unregistered /.
 
 export type ManifestMode = "socket" | "http";
 
 /** Bot scopes the app needs — single source for the manifest AND the OAuth
  *  install flow's authorize URL (src/gateway/slack/oauth.ts).
  *
- *  NOT audited: this list was not checked against Slack's documentation. It looks
- *  short for calls the code makes (pins.*, canvases.*, conversations.setTopic /
- *  setPurpose, files.* uploads) and search.messages needs a USER token. Audit it
- *  (spec WS-D D1.5) before relying on it for a fresh install. */
+ *  Checked against the tools in src/gateway/slack/mcp-tools.ts (#104): Canvas,
+ *  pin and topic/purpose tools need canvases:write, pins:write, channels:manage
+ *  and groups:write. search.messages is not covered by any bot scope: Slack
+ *  refuses bot tokens for it, so search works only when posting as a user whose
+ *  token carries search:read. Adding a scope here means existing installs must
+ *  reinstall the app to get it. */
 export const BOT_SCOPES = [
   "app_mentions:read",
   "channels:history",
@@ -41,6 +46,14 @@ export const BOT_SCOPES = [
   "reactions:write",
   "users:read",
   "assistant:write",
+  // Canvas tools (conversations.canvases.create, canvases.edit).
+  "canvases:write",
+  // pin / unpin (pins.add, pins.remove).
+  "pins:write",
+  // set_topic / set_purpose: public channels, then private ones (DM and
+  // group DM are covered by im:write / mpim:write).
+  "channels:manage",
+  "groups:write",
 ] as const;
 
 /** User-token scopes. users.profile:write acts as a person, so Slack accepts it
@@ -91,6 +104,8 @@ export function buildManifest(
           "message.groups",
           "message.im",
           "message.mpim",
+          // Reactions to proactive posts are recorded as outcomes (phase E).
+          "reaction_added",
         ],
       },
       interactivity: { is_enabled: true },

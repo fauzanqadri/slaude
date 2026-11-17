@@ -18,14 +18,21 @@
  * the router) for every provider. A provider call that hangs is abandoned at
  * GATEWAY_MEMORY_TIMEOUT_MS: prefetch answers null, sync answers ok, and the
  * timeout is logged once per operation.
+ *
+ * A brain-backed sync of an interactive turn that has a write scope also counts the turn in
+ * thread_activity (the quiet-moment pass's selection), a database write only,
+ * never a brain call; its failure is logged and never fails the sync.
  */
+import { runAsPersonFor } from "../../slices/decide";
 import { z } from "zod";
 import type { GateInput } from "../../knowledge/gated-dispatch";
 import { agentIdReady } from "../../knowledge/agent-identity";
 import { parseRunAs } from "../../agent/credential-owner";
-import type { MemoryProvider } from "../../memory/provider";
+import { stripTurnMemoryContext, type MemoryProvider } from "../../memory/provider";
 import { BrainMemoryProvider } from "../../memory/brain-provider";
-import { memoryScopeFor, withClaimLock } from "../../memory/scope";
+import { memoryScopeFor, withClaimLock, type MemoryScope } from "../../memory/scope";
+import { noteThreadTurn } from "../../db/thread-activity";
+import type { BrainScope } from "../../knowledge/scope";
 import { livePersona } from "../../persona/registry";
 import { zodIssueLine } from "../../tools/contracts/types";
 import type { JobClaims } from "./auth";
@@ -69,6 +76,8 @@ export function makeMemoryPlane(deps: {
   assertLive?: (claims: JobClaims) => void;
   timeoutMs?: number;
   warn?: (msg: string) => void;
+  /** After a brain-backed sync with a write scope: count the turn. Default noteThreadTurn (DB only, never throws). */
+  onSynced?: (sessionId: string, agentId: string, write: BrainScope) => Promise<void>;
 }): MemoryPlane {
   const providerNow = (): MemoryProvider => (typeof deps.provider === "function" ? deps.provider() : deps.provider);
   const ready = deps.ready ?? agentIdReady;
@@ -76,6 +85,7 @@ export function makeMemoryPlane(deps: {
   const timeoutMs = deps.timeoutMs ?? GATEWAY_MEMORY_TIMEOUT_MS;
   const warn = deps.warn ?? ((m: string) => console.warn(m));
   const warned = new Set<string>();
+  const onSynced = deps.onSynced ?? noteThreadTurn;
 
   async function bounded<T>(op: MemoryOp, p: Promise<T>, fallback: T): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -94,16 +104,14 @@ export function makeMemoryPlane(deps: {
     return fallback;
   }
 
-  /** The turn's memory scope, or null when the brain gives it none. */
-  async function scope(claims: JobClaims) {
+  /** The turn's memory scope and the persona's agent id, or null when the brain gives it none. */
+  async function scope(claims: JobClaims): Promise<(MemoryScope & { agentId: string; interactive: boolean }) | null> {
     await ready();
     const gate = await deps.gateFor(claims);
     if (!gate) return null;
     // runAs is signed at dispatch: a cron created inside a /1on1 runs as its
     // owner although its synthetic thread holds no lock.
-    const runAs = parseRunAs(claims.runAs);
-    const runAsUser = runAs?.kind === "user" ? runAs.slackUserId : null;
-    return memoryScopeFor(withClaimLock(gate, claims.lock?.user), { channel: claims.channel, runAsUser });
+    return { ...(await memoryScopeForClaims(gate, claims)), agentId: gate.agentId, interactive: gate.interactive };
   }
 
   return {
@@ -117,12 +125,32 @@ export function makeMemoryPlane(deps: {
     async sync(claims, turn) {
       assertLive(claims);
       const provider = providerNow();
-      const t = { sessionId: claims.session, ...turn };
+      // Whatever the provider, the per-turn blocks (the memory context, the thread head) are never stored: an
+      // older node may send them, and a provider other than the brain's would keep them whole.
+      const t = { sessionId: claims.session, ...turn, user: stripTurnMemoryContext(turn.user) };
       if (!(provider instanceof BrainMemoryProvider)) return bounded("sync", provider.syncTurn(t), undefined);
       const s = await scope(claims);
-      if (s?.write) await bounded("sync", provider.syncTurnIn(t, s.write), undefined);
+      if (!s?.write) return;
+      await bounded("sync", provider.syncTurnIn(t, s.write), undefined);
+      // A cron or runtime turn does not make a thread busy.
+      if (s.interactive) await onSynced(claims.session, s.agentId, s.write).catch(() => {});
     },
   };
+}
+
+/**
+ * The memory scope a turn's job token names: the more private of the live and
+ * signed /1on1 lock, and the signed `runAs`. The one derivation the memory
+ * routes and memory_thread_history share, so both read what the turn writes.
+ */
+export async function memoryScopeForClaims(gate: GateInput, claims: JobClaims): Promise<MemoryScope> {
+  // runAs is signed at dispatch: a cron created inside a /1on1 runs as its
+  // owner although its synthetic thread holds no lock.
+  const runAs = parseRunAs(claims.runAs);
+  const runAsUser = runAs?.kind === "user" ? runAs.slackUserId : null;
+  // Slice F shadow (`shadow`: counts only; `union`: the runAs person's verified slices, reads only).
+  const runAsPerson = await runAsPersonFor(gate, runAsUser);
+  return memoryScopeFor(await withClaimLock(gate, claims.lock?.user), { channel: claims.channel, runAsUser, ...(runAsPerson ? { runAsPerson } : {}) });
 }
 
 /** The default plane: the process's provider, gated like the KB tools (the

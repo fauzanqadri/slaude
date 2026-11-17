@@ -35,6 +35,8 @@ export type SlashHit =
   | { kind: "unignore"; target: "thread" }
   | { kind: "cron-add"; cronExpr: string; prompt: string; target: "thread" | "channel"; whenActive: "fire" | "skip" }
   | { kind: "cron-list" }
+  | { kind: "heartbeat-status" }
+  | { kind: "heartbeat-now" }
   | { kind: "cron-remove"; id: string }
   | { kind: "cron-pause"; id: string }
   | { kind: "cron-resume"; id: string }
@@ -49,6 +51,12 @@ export type SlashHit =
   | { kind: "workflow"; action: "answer" | "reject"; text: string }
   | { kind: "participant"; action: "add" | "remove"; userIds: string[] }
   | { kind: "participant"; action: "list" }
+  | { kind: "env"; action: "status" | "list" | "off" }
+  | { kind: "env"; action: "key"; kindName?: string }
+  | { kind: "env"; action: "use"; name: string; dir?: string }
+  | { kind: "env"; action: "add"; kindName?: string; name?: string; fields?: Record<string, string>; dir?: string }
+  | { kind: "env"; action: "edit"; name: string; fields?: Record<string, string>; newName?: string; dir?: string }
+  | { kind: "env"; action: "rm"; name: string }
   | { kind: "mention-only"; action: "on" | "off" }
   | { kind: "mcp"; action: "status" | "connect" | "disconnect"; server?: string }
   | { kind: "soul"; field: "trust" | "allow" | "dm" | "block"; action: "add" | "remove"; value: string }
@@ -57,6 +65,7 @@ export type SlashHit =
   | { kind: "model"; id?: string }
   | { kind: "bash"; command: string }
   | { kind: "compact" }
+  | { kind: "new" }
   | { kind: "link" };
 
 /** One descriptor per agent slash command — the single source of truth for every help
@@ -67,7 +76,8 @@ export const AGENT_COMMANDS: SlashSpec[] = [
   { usage: "/mode <name>", summary: "set the tool-permission mode (per session/thread)" },
   { usage: "/abort", summary: "cancel the current turn" },
   { usage: "/1on1 [lock | off]", summary: "start a private 1on1 (locked to you); `lock` re-restricts after open; `off` releases — to open to guests, ask the agent directly" },
-  { usage: "/remote [<addr> [dir] | off | key]", summary: "run this thread's shell + file tools on your own machine over tailcat (locks the thread to you); no arg shows status" },
+  { usage: "/env [list | use <name> [dir] | add | edit <name> | rm <name> | off | key [kind]]", summary: "choose where this thread's shell + file tools run: one of your saved environments (tailcat, ssh, …) or the server; no arg shows status and your environments" },
+  { usage: "/remote [off | key | <addr> [dir]]", summary: "alias for a tailcat environment: run this thread's shell + file tools on your own machine (locks the thread to you); no arg shows status and, when off, a private Connect button" },
   { usage: "/workflow start <pipeline> [TICKET-123 | text]", summary: "start a ticket workflow in this thread (you become the starter); `status`, `cancel`, `answer <a> || <b>`, `reject <reason>`" },
   { usage: "/participant add|remove @user… | list", summary: "who may approve this thread's workflow stages (starter + participants); add/remove: starter or manager" },
   { usage: "/sandbox [on | off]", summary: "run this thread's shell + file tools in its own sandbox (for code work; allowlisted users); `off` destroys it; no arg shows status" },
@@ -79,6 +89,8 @@ export const AGENT_COMMANDS: SlashSpec[] = [
   { usage: "/unignore-thread", summary: "stop ignoring this thread" },
   { usage: `/cron-add "<expr>" "<prompt>" [channel] [passive]`, summary: "schedule a prompt; `channel` posts to channel root, `passive` skips when a human is active" },
   { usage: "/cron-list", summary: "list scheduled crons" },
+  { usage: "/heartbeat status", summary: "what the agent is doing on its own, and what it costs (manager only)" },
+  { usage: "/heartbeat now", summary: "run this channel's wake now, at the root of a proactive channel (manager only)" },
   { usage: `/cron-edit <id> "<expr>" "<prompt>" [channel] [passive]`, summary: "update a scheduled cron's expression, prompt, target, and passive mode" },
   { usage: "/cron-pause <id>", summary: "pause a scheduled cron without deleting it" },
   { usage: "/cron-resume <id>", summary: "resume a paused cron and recompute its next run" },
@@ -90,6 +102,7 @@ export const AGENT_COMMANDS: SlashSpec[] = [
   { usage: "/bash <command>", summary: "run a shell command on the server (gated — approval required)" },
   { usage: "/link", summary: "connect your account so any agent can use your integrations (replies privately)" },
   { usage: "/compact", summary: "summarize and compact the conversation context" },
+  { usage: "/new", summary: "start this channel's session over; the old one stays in the console (manager or this channel's approvers)" },
   { usage: "/help", summary: "show this help" },
 ];
 
@@ -173,6 +186,12 @@ export function parseSlashCommand(text: string): SlashHit | null {
     const parsed = parseCronCreateTail(t.replace(/^\/cron-add\s+/, ""));
     return parsed ? { kind: "cron-add", ...parsed } : null;
   }
+  if (cmd === "heartbeat" && (arg === "" || arg === "status")) {
+    return { kind: "heartbeat-status" };
+  }
+  if (cmd === "heartbeat" && arg === "now") {
+    return { kind: "heartbeat-now" };
+  }
   if (cmd === "cron-list") {
     return { kind: "cron-list" };
   }
@@ -254,6 +273,9 @@ export function parseSlashCommand(text: string): SlashHit | null {
     if (sub === "on" || sub === "off") return { kind: "sandbox", action: sub };
     return null;
   }
+  if (cmd === "env") {
+    return parseEnvCommand(rest);
+  }
   if (cmd === "mention-only") {
     return { kind: "mention-only", action: arg === "off" ? "off" : "on" };
   }
@@ -302,20 +324,25 @@ export function parseSlashCommand(text: string): SlashHit | null {
   if (cmd === "compact") {
     return { kind: "compact" };
   }
+  if (cmd === "new") {
+    return { kind: "new" };
+  }
   if (HELP_NAMES.has(cmd)) {
     return { kind: "help" };
   }
   return null;
 }
 
-export function helpText(): string {
+export function helpText(o: { channelSessionRoot?: boolean } = {}): string {
   // Render the command table inside a code fence with the summary column aligned
   // to a single gutter (longest usage + 2). Slack renders fences monospace, so
   // space-padding lines up cleanly; tabs render at inconsistent widths and are
   // avoided. Usages are NOT backtick-wrapped — backticks show literally inside a
   // fence.
-  const gutter = Math.max(...AGENT_COMMANDS.map((c) => c.usage.length)) + 2;
-  const cmds = AGENT_COMMANDS.map((c) => c.usage.padEnd(gutter) + c.summary).join("\n");
+  // `/new` is a command only at a channel session's root; elsewhere it is plain text.
+  const commands = o.channelSessionRoot === false ? AGENT_COMMANDS.filter((c) => c.usage !== "/new") : AGENT_COMMANDS;
+  const gutter = Math.max(...commands.map((c) => c.usage.length)) + 2;
+  const cmds = commands.map((c) => c.usage.padEnd(gutter) + c.summary).join("\n");
   const modes = Object.values(MODE_ALIASES)
     .filter((v, i, a) => a.indexOf(v) === i)
     .map((m) => `  • \`/mode ${humanModeName(m)}\` — ${MODE_LABELS[m]}`)
@@ -336,4 +363,62 @@ export function humanModeName(m: PermissionMode): string {
     case "dontAsk":
       return "dont-ask";
   }
+}
+
+/** `key=value` arguments; anything else is positional. */
+function splitKv(args: string[]): { pos: string[]; kv: Record<string, string> } {
+  const pos: string[] = [];
+  const kv: Record<string, string> = {};
+  for (const a of args) {
+    const m = a.match(/^([A-Za-z][A-Za-z0-9_]*)=(.*)$/);
+    if (m) kv[m[1]!] = m[2]!;
+    else pos.push(a);
+  }
+  return { pos, kv };
+}
+
+function parseEnvCommand(rest: string[]): SlashHit | null {
+  const sub = (rest[0] ?? "").toLowerCase();
+  if (!rest[0] || sub === "status") return { kind: "env", action: "status" };
+  if (sub === "list" || sub === "ls") return { kind: "env", action: "list" };
+  if (sub === "off") return { kind: "env", action: "off" };
+  if (sub === "key") return rest[1] ? { kind: "env", action: "key", kindName: rest[1].toLowerCase() } : { kind: "env", action: "key" };
+  if (sub === "use") {
+    const name = rest[1]?.toLowerCase();
+    if (!name) return null;
+    const dir = rest.slice(2).join(" ").trim();
+    return dir ? { kind: "env", action: "use", name, dir } : { kind: "env", action: "use", name };
+  }
+  if (sub === "rm" || sub === "remove" || sub === "delete") {
+    const name = rest[1]?.toLowerCase();
+    return name ? { kind: "env", action: "rm", name } : null;
+  }
+  if (sub === "add") {
+    if (!rest[1]) return { kind: "env", action: "add" };
+    const { pos, kv } = splitKv(rest.slice(2));
+    const { dir, ...fields } = kv;
+    return {
+      kind: "env",
+      action: "add",
+      kindName: rest[1].toLowerCase(),
+      name: pos[0] ?? "",
+      fields,
+      ...(dir !== undefined ? { dir } : {}),
+    };
+  }
+  if (sub === "edit") {
+    const name = rest[1]?.toLowerCase();
+    if (!name) return null;
+    const { kv } = splitKv(rest.slice(2));
+    const { dir, name: newName, ...fields } = kv;
+    return {
+      kind: "env",
+      action: "edit",
+      name,
+      fields,
+      ...(newName !== undefined ? { newName } : {}),
+      ...(dir !== undefined ? { dir } : {}),
+    };
+  }
+  return null;
 }

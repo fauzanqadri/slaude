@@ -1,0 +1,48 @@
+import { sameAt } from "../../access/wired";
+import type { JobClaims } from "./auth";
+import { json } from "./http";
+import { parseRunAs } from "../../agent/credential-owner";
+import { boundEnv } from "../../remote/active";
+import { remoteDecision, turnKindOf } from "../../remote/definitions/decision";
+import { connectInfoForBinding } from "../../remote/env-runtime";
+import { RemoteError } from "../../remote/types";
+
+/**
+ * How to reach the turn's environment (environments spec §6): the transport
+ * and private key the node's helper connects with. Served only for a token
+ * whose signed `remote` claim names the environment the thread is bound to
+ * right now, with the same hash, and only while its trust class still applies
+ * (a user-machine environment: to its owner's own turns under their lock).
+ */
+export async function handleRemoteEnv(_req: Request, claims: JobClaims): Promise<Response> {
+  const ref = claims.remote?.env;
+  if (!ref) return json(403, { error: "this turn is not in an environment" });
+  const b = await boundEnv(claims.channel, claims.thread);
+  if (!b || b.env.id !== ref.id) return json(409, { error: "the thread's environment changed" });
+  if (b.env.source === "definition") {
+    // A shared row has no Slack team: it must belong to the tenant the token was minted for.
+    if (b.env.tenantId !== claims.tenant) return json(403, { error: "this environment may not be used by this turn" });
+  } else if (b.env.teamId !== claims.team) {
+    return json(409, { error: "the thread's environment changed" });
+  }
+  const decision = await remoteDecision({
+    tenant: claims.tenant, persona: claims.persona, channel: claims.channel, thread: claims.thread,
+    turnKind: turnKindOf({ origin: claims.origin, wake: claims.wake, backgroundRunId: claims.bgRun }),
+  });
+  if ("refused" in decision) return json(403, { error: "this environment may not be used by this turn" });
+  const target = "target" in decision ? decision.target : null;
+  if (!target?.env || target.env.id !== ref.id || target.env.hash !== ref.hash) return json(409, { error: "the thread's environment changed" });
+  if (target.env.trust === "user-machine") {
+    const runAs = parseRunAs(claims.runAs);
+    if (!runAs || runAs.kind !== "user" || !(await sameAt({ site: "remote.env_api_owner_same", persona: claims.persona, teamId: claims.team, userId: runAs.slackUserId, otherUserId: b.env.userId, otherTeamId: b.env.teamId }))) {
+      return json(403, { error: "a personal environment is only served to its owner's turns" });
+    }
+  }
+  try {
+    const info = await connectInfoForBinding(b.binding, b.env);
+    return json(200, { transport: info.transport, privateKey: info.privateKey });
+  } catch (e) {
+    if (e instanceof RemoteError) return json(409, { error: e.message, code: e.code });
+    throw e;
+  }
+}

@@ -17,15 +17,26 @@ export type Skill = {
   /** Which root it came from: the shared base, or the persona's own overlay
    *  (which shadows a base skill of the same slug). */
   source: SkillSource;
+  /** Frontmatter `authored_by` ("agent" when write_skill wrote it), if any. Not
+   *  provenance on its own: see provenance.ts (slaude.lock and the bundled seed win). */
+  authoredBy?: string;
+  /** Frontmatter `authored_at` (ISO time of the last write_skill), if any. */
+  authoredAt?: string;
 };
 
 export type SkillSource = "global" | "persona";
 
+/** A skill's slug: its directory name. */
+export const SKILL_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** Most of a SKILL.md the console reads and the version log keeps; past it the text is cut and flagged. */
+export const SKILL_MD_MAX_BYTES = 256 * 1024;
+
 const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/;
 
-function parseSkillFile(absPath: string): Pick<Skill, "name" | "description" | "body"> | null {
-  if (!existsSync(absPath)) return null;
-  const raw = readFileSync(absPath, "utf8");
+type ParsedSkill = Pick<Skill, "name" | "description" | "body" | "authoredBy" | "authoredAt">;
+
+/** Parse SKILL.md text into its frontmatter fields and body. */
+export function parseSkillText(raw: string): ParsedSkill {
   const m = raw.match(FRONTMATTER_RE);
   if (!m) {
     return { name: "", description: "", body: raw };
@@ -40,7 +51,19 @@ function parseSkillFile(absPath: string): Pick<Skill, "name" | "description" | "
     name: typeof fm.name === "string" ? fm.name : "",
     description: typeof fm.description === "string" ? fm.description : "",
     body: m[2] ?? "",
+    ...(typeof fm.authored_by === "string" ? { authoredBy: fm.authored_by } : {}),
+    ...(typeof fm.authored_at === "string" ? { authoredAt: fm.authored_at } : {}),
   };
+}
+
+function parseSkillFile(absPath: string): ParsedSkill | null {
+  if (!existsSync(absPath)) return null;
+  return parseSkillText(readFileSync(absPath, "utf8"));
+}
+
+/** A SKILL.md's frontmatter `name` ("" when it has none), or null when the file is missing. */
+export function skillFileName(absPath: string): string | null {
+  return parseSkillFile(absPath)?.name ?? null;
 }
 
 /**
@@ -66,11 +89,17 @@ export function skillRootsFor(personaName?: string): string[] {
   return persona ? [globalSkillsRoot(), personaSkillsRoot(persona)] : [globalSkillsRoot()];
 }
 
-/** Scan one skills root into Skill[]. Missing root → []. */
+/** Where retired skills are kept, inside each skills root (skillOps.retire). */
+export const RETIRED_DIR = ".retired";
+
+/** Scan one skills root into Skill[]. Missing root → []. A dot entry (the
+ *  `.retired/` store among them) is never a skill. The CLI's own scan reads
+ *  `<root>/<name>/SKILL.md` one level deep, so it never sees `.retired/` either. */
 function scanSkillsRoot(root: string, source: SkillSource): Skill[] {
   if (!existsSync(root)) return [];
   const out: Skill[] = [];
   for (const entry of readdirSync(root)) {
+    if (entry.startsWith(".")) continue;
     const dir = join(root, entry);
     if (!statSync(dir).isDirectory()) continue;
     const skillPath = join(dir, "SKILL.md");
@@ -83,6 +112,8 @@ function scanSkillsRoot(root: string, source: SkillSource): Skill[] {
       body: parsed.body,
       dir,
       source,
+      ...(parsed.authoredBy !== undefined ? { authoredBy: parsed.authoredBy } : {}),
+      ...(parsed.authoredAt !== undefined ? { authoredAt: parsed.authoredAt } : {}),
     });
   }
   return out;
@@ -99,6 +130,11 @@ export function discoverSkills(personaName?: string): Skill[] {
   const bySlug = new Map<string, Skill>(base.map((s) => [s.slug, s]));
   for (const s of scanSkillsRoot(personaSkillsRoot(persona), "persona")) bySlug.set(s.slug, s);
   return [...bySlug.values()];
+}
+
+/** The skills an agent may use: all of them with no list, else the slugs named. */
+export function allowedSkillsOf(skills: Skill[], allowed: readonly string[] | null): Skill[] {
+  return allowed ? skills.filter((s) => allowed.includes(s.slug)) : skills;
 }
 
 /** Slack message text → maybe a /skill-name invocation. Returns matching skill + remaining args. */

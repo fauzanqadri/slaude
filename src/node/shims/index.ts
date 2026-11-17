@@ -28,11 +28,13 @@ import { slackContract } from "../../tools/contracts/slack";
 import { runtimeContract } from "../../tools/contracts/runtime";
 import { connectContract } from "../../tools/contracts/connect";
 import { skillsContract } from "../../tools/contracts/skills";
-import { kbContract } from "../../tools/contracts/kb";
+import { isMemoryToolAlias, kbContract } from "../../tools/contracts/kb";
+import { env } from "../../config/env";
 import { mcpMountedTools, type ServerContract } from "../../tools/contracts/types";
 import { decisionFromApprovalRow } from "../../gateway/slack/approval-gate";
 import type { NodeClient, ToolResult } from "../client";
 import { pollPending } from "../pending";
+import { directUpload } from "../upload";
 import { VOICE_QUIET_SLACK_TOOLS, VOICE_QUIET_TOOLS, VOICE_SUPPRESSED_RESULT } from "../../voice/turn-flags";
 
 /** Contract server name → REST path segment (spec §3 tool plane). */
@@ -55,6 +57,20 @@ export interface ShimDeps {
   /** True while this session runs a voice-origin turn (voice mode, plan
    *  deviation 3): user-visible surface writes are dropped locally. */
   voiceActive?(sessionId: string): boolean;
+  /** The session's working directory (the gateway's session row), for the upload read guard. */
+  workingDirFor?(sessionId: string): Promise<string | undefined>;
+  /** The session's scratch directory, when it has one: the other place an upload may read from. */
+  scratchDirFor?(sessionId: string): string | undefined;
+  /** Test seam: the fetch that sends an upload's bytes to Slack. */
+  uploadFetch?: typeof fetch;
+}
+
+/** The tools a shim mounts: the contract's MCP tools, less the deprecated
+ *  memory aliases when SLAUDE_MEMORY_TOOL_ALIASES=0 (as createKbMcp does). */
+export function shimMountedTools(contract: ServerContract) {
+  const tools = mcpMountedTools(contract);
+  if (contract.server !== kbContract.server || env.memoryToolAliases()) return tools;
+  return tools.filter((t) => !isMemoryToolAlias(t.name));
 }
 
 const errResult = (text: string): ToolResult => ({ content: [{ type: "text", text }], isError: true });
@@ -64,7 +80,7 @@ function shimServer(contract: ServerContract, sessionId: string, deps: ShimDeps)
   return createSdkMcpServer({
     name: contract.server,
     version: "0.1.0",
-    tools: mcpMountedTools(contract).map((t) =>
+    tools: shimMountedTools(contract).map((t) =>
       // Return type widened to the SDK's CallToolResult via `any`: our
       // ToolResult is the same MCP shape minus the SDK's index signature.
       tool(t.name, t.description, t.schema, async (args: Record<string, unknown>): Promise<any> => {
@@ -74,17 +90,57 @@ function shimServer(contract: ServerContract, sessionId: string, deps: ShimDeps)
           (contract.server === surfaceContract.server && VOICE_QUIET_TOOLS.has(t.name)) ||
           (contract.server === slackContract.server && VOICE_QUIET_SLACK_TOOLS.has(t.name));
         if (quiet && deps.voiceActive?.(sessionId)) return VOICE_SUPPRESSED_RESULT;
+        // pass is not a write, but its optional reaction is. The gateway's
+        // voice flag is process-local and knows nothing of this node's call,
+        // so drop the reaction here and still forward (the gateway logs it).
+        if (
+          contract.server === surfaceContract.server && t.name === surfaceContract.tools.pass.name &&
+          "react" in args && deps.voiceActive?.(sessionId)
+        ) {
+          const { react: _dropped, ...rest } = args;
+          args = rest;
+        }
         try {
           if (contract.server === surfaceContract.server && t.name === surfaceContract.tools.request_approval.name) {
             return await requestApprovalOverRest(sessionId, args, token, deps);
           }
-          return await deps.client.postTool(segment, t.name, args, token);
+          // upload on a node sends the bytes to Slack itself (see ../upload); a gateway that
+          // cannot serve that, or a shim with no read guard wired, uses the old path call.
+          if (contract.server === surfaceContract.server && t.name === surfaceContract.tools.upload.name && deps.workingDirFor) {
+            const out = await directUpload(args as { path: string }, {
+              client: deps.client,
+              tokenFor: () => deps.tokenFor(sessionId),
+              workingDir: () => deps.workingDirFor!(sessionId),
+              scratchDir: () => deps.scratchDirFor?.(sessionId),
+              signal: deps.signalFor?.(sessionId),
+              ...(deps.uploadFetch ? { fetchImpl: deps.uploadFetch } : {}),
+            });
+            if ("result" in out) return out.result;
+            noteUploadFallback(out.fallback);
+          }
+          return await deps.client.postTool(segment, t.name, args, token, deps.signalFor?.(sessionId));
         } catch (e) {
           return errResult(`${segment}/${t.name} failed: ${e instanceof Error ? e.message : String(e)}`);
         }
       }),
     ),
   });
+}
+
+let warnedUploadFallback = new Set<string>();
+/** Logged once per reason: this gateway cannot serve a direct upload, so the old path call is used. */
+function noteUploadFallback(reason: "old-gateway" | "no-capability"): void {
+  if (warnedUploadFallback.has(reason)) return;
+  warnedUploadFallback.add(reason);
+  console.warn(
+    reason === "old-gateway"
+      ? "[node] upload: this gateway predates direct upload; using the path call (the file must be visible to the gateway)"
+      : "[node] upload: the gateway has no upload capability for this surface; using the path call",
+  );
+}
+/** TEST SEAM: let the once-only fallback logs fire again. */
+export function __resetUploadFallbackLogs(): void {
+  warnedUploadFallback = new Set();
 }
 
 /** request_approval: open (→ pendingId) + long-poll + render the same text

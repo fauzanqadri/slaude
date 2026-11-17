@@ -125,7 +125,7 @@ describe("db/client drivers", () => {
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
       )).map((r) => r.table_name);
       for (const t of EXPECTED_TABLES) expect(tables).toContain(t);
-      expect(tables).not.toContain("skill_usage");
+      expect(tables).toContain("skill_usage");
       expect(await db.one<{ id: string }>("SELECT id FROM tenants WHERE id = ?", ["default"])).toEqual({ id: "default" });
 
       const now = Date.now();
@@ -165,5 +165,32 @@ describe("db/client drivers", () => {
     const all = loadMigrations();
     expect(all.map((m) => m.version)).toEqual([...all.map((m) => m.version)].sort());
     expect(noopLeaderLock.withLock("x", async () => 1)).resolves.toBe(1);
+  });
+});
+
+describe("sqlite transactions on one connection", () => {
+  test("two overlapping transactions run one after the other instead of colliding", async () => {
+    const c = await openDb({ dialect: "sqlite", path: ":memory:" });
+    await c.exec("CREATE TABLE t_tx (n INTEGER)");
+    const order: string[] = [];
+    const a = c.transaction(async (tx) => {
+      order.push("a:start");
+      await tx.run("INSERT INTO t_tx VALUES (1)");
+      await new Promise((r) => setTimeout(r, 20));
+      order.push("a:end");
+    });
+    const b = c.transaction(async (tx) => {
+      order.push("b:start");
+      await tx.run("INSERT INTO t_tx VALUES (2)");
+      order.push("b:end");
+    });
+    await Promise.all([a, b]);
+    expect(order).toEqual(["a:start", "a:end", "b:start", "b:end"]);
+    expect((await c.query("SELECT n FROM t_tx")).length).toBe(2);
+    // A failed transaction releases the lock.
+    await c.transaction(async () => { throw new Error("boom"); }).catch(() => {});
+    await c.transaction(async (tx) => { await tx.run("INSERT INTO t_tx VALUES (3)"); });
+    expect((await c.query("SELECT n FROM t_tx")).length).toBe(3);
+    await c.close();
   });
 });

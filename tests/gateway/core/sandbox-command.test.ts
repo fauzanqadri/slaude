@@ -136,7 +136,8 @@ describe("/remote on replaces sandbox mode", () => {
     await Sandbox.set({ channelId: "C1", threadTs: "1.0", createdBy: "U_A" });
     const rdeps: RemoteCommandDeps = {
       preflight: async () => ({ ok: true, dir: "/abs" }),
-      ping: async () => "direct",
+      status: async () => "direct",
+      provision: (async () => {}) as never,
       cleanup: async () => {},
       generateKeyPair: (c) => ({ privateKey: `PRIV-${c}`, publicKey: `PUB ${c}` }),
       validKey: () => true,

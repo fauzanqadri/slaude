@@ -50,10 +50,21 @@ const NO_TENANT_TABLES = new Set([
   "portal_oauth_flows",
   "slack_oauth_flows",
   "remote_keys",
+  "users", // domain records (0038) are deployment-global like accounts
+  "bindings",
+  "boundaries",
+  "user_aliases",
+  "link_token_uses", // single-use ledger of portal link tokens (0040), keyed by the token id, like accounts
+  "slice_tombstones", // operator tombstones for the memory union (0052), keyed by user id with no foreign key so they survive a merge
+  "user_merges", // merge ledger (0041), deployment-global like users; survivor and loser ids are deliberately not foreign keys
+  "merge_proposals", // a pair of users a human settles (0041)
+  "merge_vetoes", // pairs an undo forbids from linking again (0041)
+  "node_plugins", // a node credential is deployment-global, like node_revocations
 ]);
 
-// Tables that exist only on sqlite (legacy; dropped from the pg schema).
-const SQLITE_ONLY_TABLES = new Set(["skill_usage"]);
+// Tables that exist only on sqlite (legacy; dropped from the pg schema). None
+// today: skill_usage moved to both dialects, agent-scoped (pg 0024).
+const SQLITE_ONLY_TABLES = new Set<string>([]);
 
 // Per-table columns that exist only on Postgres.
 const PG_ONLY_COLUMNS = new Set(["tenant_id"]);

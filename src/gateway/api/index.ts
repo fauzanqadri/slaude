@@ -16,6 +16,7 @@
  * labels, before the handler runs.
  *
  *   GET   /v1/node/whoami             the caller's verified identity      (node)
+ *   PUT   /v1/node/plugins            the node's plugin report, once per process (node)
  *   GET   /v1/sessions/:id            session row                         (node+job, label)
  *   PATCH /v1/sessions/:id            update started/model/mode           (same)
  *   GET   /v1/tenants/:id/runtime     runtime bundle (legacy route)       (node+job, label)
@@ -23,18 +24,23 @@
  *   GET   /v1/tenants/:id/mcp-credentials       the runAs owner's MCP access tokens (node+job, label)
  *   POST  /v1/tenants/:id/mcp-credentials/refresh   refresh one server for that owner (same)
  *   GET   /v1/tenants/:id/remote-key  runAs user's SSH key for a remote-mode turn (node+job, label)
+ *   GET   /v1/tenants/:id/remote-env  transport + key for the turn's environment (node+job, label)
  *   GET   /v1/pending/:id             30s long-poll, 204 timeout          (node+job, label; session-bound;
  *                                     tokenless only for the legacy identity, see below)
  *   POST  /v1/jobs/:id/ack|fail       telemetry only                      (node)
  *   POST  /v1/jobs/:id/token-refresh  fresh token, same claims            (node+job within grace, label)
  *   POST  /v1/jobs/:id/token-reissue  re-mint a long-queued job's token   (node+job any age, label)
  *   POST  /v1/tools/memory/prefetch|sync  episodic memory, run on the gateway (node+job, label)
+ *   POST  /v1/background/skill-check/start|finish  the skill check's budget run (node+job, label)
+ *   POST  /v1/background/skill-usage  one use of a skill, for the skill review (node+job, label)
+ *   POST  /v1/background/turn/finish  the background-turn run a job carries (node+job, label)
  *   POST  /v1/tools/:server/:tool     contract-validated tool call        (node+job, label)
  *   POST  /v1/tools/mcpx/:server/list|call   the MCP bridge (WS-C §4.2)   (node+job, label)
  */
 import {
   authenticateNode,
   gateLabel,
+  jobLabel,
   JOB_HEADER,
   requireJobToken,
   type JobClaims,
@@ -45,15 +51,18 @@ import { handleSession } from "./sessions";
 import { handleTenantRuntime } from "./tenants";
 import { handleMcpCredentials, handleMcpCredentialRefresh, type CredentialRefresher } from "./mcp-credentials";
 import { handleRemoteKey } from "./remote-key";
+import { handleRemoteEnv } from "./remote-env";
 import { defaultCredentialRefresher } from "../core/credential-refresh";
-import { handlePending, type PendingOptions } from "./pending";
+import { handlePending, handlePendingCancel, type PendingOptions } from "./pending";
 import { handleJobEvent, handleTokenRefresh, handleTokenReissue, REFRESH_GRACE_SEC, type JobLookup, type JobMovedTo } from "./jobs";
 import { executeToolCall } from "./tools";
 import { handleMcpx } from "./tools/mcpx";
+import { handleNodePlugins, type NodePluginsDeps } from "./node-plugins";
 import type { ToolPlaneDeps } from "./tools/deps";
 import { defaultPendingSource, type PendingSource } from "./pending-source";
 import { json, methodNotAllowed, notFound, readBodyCapped, readJson } from "./http";
 import { defaultMemoryPlane, handleMemory, MEMORY_BODY_MAX_BYTES, type MemoryPlane } from "./memory";
+import { BACKGROUND_BODY_MAX_BYTES, handleSkillCheck, handleSkillUsage, handleTurnRun } from "./background";
 import { PersonaNotLiveError } from "../../persona/registry";
 import { memory as processMemory } from "../../memory";
 
@@ -78,6 +87,8 @@ export interface V1Options {
   jobLookup?: JobLookup;
   /** The job-moved marker, for a held copy's token (refresh and reissue). */
   jobMovedTo?: JobMovedTo;
+  /** The plugin report route's seams (tests). */
+  nodePlugins?: NodePluginsDeps;
 }
 
 export type RouteAuth = "node" | "node+job";
@@ -137,6 +148,15 @@ export function v1Routes(opts: V1Options, pendingSource: PendingSource): RouteDe
         }),
     },
     {
+      name: "node.plugins",
+      methods: ["PUT"],
+      pattern: ["node", "plugins"],
+      auth: "node",
+      gate: "none",
+      reason: "the report is stored under the caller's own verified node id and labels; no persona data",
+      handle: async ({ req, node }) => handleNodePlugins(req, node, opts.nodePlugins),
+    },
+    {
       name: "sessions",
       methods: ["GET", "PATCH"],
       pattern: ["sessions", ":id"],
@@ -154,8 +174,8 @@ export function v1Routes(opts: V1Options, pendingSource: PendingSource): RouteDe
       pattern: ["tenants", ":tenant", "runtime"],
       auth: "node+job",
       gate: "label",
-      handle: async ({ req, seg, claims }) =>
-        tenantScoped(claims!, seg[1]!) ?? handleTenantRuntime(req, seg[1]!, claims!.persona || "default"),
+      handle: async ({ req, seg, claims, node }) =>
+        tenantScoped(claims!, seg[1]!) ?? handleTenantRuntime(req, seg[1]!, claims!.persona || "default", { nodeId: node.id, sessionId: claims!.session, label: jobLabel(claims!), post: claims!.post }),
     },
     {
       // The owner is the token's signed runAs claim and nothing else: there is
@@ -180,6 +200,16 @@ export function v1Routes(opts: V1Options, pendingSource: PendingSource): RouteDe
       handle: async ({ req, seg, claims }) => tenantScoped(claims!, seg[1]!) ?? handleRemoteKey(req, claims!),
     },
     {
+      // How to reach the turn's environment, only for a token whose signed
+      // claims name the thread's current environment (environments spec §6).
+      name: "tenants.remote-env",
+      methods: ["GET"],
+      pattern: ["tenants", ":tenant", "remote-env"],
+      auth: "node+job",
+      gate: "label",
+      handle: async ({ req, seg, claims }) => tenantScoped(claims!, seg[1]!) ?? handleRemoteEnv(req, claims!),
+    },
+    {
       // Refresh one server for the token's own runAs owner. The gateway is the
       // only refresher: nodes hold access tokens only.
       name: "tenants.mcp-credentials.refresh",
@@ -198,11 +228,11 @@ export function v1Routes(opts: V1Options, pendingSource: PendingSource): RouteDe
       pattern: ["tenants", ":tenant", "personas", ":persona", "runtime"],
       auth: "node+job",
       gate: "label",
-      handle: async ({ req, seg, claims }) => {
+      handle: async ({ req, seg, claims, node }) => {
         const scoped = tenantScoped(claims!, seg[1]!);
         if (scoped) return scoped;
         if (claims!.persona !== seg[3]!) return json(403, { error: "job token is not scoped to this persona" });
-        return handleTenantRuntime(req, seg[1]!, seg[3]!);
+        return handleTenantRuntime(req, seg[1]!, seg[3]!, { nodeId: node.id, sessionId: claims!.session, label: jobLabel(claims!), post: claims!.post });
       },
     },
     {
@@ -210,12 +240,16 @@ export function v1Routes(opts: V1Options, pendingSource: PendingSource): RouteDe
       // here, so a tokenless call is accepted only from the legacy identity,
       // and only while SLAUDE_NODE_ALLOW_TOKENLESS_PENDING is on.
       name: "pending",
-      methods: ["GET"],
+      methods: ["GET", "DELETE"],
       pattern: ["pending", ":id"],
       auth: "node+job",
       gate: "label",
       jobOptional: true,
-      handle: async ({ seg, node, claims }) => {
+      handle: async ({ req, seg, node, claims }) => {
+        // DELETE: a node gave up waiting on an owner guardrail's card (its
+        // deadline, the turn stopped): the row is cancelled so a late click
+        // cannot show Approved on a call that was refused. Job token only.
+        if (req.method === "DELETE") return claims ? handlePendingCancel(seg[1]!, claims.session) : json(401, { error: "invalid job token: missing" });
         if (claims) return handlePending(seg[1]!, pendingSource, opts.pending, claims.session);
         if (!node.legacy || !env.allowTokenlessPending()) {
           return json(401, { error: "invalid job token: missing" });
@@ -277,6 +311,67 @@ export function v1Routes(opts: V1Options, pendingSource: PendingSource): RouteDe
           return json(400, { error: "malformed JSON body" });
         }
         return handleMemory(seg[2]!, body, claims!, memoryPlane);
+      },
+    },
+    {
+      // The post-turn skill check's budget run (spec §9.3). Label-gated: it
+      // spends the persona's budget. Persona, agent, session and scope come
+      // from the token; the gateway prices the usage with its own table.
+      name: "background.skill-check",
+      methods: ["POST"],
+      pattern: ["background", "skill-check", "start|finish"],
+      auth: "node+job",
+      gate: "label",
+      handle: async ({ req, seg, claims }) => {
+        const text = await readBodyCapped(req, BACKGROUND_BODY_MAX_BYTES);
+        if (text === null) return json(413, { error: "body too large" });
+        let body: unknown = {};
+        try {
+          if (text.trim()) body = JSON.parse(text);
+        } catch {
+          return json(400, { error: "malformed JSON body" });
+        }
+        return handleSkillCheck(seg[2]!, body, claims!);
+      },
+    },
+    {
+      // The background-turn run a job carries (a promise check, phase E).
+      // Label-gated like the skill check; only the token's own `bgRun` is finished.
+      name: "background.turn",
+      methods: ["POST"],
+      pattern: ["background", "turn", "finish"],
+      auth: "node+job",
+      gate: "label",
+      handle: async ({ req, seg, claims }) => {
+        const text = await readBodyCapped(req, BACKGROUND_BODY_MAX_BYTES);
+        if (text === null) return json(413, { error: "body too large" });
+        let body: unknown = {};
+        try {
+          if (text.trim()) body = JSON.parse(text);
+        } catch {
+          return json(400, { error: "malformed JSON body" });
+        }
+        return handleTurnRun(seg[2]!, body, claims!);
+      },
+    },
+    {
+      // One use of a skill (spec §9.1), counted for the token persona's agent.
+      // Label-gated: it writes that persona's usage.
+      name: "background.skill-usage",
+      methods: ["POST"],
+      pattern: ["background", "skill-usage"],
+      auth: "node+job",
+      gate: "label",
+      handle: async ({ req, claims }) => {
+        const text = await readBodyCapped(req, BACKGROUND_BODY_MAX_BYTES);
+        if (text === null) return json(413, { error: "body too large" });
+        let body: unknown = {};
+        try {
+          if (text.trim()) body = JSON.parse(text);
+        } catch {
+          return json(400, { error: "malformed JSON body" });
+        }
+        return handleSkillUsage(body, claims!);
       },
     },
     {
