@@ -1,7 +1,7 @@
 import "../../decision/adapters/index";
 import { parseDecisionConfig } from "../../decision/config";
 import { adapterFromConfig, decide } from "../../decision/registry";
-import { DecisionError, type DecisionAdapter } from "../../decision/types";
+import { DecisionError, type DecisionAdapter, type DecisionQuestion, type DecisionResult } from "../../decision/types";
 import { env } from "../../config/env";
 import { m } from "../../metrics";
 import { decideAction, rulesDecision } from "./policy";
@@ -48,6 +48,15 @@ export interface GateRunner {
   readonly timeoutMs?: number;
   /** Whether a decision adapter is configured (an implicit consult answers from it whatever the mode). */
   readonly hasAdapter: boolean;
+  /** The confidence an answer needs before anything acts on it. */
+  readonly tAct?: number;
+  /**
+   * Ask the configured adapter other questions than the gate's own, for a
+   * caller that applies its own policy (an intent check). Independent of the
+   * gate mode, not memoised, never logged or counted as a gate decision.
+   * No adapter, an error or a timeout is undefined, never a guess.
+   */
+  ask?(questions: Record<string, DecisionQuestion>, state: unknown, deadlineMs: number): Promise<DecisionResult | undefined>;
   /** off → undefined (caller keeps today's path). shadow → resolves `actual` immediately; the decision runs detached and is logged. on → the decided action. */
   gate(key: string, input: () => Promise<GateInput>, actual: GateAction): Promise<GateAction | undefined>;
   /**
@@ -216,6 +225,15 @@ export function makeGateRunner(o: {
     contextMessages: o.contextMessages,
     timeoutMs: o.timeoutMs,
     hasAdapter: o.adapter !== null,
+    tAct: o.tAct,
+    async ask(questions, state, deadlineMs) {
+      if (!o.adapter) return undefined;
+      try {
+        return await decide(o.adapter, { state, questions }, Math.max(1, deadlineMs));
+      } catch {
+        return undefined;
+      }
+    },
     consult,
     async consultImplicit(key, input, want) {
       try {

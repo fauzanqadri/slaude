@@ -56,6 +56,13 @@ export interface EngageState {
    * "cap" past `limit`, "error" on a store failure (both mean do not act).
    */
   actSlot(channel: string, limit: number, tenant?: string): Promise<"ok" | "cap" | "error">;
+  /**
+   * Intent check: take one classifier call from the channel's own intent budget
+   * for the UTC day (separate from the engage budget). "day" past `limit`, "error" on a store failure.
+   */
+  spendIntent(channel: string, limit: number, tenant?: string): Promise<"ok" | "day" | "error">;
+  /** Intent check: take one of the channel's started runs for this hour (separate from the engage cap). */
+  intentSlot(channel: string, limit: number, tenant?: string): Promise<"ok" | "cap" | "error">;
   /** One tier 2 sample: false unless the draw hits and the channel's daily sample cap has room. */
   sample(channel: string, tenant?: string): Promise<boolean>;
   /** Remember that two humans took turns in a thread (read by the ladder's next message). */
@@ -160,6 +167,12 @@ export function memoryEngageState(o: StateOpts = {}): EngageState {
     },
     async actSlot(channel, limit, tenant = "-") {
       return incr(`actcap:${tenant}:${channel}:${hour(c.now())}`, 7200) > limit ? "cap" : "ok";
+    },
+    async spendIntent(channel, limit, tenant = "-") {
+      return incr(`intentday:${tenant}:${channel}:${day(c.now())}`, 172_800) > limit ? "day" : "ok";
+    },
+    async intentSlot(channel, limit, tenant = "-") {
+      return incr(`intentcap:${tenant}:${channel}:${hour(c.now())}`, 7200) > limit ? "cap" : "ok";
     },
     async sample(channel, tenant = "-") {
       const n = c.every();
@@ -268,6 +281,22 @@ export function redisEngageState(client: EngageRedis, prefix = "slaude", o: Stat
         return (await incr(k(`actcap:${tenant}:${channel}:${hour(c.now())}`), 7200)) > limit ? "cap" : "ok";
       } catch (e) {
         warn("act cap", e);
+        return "error";
+      }
+    },
+    async spendIntent(channel, limit, tenant = "-") {
+      try {
+        return (await incr(k(`intentday:${tenant}:${channel}:${day(c.now())}`), 172_800)) > limit ? "day" : "ok";
+      } catch (e) {
+        warn("intent budget", e);
+        return "error";
+      }
+    },
+    async intentSlot(channel, limit, tenant = "-") {
+      try {
+        return (await incr(k(`intentcap:${tenant}:${channel}:${hour(c.now())}`), 7200)) > limit ? "cap" : "ok";
+      } catch (e) {
+        warn("intent cap", e);
         return "error";
       }
     },
