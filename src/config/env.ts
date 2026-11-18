@@ -637,6 +637,17 @@ export const env = {
    * to shadow behaviour whatever its engage mode. Read at decision time, never cached.
    */
   engageForceShadow: (): boolean => ["1", "true", "yes", "on"].includes(opt("SLAUDE_ENGAGE_FORCE_SHADOW").trim().toLowerCase()),
+  /**
+   * Intent check (agent.yaml `channels.<ref>.intents`). `SLAUDE_INTENT_DAILY_BUDGET`:
+   * classifier calls per channel per UTC day (default 30). `SLAUDE_INTENT_PER_HOUR`:
+   * runs started per channel per hour (default 6). `SLAUDE_INTENT_FORCE_SHADOW`:
+   * truthy puts every intent in shadow, read at decision time. `SLAUDE_INTENT_DEADLINE_MS`:
+   * the classifier call's deadline (default 3000). Invalid values read as the default.
+   */
+  intentDailyBudget: (): number => posInt(opt("SLAUDE_INTENT_DAILY_BUDGET"), 30, 100_000),
+  intentPerHour: (): number => posInt(opt("SLAUDE_INTENT_PER_HOUR"), 6, 10_000),
+  intentForceShadow: (): boolean => ["1", "true", "yes", "on"].includes(opt("SLAUDE_INTENT_FORCE_SHADOW").trim().toLowerCase()),
+  intentDeadlineMs: (): number => posInt(opt("SLAUDE_INTENT_DEADLINE_MS"), 3000, 30_000),
   /** Phase 2: acted runs per channel per hour (`SLAUDE_ENGAGE_ACT_PER_HOUR`, default 12); past it a run decision is a pass. */
   engageActPerHour: (): number => posInt(opt("SLAUDE_ENGAGE_ACT_PER_HOUR"), 12, 10_000),
   engageSample: (): number => {

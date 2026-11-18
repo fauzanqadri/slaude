@@ -14,7 +14,7 @@ import { Status } from "../slack/status";
 import { PermissionGate, liveTurnStamp, stampFromSenders } from "../slack/permission-gate";
 import { ApprovalGate, type ApprovalRequest } from "../slack/approval-gate";
 import { IgnoreGate } from "../slack/ignore-gate";
-import { parseSlashCommand, helpText, humanModeName, MODE_LABELS } from "../slack/commands";
+import { parseSlashCommand, helpText, humanModeName, MODE_LABELS, type SlashHit } from "../slack/commands";
 import { soulData, soulDataBase, effectiveSoulForChannel } from "../../soul/extract";
 import { trustSoulFor, approvalTimeoutFor, effectiveSoulForChannelFor, soulDataFor } from "../../soul/per-persona";
 import { observeSlackChannel, observeSlackUser, setLiveWorkspaces } from "../../domain/first-sight";
@@ -33,6 +33,7 @@ import { observeEngage, type ImplicitRun } from "../engage/observe";
 import { clearAgentRecord, noteAgentMessage } from "../engage/record";
 import { setLastSpeakerRedis } from "../engage/last-speaker";
 import { engageState, setEngageRedis } from "../engage/budget";
+import { classifyIntent, latestPrUrl, prefilter, type Prefilter } from "../engage/intent";
 import { gateClassifier } from "../engage/gate-classifier";
 import { buildImplicitInput } from "../engage/input";
 import { errorCode, loadUserNames } from "../engage/users";
@@ -341,6 +342,11 @@ type HandleDispatch = {
   channelSession?: boolean;
   /** Implicit engagement: the message was not an @mention. The first turn says so and the model may pass. */
   implicit?: boolean;
+  /**
+   * Intent check: handle the message as `/workflow start <pipeline> <request>` from its
+   * author, after the same checks as a mention. No model turn.
+   */
+  startPipeline?: { pipeline: string; request: string };
 };
 
 type SessionRoute = {
@@ -3078,7 +3084,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     if (!(recordingOnly ? text : stripped) && !hasFiles) return;
 
     // Slash commands: /mode, /abort, /help. Handled locally; do not forward to model.
-    const parsed = recordingOnly ? null : parseSlashCommand(stripped);
+    const parsed: SlashHit | null = recordingOnly
+      ? null
+      : dispatch?.startPipeline && !suppress
+        ? { kind: "workflow", action: "start", pipeline: dispatch.startPipeline.pipeline, request: dispatch.startPipeline.request }
+        : parseSlashCommand(stripped);
     // `/new` is a command only at a channel session's root. Anywhere else it is
     // text: it reaches the model, or a skill named `new`, as it did before.
     const slash = parsed?.kind === "new" && !dispatch?.channelSession ? null : parsed;
@@ -5065,6 +5075,99 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       return false;
     }
   };
+  /**
+   * Intent check (agent.yaml `channels.<ref>.intents`): a message nobody @mentioned that
+   * passes the link or word check and that the decision adapter confirms starts the
+   * intent's pipeline in the message's thread, as `/workflow start` from its author would,
+   * after the same checks as a mention. True once handleMessage was called; false leaves
+   * the message to today's path. Never throws; never logs message text.
+   */
+  const intentTrigger = async (args: any, personaId: string | undefined, site: "mention_other" | "drop"): Promise<boolean> => {
+    const e: any = args.event;
+    try {
+      if (!e?.channel || !e.user || e.bot_id || e.channel_type === "im") return false;
+      if (e.subtype && e.subtype !== "file_share") return false;
+      const intents = soulDataFor(personaId).channelIntents.filter((i) => i.channel === e.channel);
+      if (!intents.length) return false;
+      const text = String(e.text ?? "");
+      const inThread = Boolean(e.thread_ts && e.thread_ts !== e.ts);
+      const rootTs: string = e.thread_ts || e.ts;
+      let hit: { intent: (typeof intents)[number]; pre: Prefilter } | null = null;
+      for (const intent of intents) {
+        const pre = prefilter(text, intent, inThread);
+        if (pre) {
+          hit = { intent, pre };
+          break;
+        }
+      }
+      if (!hit) return false;
+      const { intent } = hit;
+      const count = (outcome: string) => metric.intentTotal.inc({ intent: intent.name, outcome });
+      const line = (outcome: string, extra = "") =>
+        console.log(`[intent] ${outcome} intent=${intent.name} channel=${e.channel} ts=${e.ts} persona=${personaId ?? "default"} site=${site}${extra}`);
+      count("prefilter_pass");
+      const teamId: string | undefined = args.context?.teamId ?? e.team;
+      // A thread that is mention-only, or where this agent is already engaged, is left to today's path.
+      if (await MentionOnly.find(e.channel, rootTs)) return false;
+      if (teamId && (await Sessions.findByThread({ team_id: teamId, channel_id: e.channel, thread_ts: rootTs, persona_id: personaId ?? "default" }))?.engaged) return false;
+      const deps = shadowFor(args, personaId);
+      if (!(await deps.admit!())) {
+        count("refused");
+        line("refused", " reason=admit");
+        return false;
+      }
+      const state = engageState();
+      const spent = await state.spendIntent(e.channel, env.intentDailyBudget(), teamId);
+      if (spent !== "ok") {
+        count(spent === "day" ? "budget" : "error");
+        line(spent === "day" ? "budget" : "error");
+        return false;
+      }
+      let url = hit.pre.kind === "link" ? hit.pre.url : null;
+      if (!url) {
+        const r: any = await withinMs<any>(engageReader(args).conversations.replies({ channel: e.channel, ts: rootTs, limit: ENGAGE_READ_LIMIT }), 2000).catch(() => null);
+        url = r?.ok ? latestPrUrl((r.messages ?? []) as { text?: string }[]) : null;
+        if (!url) {
+          count("classifier_pass");
+          line("pass", " reason=no_link");
+          return false;
+        }
+      }
+      const built = await deps.buildInput({ level: "contribute", continuation: false, thread: inThread ? rootTs : null });
+      const verdict = await classifyIntent(gateRunner, intent, { message: built.input.message, recent: built.input.recent }, env.intentDeadlineMs());
+      if (verdict.answer !== "run") {
+        count(verdict.reason === "noadapter" || verdict.reason === "error" ? "error" : "classifier_pass");
+        line("pass", ` reason=${verdict.reason}`);
+        return false;
+      }
+      if (intent.mode !== "on" || env.intentForceShadow()) {
+        count("shadow_run");
+        line("shadow_run", ` pipeline=${intent.pipeline}`);
+        return false;
+      }
+      // One owner per message across apps and personas, shared with implicit engagement.
+      if (!(await state.claimAct(e.channel, String(e.ts)))) {
+        count("lost_claim");
+        return false;
+      }
+      const slot = await state.intentSlot(e.channel, env.intentPerHour(), teamId);
+      if (slot !== "ok") {
+        count(slot === "cap" ? "cap" : "error");
+        line(slot === "cap" ? "cap" : "error");
+        return false;
+      }
+      count("run");
+      line("run", ` pipeline=${intent.pipeline}`);
+      staleRecord(e, personaId);
+      const engagedBefore = await engageOnMention(teamId, e.channel, rootTs, e.ts, personaId);
+      await handleMessage(args, { personaId, engagedBefore, startPipeline: { pipeline: intent.pipeline, request: url } });
+      return true;
+    } catch (err) {
+      metric.intentTotal.inc({ intent: "-", outcome: "error" });
+      console.error(`[intent] failed channel=${e?.channel} ts=${e?.ts}: ${redactSecrets(err instanceof Error ? err.message : String(err))}`);
+      return false;
+    }
+  };
   /** A human message handled some other way (a mention, a reply in an engaged thread) makes the agent's last-speaker record stale. */
   const staleRecord = (e: any, personaId: string | undefined): void =>
     clearAgentRecord({ channel: e?.channel, thread: e?.thread_ts && e.thread_ts !== e.ts ? e.thread_ts : null, persona: personaId });
@@ -5265,6 +5368,8 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       return await handleMessage(args, { personaId: mentionedPersona.name, engagedBefore });
     }
     if (mentionsOther) {
+      // A request addressed to a colleague ("@name please review <link>") can still start an intent's pipeline.
+      if (await intentTrigger(args, appPersona, "mention_other")) return;
       // Disengage the bot AND every persona in this thread (the user is
       // talking to a colleague now) — one durable write, no in-memory keys.
       if (teamId) await Sessions.setEngagedForThread({ team_id: teamId, channel_id: channelId, thread_ts: ts }, false);
@@ -5388,6 +5493,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       console.log(`[slack-rx] engage ch=${channelId} ts=${e.ts} user=${e.user} — reply under a proactive post`);
       return await handleMessage(args, { personaId: proactive.personaId });
     }
+    if (await intentTrigger(args, appPersona, "drop")) return;
     console.log(
       `[slack-rx] drop ch=${channelId} ts=${e.ts} user=${e.user} — channel msg, thread not engaged (no @mention)`,
     );

@@ -288,6 +288,48 @@ slaude_engage_act_total{tier,outcome,level}
 
 A per-channel label on the counter, and a deterministic last-speaker priority beyond what the ladder already does (a persona that spoke after another wins by the ladder; two personas that both decide run get the first claimant). Tuning the cap and budgets from real counts.
 
+### 1.8 Starting a workflow from a request (intents)
+
+People ask for a pull request review in their own words, often addressed to a colleague ("@Jane please review <link>") and without mentioning the agent. An **intent** starts a workflow pipeline from such a message. It does not start a model turn: a confirmed message is handled as `/workflow start <pipeline> <link>` from its author would be, after the same checks as an @mention. It is independent of `engage` (section 1.7) and works at level `mention`.
+
+```yaml
+channels:
+  slack:channel:C0EXAMPLE:
+    intents:
+      - name: pr_review
+        mode: shadow          # shadow | on; leave out for shadow
+        question: Does the new message ask someone to review a pull request?
+        words: [review, approve]
+        pipeline: review
+```
+
+For each message in the channel that nobody @mentioned, in order (each step can end it, and only the last one starts anything):
+
+1. **Link and word check, no model.** The message holds a pull request link (`/pull-requests/<n>`, `/pull/<n>` or `/merge_requests/<n>`), whatever the wording. A thread reply with no link passes when it holds one of `words` (whole words, ignoring case); the link is then the most recent one in the thread, read once. Anything else is dropped as today.
+2. **The thread is checked.** A `/mention-only` thread and a thread where the agent is already engaged are left to today's path. The author is admitted exactly as for an @mention (blocked and ignored lists, `/1on1` locks, owner inbound rules).
+3. **Budget.** One classifier call from the channel's daily intent budget.
+4. **Classifier.** `question` goes to the decision adapter the gate uses (`SLAUDE_DECISION_CONFIG`), whatever the gate's own mode, with the message and the recent thread, redacted as for section 1.7. Only a "yes" at or above `gate.tAct` counts. No adapter, an error, a timeout, a "no" or a low confidence is a pass.
+5. **Shadow or on.** In `shadow`, or with the kill switch set, the decision is counted and logged and nothing else happens.
+6. **One owner, one cap, then the start.** One atomic claim per message across apps and personas (the same claim implicit engagement uses, so the two never both act), then the channel's hourly cap. The thread is engaged as for a mention, and the pipeline starts in the message's thread with the author as its starter and the link as its request. A thread that already has a running workflow gets the usual refusal.
+
+A message that mentions a colleague is checked before the colleague mention disengages the thread, so "@Jane please review <link>" starts the pipeline and the thread stays engaged.
+
+| Control | Default | Effect |
+|---|---|---|
+| `SLAUDE_INTENT_FORCE_SHADOW` | unset | Truthy puts every intent in `shadow`. Read for every message. The kill switch. |
+| `SLAUDE_INTENT_DAILY_BUDGET` | `30` | Classifier calls per channel per UTC day. |
+| `SLAUDE_INTENT_PER_HOUR` | `6` | Pipelines started per channel per hour. |
+| `SLAUDE_INTENT_DEADLINE_MS` | `3000` | The classifier call's deadline. Nobody waits on a reply, so it is longer than the gate's. |
+
+```
+slaude_intent_total{intent,outcome}
+[intent] run intent=pr_review channel=C... ts=... persona=default site=drop pipeline=review
+```
+
+`outcome` is `prefilter_pass`, `classifier_pass`, `run`, `shadow_run`, `budget`, `cap`, `lost_claim`, `refused` or `error`. `site` is `drop` (a message nobody addressed) or `mention_other` (a message that mentions someone else). Neither the counter nor the line carries message text.
+
+**Rolling it out.** Configure a decision adapter, add the intent with `mode: shadow`, and read `slaude_intent_total` and the `[intent]` lines for a few days: how many messages pass the link check, and how often the classifier says yes on real requests and on links that are only shared. Then switch that channel to `mode: on` and tell the people in it.
+
 ---
 
 ## 2. Channel controls and identity

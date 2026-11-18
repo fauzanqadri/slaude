@@ -587,6 +587,77 @@
                           }
                         ],
                         "description": "Whether the agent takes part in this channel without an @mention, and whether that is live or only logged. Leave the key out for the deployment default at shadow."
+                      },
+                      "intents": {
+                        "anyOf": [
+                          {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "name": {
+                                  "type": "string",
+                                  "pattern": "^[a-z][a-z0-9_-]{0,39}$",
+                                  "description": "A name for this intent, used in logs and the slaude_intent_total counter. Example: pr_review"
+                                },
+                                "question": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 500,
+                                  "description": "The yes or no question the decision adapter answers about the message. Example: Does the new message ask someone to review a pull request?"
+                                },
+                                "mode": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "enum": [
+                                        "shadow",
+                                        "on"
+                                      ]
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "description": "shadow checks, classifies and counts but starts nothing; on starts the pipeline. Leave the key out for shadow. Example: shadow"
+                                },
+                                "words": {
+                                  "anyOf": [
+                                    {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 40
+                                      },
+                                      "maxItems": 50
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "description": "Words that make a thread reply with no link a candidate, when the thread already holds a pull request link. Matched whole, ignoring case. Example: [review, approve]"
+                                },
+                                "pipeline": {
+                                  "type": "string",
+                                  "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+                                  "description": "The workflow pipeline a confident yes starts in the message's thread, with the pull request link as its request and the author as the starter. Example: review"
+                                }
+                              },
+                              "required": [
+                                "name",
+                                "question",
+                                "pipeline"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "maxItems": 10
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "description": "Messages nobody @mentioned that start a workflow pipeline when the decision adapter confirms what they ask for. Independent of engage. Leave the key out for none."
                       }
                     },
                     "additionalProperties": false
