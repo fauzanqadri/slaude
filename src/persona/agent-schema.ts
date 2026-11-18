@@ -224,6 +224,34 @@ const engageSchema = z
   )
   .strict();
 
+const INTENT_NAME_RE = /^[a-z][a-z0-9_-]{0,39}$/;
+const PIPELINE_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+const intentSchema = z
+  .object(
+    {
+      name: text("a short name")
+        .regex(INTENT_NAME_RE, "must be lower case letters, digits, - or _, starting with a letter, at most 40 characters")
+        .describe("A name for this intent, used in logs and the slaude_intent_total counter. Example: pr_review"),
+      question: text("text")
+        .min(1, "must not be empty")
+        .max(500, "must be at most 500 characters")
+        .describe("The yes or no question the decision adapter answers about the message. Example: Does the new message ask someone to review a pull request?"),
+      mode: optional(engageEnum(ENGAGE_MODES, "shadow or on").describe("shadow checks, classifies and counts but starts nothing; on starts the pipeline. Leave the key out for shadow. Example: shadow")),
+      words: optional(
+        z
+          .array(text("a word or short phrase").min(1, "must not be empty").max(40, "must be at most 40 characters"), typeMessage({ other: "must be a list of words" }))
+          .max(50, "must list at most 50 words")
+          .describe("Words that make a thread reply with no link a candidate, when the thread already holds a pull request link. Matched whole, ignoring case. Example: [review, approve]"),
+      ),
+      pipeline: text("a pipeline name")
+        .regex(PIPELINE_RE, "must be lower case letters, digits, - or _")
+        .describe("The workflow pipeline a confident yes starts in the message's thread, with the pull request link as its request and the author as the starter. Example: review"),
+    },
+    typeMessage({ other: "must be a mapping with name, question and pipeline" }),
+  )
+  .strict();
+
 const channelEntry = z
   .object(
     {
@@ -241,6 +269,12 @@ const channelEntry = z
         .describe("true lets the agent wake in this channel on its own and speak up; false keeps it silent here. Setting it implies a channel session. Leave the key out to change nothing.")
         .optional(),
       engage: optional(engageSchema.describe("Whether the agent takes part in this channel without an @mention, and whether that is live or only logged. Leave the key out for the deployment default at shadow.")),
+      intents: optional(
+        z
+          .array(intentSchema, typeMessage({ other: "must be a list of intents" }))
+          .max(10, "must list at most 10 intents")
+          .describe("Messages nobody @mentioned that start a workflow pipeline when the decision adapter confirms what they ask for. Independent of engage. Leave the key out for none."),
+      ),
     },
     typeMessage({ other: "must be a mapping" }),
   )

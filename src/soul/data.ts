@@ -51,6 +51,21 @@ export const ChannelEngageSchema = z.object({
   mode: z.enum(["shadow", "on"]).optional(),
 });
 
+/**
+ * Per-channel intent check from agent.yaml `channels.<ref>.intents`: a message
+ * nobody @mentioned that holds a pull request link (or a listed word in a
+ * thread whose messages hold one) is put to the decision adapter with
+ * `question`; a confident yes starts `pipeline` with the link as its request.
+ */
+export const ChannelIntentSchema = z.object({
+  channel: z.string().regex(/^[CGD][A-Z0-9]+$/),
+  name: z.string().regex(/^[a-z][a-z0-9_-]{0,39}$/),
+  mode: z.enum(["shadow", "on"]).default("shadow"),
+  question: z.string().min(1).max(500),
+  words: z.array(z.string().min(1).max(40)).max(50).default([]),
+  pipeline: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+});
+
 /** A sub-mandate for a kind of place, from a `## Scope dm|public|trusted` block. */
 export const ScopeMandateSchema = z.object({
   scope: z.enum(["dm", "public", "trusted"]),
@@ -167,6 +182,8 @@ export const SoulDataSchema = z.object({
   channelOverrides: z.array(ChannelOverrideSchema).default([]),
   /** Per-channel `engage` settings (agent.yaml only). Empty = every channel at the deployment default. */
   channelEngage: z.array(ChannelEngageSchema).default([]),
+  /** Per-channel intent checks (agent.yaml only). Empty = none. */
+  channelIntents: z.array(ChannelIntentSchema).default([]),
   /**
    * Extra names the persona answers to (agent.yaml `aliases`), NFKC-normalised.
    * Reading is lenient: a stored list that fails the alias rules (an older or
@@ -197,6 +214,7 @@ export const SoulDataStrictSchema = SoulDataSchema.extend({
 
 export type ApproverEntry = z.infer<typeof ApproverEntrySchema>;
 export type ChannelEngage = z.infer<typeof ChannelEngageSchema>;
+export type ChannelIntent = z.infer<typeof ChannelIntentSchema>;
 export type ChannelOverride = z.infer<typeof ChannelOverrideSchema>;
 export type ScopeMandate = z.infer<typeof ScopeMandateSchema>;
 export type SoulData = z.infer<typeof SoulDataSchema>;

@@ -13,7 +13,7 @@ import { parse as parseYaml, YAMLParseError } from "yaml";
 import { MANDATE_LINE_MAX, subMandatesOf, type SubMandate } from "../soul/mandate-scope";
 import { env } from "../config/env";
 import { normalizeAlias, aliasIssues } from "./aliases";
-import { SoulDataSchema, type AccessEntry, type ChannelEngage, type AccessRef, type ApproverEntry, type ChannelOverride, type ScopeMandate, type SoulData } from "../soul/data";
+import { SoulDataSchema, type AccessEntry, type ChannelEngage, type ChannelIntent, type AccessRef, type ApproverEntry, type ChannelOverride, type ScopeMandate, type SoulData } from "../soul/data";
 import { channelOf, endsInOpenFence, isCodeFence, parseProactive, parseWindow } from "../soul/proactive";
 import { AgentSchema, BOUNDARY_RE, CHANNEL_ID_RE, DESCRIPTION_MAX, ENVIRONMENT_INLINE_MSG, USER_ID_RE, type AgentFile } from "./agent-schema";
 import { anchored, parseRef, refScheme, SRC } from "../refs/parse";
@@ -281,6 +281,7 @@ export function parseAgentYaml(name: string, text: string): CompiledAgent {
   // The schema checked the list; this adds the rule that needs the agent's own name.
   for (const i of aliasIssues(file.aliases ?? [], name)) fail(i.index === null ? "aliases" : `aliases[${i.index}]`, i.message);
   const channelEngage: ChannelEngage[] = [];
+  const channelIntents: ChannelIntent[] = [];
   const soulData = SoulDataSchema.parse({
     identity: { name, ...(description ? { role: description } : {}) },
     manager: manager ? { userId: manager } : {},
@@ -312,6 +313,12 @@ export function parseAgentYaml(name: string, text: string): CompiledAgent {
     if (seenChannel.has(channel)) fail(keyPath, "repeats an earlier channel");
     seenChannel.add(channel);
     if (entry?.engage) channelEngage.push({ channel, ...(entry.engage.level ? { level: entry.engage.level } : {}), ...(entry.engage.mode ? { mode: entry.engage.mode } : {}) });
+    const intentNames = new Set<string>();
+    for (const [i, it] of (entry?.intents ?? []).entries()) {
+      if (intentNames.has(it.name)) fail(`${keyPath}.intents[${i}].name`, "repeats an earlier intent in this channel");
+      intentNames.add(it.name);
+      channelIntents.push({ channel, name: it.name, mode: it.mode ?? "shadow", question: it.question, words: it.words ?? [], pipeline: it.pipeline });
+    }
     if (authoredChannels.has(channel)) fail(keyPath, "also has a ## Channel section in soul: keep it in one place");
     let settings = "";
     if (entry?.session === "channel") settings += "\n### Session\n- Mode: channel";
@@ -320,6 +327,7 @@ export function parseAgentYaml(name: string, text: string): CompiledAgent {
   }
   // Engage settings are gathered by the channel loop above, after the structure was parsed.
   soulData.channelEngage.push(...channelEngage);
+  soulData.channelIntents.push(...channelIntents);
   if (channelBlocks && endsInOpenFence(soulText)) fail("soul", "ends inside an open code fence, so the channels settings would not be read");
 
   // The global `proactive` key compiles to the `## Proactive` section parseProactive reads.
