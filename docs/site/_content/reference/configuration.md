@@ -386,6 +386,10 @@ and roles come from a file or the env lists below.
 | `SLAUDE_ENGAGE_MINUTE_CEILING` | No | `6` | Phase 1 shadow classifier: calls per channel per minute. A whole number from 1 to 1000; anything else means 6. |
 | `SLAUDE_ENGAGE_FORCE_SHADOW` | No | unset | Phase 2 kill switch: `1`, `true`, `yes` or `on` forces every channel to shadow behaviour, whatever its `engage.mode`. Read for every message, never cached. |
 | `SLAUDE_ENGAGE_ACT_PER_HOUR` | No | `12` | Phase 2: acted runs per channel per hour. Past it a run decision is a counted pass (`outcome="cap"`). A whole number from 1 to 10000; anything else means 12. |
+| `SLAUDE_INTENT_DAILY_BUDGET` | No | `30` | Intent check (agent.yaml `channels.<ref>.intents`): classifier calls per channel per UTC day. Past it a candidate is a counted pass (`outcome="budget"`). A whole number from 1 to 100000; anything else means 30. |
+| `SLAUDE_INTENT_PER_HOUR` | No | `6` | Intent check: pipelines started per channel per hour. Past it a confirmed request is a counted pass (`outcome="cap"`). A whole number from 1 to 10000; anything else means 6. |
+| `SLAUDE_INTENT_FORCE_SHADOW` | No | unset | Intent check kill switch: truthy (`1`, `true`, `yes`, `on`) puts every intent in shadow. Read for every message. |
+| `SLAUDE_INTENT_DEADLINE_MS` | No | `3000` | Intent check: the classifier call's deadline in ms. A whole number from 1 to 30000; anything else means 3000. |
 | `SLAUDE_ENGAGE_SAMPLE` | No | `20` | Phase 1: sample 1 in N tier 2 run decisions for the classifier (at most 5 a day per channel), to check the rules. `0` turns sampling off. Anything invalid means 20. |
 | `SLAUDE_GUARDRAIL_REPLY_QUIET_SECS` | No | `600` | How long an inbound guardrail's reply stays quiet for the same person in the same thread; later drops are silent and audited. |
 | `SLAUDE_GUARDRAIL_APPROVE_TIMEOUT_SEC` | No | `600` | How long an owner guardrail's approval card waits (a tool `approve` and a held reply), at most 3600. A timeout is a deny. On nodes a tool card also ends 30 s before the turn deadline. |
