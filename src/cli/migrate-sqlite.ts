@@ -28,6 +28,7 @@ export const EXPORT_TABLES = [
   "cron_jobs",
   "one_on_one_locks",
   "mention_only_threads",
+  "sandbox_threads",
   "soul_overrides",
   "kb_ingest_jobs",
   "memory_turns",
