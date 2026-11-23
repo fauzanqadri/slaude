@@ -11,6 +11,7 @@ description: Task-oriented guides for operating slaude — engagement, approvals
 | [Channel sessions](channel-sessions.md) | Give an agent one long-lived session for a channel: root mentions reply at root, other root messages are recorded |
 | [Environments](environments.md) | Save environments (your machine over tailcat or ssh, sandboxes) and choose one per thread with `/env` |
 | [Remote mode](remote.md) | Run a thread's shell and file tools on your own machine over tailcat SSH |
+| [Sandbox mode](sandbox.md) | Run a thread's shell and file tools in its own isolated sandbox, with approved server-side git pushes |
 | [Voice mode](voice-mode.md) | Let the agent join a call and talk, while the thread's session does the thinking |
 | [Examples](examples.md) | Write a first skill, run a first ingest, add a custom MCP server, run the simulation |
 
