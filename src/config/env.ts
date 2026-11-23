@@ -153,6 +153,14 @@ function durationEnvSec(name: string, dflt: number): number {
 }
 
 /** Split a comma-separated env list into trimmed, non-empty entries. */
+/** "1", "true", "yes" or "on", case-insensitive. */
+function truthy(raw: string): boolean {
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+/** Default for `SLAUDE_GIT_PUSH_BRANCH_PATTERN`: `agent/` followed by a safe ref name. */
+export const DEFAULT_GIT_PUSH_BRANCH = /^agent\/[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+
 function csv(raw: string): string[] {
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
@@ -945,6 +953,44 @@ export const env = {
      *  machine over tailcat SSH. Default off; ships behind this flag. */
     enabled: () => {
       return remoteFlagValue(opt("SLAUDE_REMOTE", "0"));
+    },
+  },
+  sandbox: {
+    /** `SLAUDE_SANDBOX=1`: the switch for sandbox mode, so the connection can be
+     *  turned off without removing the URL (which may come from a secret store). Default off. */
+    enabled: (): boolean => truthy(opt("SLAUDE_SANDBOX", "0")),
+    /** The streamable-HTTP MCP server that serves a sandbox thread's shell and file
+     *  tools (`SLAUDE_SANDBOX_MCP_URL`). Read through `activeUrl()`. */
+    mcpUrl: () => opt("SLAUDE_SANDBOX_MCP_URL").trim(),
+    /** The sandbox MCP URL when the feature is on, else "". Every caller goes through this. */
+    activeUrl: (): string => (truthy(opt("SLAUDE_SANDBOX", "0")) ? opt("SLAUDE_SANDBOX_MCP_URL").trim() : ""),
+    /** Bearer token sent to the sandbox MCP server. Empty = no Authorization header. */
+    mcpToken: () => opt("SLAUDE_SANDBOX_MCP_TOKEN").trim(),
+    /** Directory holding the repositories inside a sandbox (the server's workspace root). */
+    root: (): string => opt("SLAUDE_SANDBOX_ROOT", "/workspace").trim() || "/workspace",
+    /** Slack user ids allowed to switch sandbox mode on or off (`/sandbox on|off`,
+     *  and `enter_sandbox` on their turns), comma-separated. Unset, empty or `*` =
+     *  everyone. `/sandbox` status is always open. */
+    autoUsers: () => csv(opt("SLAUDE_SANDBOX_AUTO_USERS")),
+    autoAllowed: (userId: string | undefined): boolean => {
+      const list = csv(opt("SLAUDE_SANDBOX_AUTO_USERS"));
+      return list.length === 0 || list.includes("*") || (!!userId && list.includes(userId));
+    },
+  },
+  gitPush: {
+    /** Branch names `git_push` may publish (`SLAUDE_GIT_PUSH_BRANCH_PATTERN`, a
+     *  regular expression matched against the whole name). Default `agent/<name>`.
+     *  An invalid pattern falls back to the default. */
+    branchPattern: (): RegExp => {
+      const raw = opt("SLAUDE_GIT_PUSH_BRANCH_PATTERN").trim();
+      if (raw) {
+        try {
+          return new RegExp(raw);
+        } catch {
+          /* fall through to the default */
+        }
+      }
+      return DEFAULT_GIT_PUSH_BRANCH;
     },
   },
   /** Static Prometheus labels applied to every metric, e.g.
