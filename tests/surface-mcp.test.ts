@@ -53,6 +53,17 @@ describe("surfaceTools — capability gating", () => {
     expect(r.content[0].text).toBe("on");
   });
 
+  test("enter_sandbox mounts only when the opt is provided + handler calls the engine", async () => {
+    expect(surfaceTools(fakeSurface([])).map((t) => t.name)).not.toContain("enter_sandbox");
+    let calls = 0;
+    const defs = surfaceTools(fakeSurface([]), { enterSandbox: async () => { calls++; return "on next turn"; } });
+    const def = defs.find((t) => t.name === "enter_sandbox")!;
+    expect(def).toBeDefined();
+    const r: any = await def.handler({});
+    expect(calls).toBe(1);
+    expect(r.content[0].text).toBe("on next turn");
+  });
+
   test("unreact rides on the react capability", () => {
     const reactNames = surfaceTools(fakeSurface(["react"])).map((t) => t.name);
     expect(reactNames).toContain("react");

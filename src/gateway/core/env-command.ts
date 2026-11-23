@@ -4,6 +4,7 @@
  * (remote-command.ts). Addresses and other config values are never echoed in a
  * thread: they appear only in private replies or not at all.
  */
+import { SANDBOX_GONE_NOTE, destroySandbox, turnSandboxOff } from "../../remote/sandbox-destroy";
 import { sameAt } from "../../access/wired";
 import { env as config } from "../../config/env";
 import * as CronJobs from "../../db/cron-jobs";
@@ -49,6 +50,8 @@ export interface RemoteCommandCtx {
   /** Open the add form in a modal for one kind (or the kind picker). */
   offerAdd?(): Promise<void>;
   reload(): void;
+  /** Queue a line for the agent's transcript on its next turn (agent.noteSessionEvent). */
+  note?(text: string): void;
   /** Reboot the session of another thread (an environment deleted or edited
    *  under it). Optional: without it those threads pick up the change on
    *  their next message, through the session fingerprint. */
@@ -67,6 +70,8 @@ export interface EnvCommandDeps {
   validKey(pair: Remote.RemoteKeyPair): boolean;
   /** Active cron jobs firing into this thread that someone other than `userId` created. */
   listForeignThreadCrons(channelId: string, threadTs: string, userId: string): Promise<number>;
+  /** Destroy a thread's sandbox when an environment replaces sandbox mode (default: the sandbox server). */
+  destroySandbox?: (sessionId: string) => Promise<boolean>;
 }
 
 export const defaultEnvDeps: EnvCommandDeps = {
@@ -159,6 +164,21 @@ export async function endRemoteForThread(
  *  picker's Use button and the `/remote` alias. True when the thread now runs
  *  in it. */
 export async function useEnvironment(
+  env: StoredEnv,
+  dirArg: string | undefined,
+  ctx: EnvCommandCtx,
+  deps: EnvCommandDeps,
+): Promise<boolean> {
+  const ok = await bindEnvironment(env, dirArg, ctx, deps);
+  if (ok) {
+    // The last command wins: an environment replaces sandbox mode, and the sandbox goes.
+    const sbx = await turnSandboxOff(ctx.channelId, ctx.threadTs, ctx.sessionId, deps.destroySandbox ?? destroySandbox);
+    if (sbx.wasOn) ctx.note?.(SANDBOX_GONE_NOTE);
+  }
+  return ok;
+}
+
+async function bindEnvironment(
   env: StoredEnv,
   dirArg: string | undefined,
   ctx: EnvCommandCtx,
@@ -367,6 +387,43 @@ function kindsHelp(): string {
 
 /** Who may end the thread's environment: its owner or the manager; for a
  *  sandbox in a thread that is not locked, anyone the thread admits. */
+/** End the thread's environment, as `/env off` does: only someone `mayTurnOff`
+ *  allows; releases the 1on1 lock when binding created it and it is still the
+ *  owner's. Shared with `/sandbox on`, which replaces an environment. The caller
+ *  reloads and replies. `wasBound` false = the thread already ran on the server. */
+export async function turnEnvironmentOff(
+  ctx: EnvCommandCtx,
+  deps: Pick<EnvCommandDeps, "cleanup">,
+): Promise<{ ok: true; wasBound: boolean; lockReleased: boolean } | { ok: false; message: string }> {
+  const { channelId, threadTs } = ctx;
+  const b = await boundEnv(channelId, threadTs);
+  if (!b) {
+    // A binding whose environment or kind is gone still has to be removable.
+    if (await Envs.findBinding(channelId, threadTs)) {
+      await endRemoteForThread(channelId, threadTs, { sessionId: ctx.sessionId, cleanup: deps.cleanup });
+      return { ok: true, wasBound: true, lockReleased: false };
+    }
+    return { ok: true, wasBound: false, lockReleased: false };
+  }
+  if (!(await mayTurnOff(ctx, b))) {
+    return {
+      ok: false,
+      message: b.env.source === "definition"
+        ? "Only the thread's 1on1 owner or the manager can switch this thread's environment off."
+        : `Only <@${b.env.userId}> or the manager can switch this thread's environment off.`,
+    };
+  }
+  const { lockByRemote } = await endRemoteForThread(channelId, threadTs, { sessionId: ctx.sessionId, cleanup: deps.cleanup });
+  // Only release a lock that is still this environment owner's: a stale row never unlocks someone else.
+  const heldBy = lockByRemote ? await OneOnOne.find(channelId, threadTs) : null;
+  if (lockByRemote && (await sameAt({ site: "env.release_lock_owner", persona: null, teamId: b.env.teamId, userId: b.env.userId, otherUserId: heldBy?.locked_user, otherTeamId: heldBy?.team_id }))) {
+    await OneOnOne.unlock(channelId, threadTs);
+    auditOneOnOne("one_on_one.unlocked", { userId: ctx.userId, sessionId: ctx.sessionId, channelId, threadTs, lockedUser: b.env.userId, via: "env" });
+  }
+  forgetRemoteStatus(ctx.sessionId);
+  return { ok: true, wasBound: true, lockReleased: lockByRemote };
+}
+
 async function mayTurnOff(ctx: EnvCommandCtx, b: { env: StoredEnv }): Promise<boolean> {
   if (b.env.source === "definition") {
     // A shared machine has no owner: the manager, whoever holds the thread's 1on1 lock (they may have bound it there), or anyone the thread admits when it is not locked.
@@ -446,34 +503,15 @@ export async function handleEnvCommand(hit: EnvHit, ctx: EnvCommandCtx, deps: En
   }
 
   if (hit.action === "off") {
-    const b = await boundEnv(channelId, threadTs);
-    if (!b) {
-      // A binding whose environment or kind is gone still has to be removable.
-      if (await Envs.findBinding(channelId, threadTs)) {
-        await endRemoteForThread(channelId, threadTs, { sessionId: ctx.sessionId, cleanup: deps.cleanup });
-        ctx.reload();
-        await ctx.reply(":house: Environment *server* — tools run on the server again.");
-        return;
-      }
-      await ctx.reply("This thread already runs on the server.");
+    const r = await turnEnvironmentOff(ctx, deps);
+    if (!r.ok) {
+      await ctx.reply(r.message);
       return;
     }
-    if (!(await mayTurnOff(ctx, b))) {
-      await ctx.reply(b.env.source === "definition"
-        ? "Only the thread's 1on1 owner or the manager can switch this thread's environment off."
-        : `Only <@${b.env.userId}> or the manager can switch this thread's environment off.`);
-      return;
-    }
-    const { lockByRemote } = await endRemoteForThread(channelId, threadTs, { sessionId: ctx.sessionId, cleanup: deps.cleanup });
-    // Only release a lock that is still this environment owner's: a stale row never unlocks someone else.
-    const heldBy = lockByRemote ? await OneOnOne.find(channelId, threadTs) : null;
-    if (lockByRemote && (await sameAt({ site: "env.release_lock_owner", persona: null, teamId: b.env.teamId, userId: b.env.userId, otherUserId: heldBy?.locked_user, otherTeamId: heldBy?.team_id }))) {
-      await OneOnOne.unlock(channelId, threadTs);
-      auditOneOnOne("one_on_one.unlocked", { userId: ctx.userId, sessionId: ctx.sessionId, channelId, threadTs, lockedUser: b.env.userId, via: "env" });
-    }
-    forgetRemoteStatus(ctx.sessionId);
     ctx.reload();
-    await ctx.reply(`:house: Environment *server* — tools run on the server again.${lockByRemote ? " 1on1 released." : ""}`);
+    await ctx.reply(r.wasBound
+      ? `:house: Environment *server* — tools run on the server again.${r.lockReleased ? " 1on1 released." : ""}`
+      : "This thread already runs on the server.");
     return;
   }
 
