@@ -194,7 +194,7 @@ An action runs one named tool with given arguments and no model, for example `gi
 
 - Each event is written to `agent_outbox` in the same transaction as the state change that caused it.
 - A leader-only worker delivers it as a CloudEvents 1.0 message in structured mode (`Content-Type: application/cloudevents+json`).
-- Types: `ai.slaude.task.completed`, `ai.slaude.task.failed`, `ai.slaude.request.responded`, `ai.slaude.request.expired`.
+- Types: `ai.slaude.task.completed`, `ai.slaude.task.failed`, `ai.slaude.request.responded`, `ai.slaude.request.expired`, and `ai.slaude.trigger.invoked` (section 5.7).
 - The CloudEvents `id` is the deduplication key; `subject` is the task or request id; `data` carries the result and the client's `correlation`.
 - Delivery is at least once, retried with exponential backoff, and signed with HMAC-SHA256 of the body in a `webhook-signature` header.
 - The target is the client's event URL, or the create call's `notify.url` when its host is in `notifyHosts`. A `404` or `410` from a notify URL ends delivery.
@@ -203,7 +203,7 @@ An action runs one named tool with given arguments and no model, for example `gi
 
 ### 5.7 Triggers
 
-A configured slash command dispatches `{conversationId, actor, text}` to a client, so `/<command>` in Slack can start a process in an engine without slaude knowing the process.
+A configured slash command dispatches `{conversationId, actor, text}` to a client as an `ai.slaude.trigger.invoked` event through the outbox, so `/<command>` in Slack can start a process in an engine without slaude knowing the process.
 
 ## 6. Sandbox mode
 
