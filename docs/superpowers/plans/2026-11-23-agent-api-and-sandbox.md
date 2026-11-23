@@ -33,7 +33,7 @@
 
 ## File Structure
 
-- **PR 1 (sandbox):** Create `src/db/sandbox.ts`, `src/gateway/core/sandbox-command.ts`, `src/remote/sandbox-call.ts`, `src/remote/tools/git-push.ts`. Modify `src/remote/mcp.ts`, `src/remote/fingerprint.ts`, `src/agent/manager.ts`, `src/agent/session-mode.ts`, `src/config/env.ts`, `src/config/gateway-only-env.ts`, `src/gateway/slack/commands.ts`, `src/gateway/core/surface-mcp.ts`, `src/tools/contracts/surface.ts`, `src/soul/runtime/modules/remote.md`. Tests under `tests/remote/`, `tests/db/`, `tests/gateway/core/`, `tests/agent/manager-remote.test.ts`.
+- **PR 1 (sandbox):** Create `src/db/sandbox.ts`, `src/gateway/core/sandbox-command.ts`, `src/remote/sandbox-destroy.ts`. Modify `src/remote/mcp.ts`, `src/remote/fingerprint.ts`, `src/agent/manager.ts`, `src/agent/session-mode.ts`, `src/agent/guardrails.ts`, `src/config/env.ts`, `src/gateway/core/{env-command,gateway,dispatch,thread-identity}.ts`, `src/gateway/api/auth.ts`, `src/node/{session-lock,worker}.ts`, `src/gateway/slack/commands.ts`, `src/gateway/core/surface-mcp.ts`, `src/tools/contracts/surface.ts`. Tests under `tests/remote/`, `tests/db/`, `tests/gateway/core/`, `tests/agent/`.
 - **PR 2 (Helm):** Create `deploy/helm/slaude/**`, `deploy/helm/sandbox/**`, `tests/deploy/helm-parity.test.ts`, `tests/deploy/fixtures/scale-values.yaml`. Modify `deploy/k8s-local/up.sh`, `.github/workflows/` (chart lint and OCI publish), `docs/site/_content/deploy/` (one page).
 - **PR 3 to 7 (agent API):** Create `src/agentapi/{index,routes,clients,auth,idempotency,conversations,capabilities,tasks,submit-tool,requests,request-card,outbox,deliver,signature,actions,triggers}.ts`, `src/db/agent-api.ts`, migrations `00xx_agent_api_*.sql`, `docs/agent-api/openapi.yaml`. Modify `src/health.ts`, `src/server.ts`, `src/gateway/core/gateway.ts` (`GatewayHandle`), `src/knowledge/gated-dispatch.ts` (`TurnOrigin`), `src/gateway/slack/commands.ts`. Tests under `tests/agentapi/`.
 
@@ -79,9 +79,10 @@ The design exists on an older branch that diverged from `main` long ago. Rebuild
 - [ ] **Step 1:** Tests: `/sandbox on|off|status`; `on|off` refused for a user outside `SLAUDE_SANDBOX_AUTO_USERS` when set; `enter_sandbox` follows the same rule for the turn's initiator; `status` always answers; `off` asks the server to destroy the session.
 - [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `gateway: /sandbox and enter_sandbox`.
 
-### Task 1.6: `git_push` with server-side credentials
-**Files:** Create `src/remote/tools/git-push.ts`; Test `tests/remote/git-push.test.ts`.
-- [ ] **Step 1:** Tests: refuses a remote outside `SLAUDE_GIT_PUSH_REMOTES`; refuses a branch not matching `SLAUDE_GIT_PUSH_BRANCH_PATTERN`; never sends `force`; goes through the permission gate; records audit.
+### Task 1.6: `git_push` approval and branch guard
+The sandbox server runs `git_push` with its own key and remote allowlist; slaude does not push.
+**Files:** Modify `src/remote/mcp.ts` (`gitPushGuard`, `PUBLISH` permission), `src/agent/guardrails.ts`, `src/agent/hook-tags.ts`; Test `tests/remote/mcp.test.ts`.
+- [ ] **Step 1:** Tests: `git_push` asks in default and acceptEdits, is refused in plan, dontAsk and bypass; an approval is never remembered; the hook refuses bypass mode and a branch not matching `SLAUDE_GIT_PUSH_BRANCH_PATTERN` (whole-name match, unsafe ref shapes refused); `git_fetch` is allowed like a read.
 - [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `remote: git_push through the sandbox server`.
 
 ### Task 1.7: Docs and field note
