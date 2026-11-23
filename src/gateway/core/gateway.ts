@@ -57,6 +57,7 @@ import { humanizeToolStatus, redactSecrets } from "./status-text";
 import * as Remote from "../../db/remote";
 import * as Envs from "../../db/environments";
 import { handleEnvCommand, addEnvironment, useEnvironment, defaultEnvDeps } from "./env-command";
+import { handleSandboxCommand } from "./sandbox-command";
 import type { RemoteTarget } from "../../remote/types";
 
 /** A thread's remote target that runs on a person's own machine (the manager
@@ -201,6 +202,7 @@ import * as Ignores from "../../db/ignores";
 import * as CronJobs from "../../db/cron-jobs";
 import * as OneOnOne from "../../db/one-on-one";
 import * as MentionOnly from "../../db/mention-only";
+import * as Sandbox from "../../db/sandbox";
 import { CronScheduler } from "../slack/cron-scheduler";
 import { startCronLeader } from "./cron-leader";
 import { defaultSchedulerDeps, leaderElect, personaManager, startBackgroundScheduler, wakeNow, type SchedulerSlack } from "../../background/scheduler";
@@ -265,6 +267,9 @@ export interface GatewayHandle {
   /** TEST/SIM SEAM ONLY. Drive the agent-facing mention-only toggle
    *  (mcp__slaude_surface__set_mention_only) for a live session. */
   __agentMentionOnly(sessionId: string, active: boolean): Promise<string>;
+  /** TEST/SIM SEAM ONLY. Drive the agent-facing sandbox switch
+   *  (mcp__slaude_surface__enter_sandbox) for a live session. */
+  __agentEnterSandbox(sessionId: string): Promise<string>;
   /** TEST SEAM ONLY. The brain gate input a mono session's tools see now
    *  (its route's context); undefined with no route. */
   __brainGate?(sessionId: string): Promise<GateInput | undefined>;
@@ -1978,6 +1983,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         }),
         setOneOnOne: (action, scope) => agentOneOnOne(sessionId, route.ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(route.ctx, active),
+        ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(sessionId, route.ctx) } : {}),
       }),
       [RUNTIME_MCP_NAME]: createRuntimeMcp(route.ctx),
       [CONNECT_MCP_NAME]: createConnectMcp({ connect: (server) => agentConnect(sessionId, route.ctx, server) }),
@@ -2413,6 +2419,21 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
     return "Mention-only off — I'll follow this thread normally again.";
   }
 
+  // Agent-facing sandbox switch: the /sandbox on engine, gated on the turn's Slack
+  // user being allowed to switch sandbox mode. It never replaces an environment:
+  // taking a thread off someone's machine is a person's decision. Takes effect on
+  // the next turn (the reload waits for this turn; on a node, the fingerprint).
+  async function agentEnterSandbox(sessionId: string, ctx: SlackContext): Promise<string> {
+    const threadTs = ctx.threadTs ?? ctx.inboundTs ?? "";
+    if (!env.sandbox.activeUrl()) return "Sandbox mode is not enabled on this deployment.";
+    if (await Sandbox.find(ctx.channel, threadTs)) return "Sandbox mode is already on in this thread.";
+    if (await Envs.findBinding(ctx.channel, threadTs)) return "This thread runs in an environment the user chose (/env). Ask the user to type `/sandbox on` in this thread.";
+    if (!env.sandbox.autoAllowed(ctx.userId)) return "This user may not switch sandbox mode, so the thread stays here; tell them to ask the manager for access. Do not do the code work on this server.";
+    await Sandbox.set({ channelId: ctx.channel, threadTs, createdBy: ctx.userId ?? "" });
+    reloadSession(sessionId);
+    return "Sandbox mode is on from the next turn: finish this reply, tell the user their next message continues in the sandbox, and do no code work here.";
+  }
+
   /** The /remote handler's context for one thread and user: replies post as the
    *  thread's persona through `app`; private replies and the Connect button go
    *  ephemerally to `userId`. Shared by the typed command and the Connect modal. */
@@ -2474,6 +2495,8 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
           }
         : {}),
       reload: () => { reloadSession(sessionId); },
+      // In-process: on a split deploy the node does not see the note; the reload still reaches it.
+      note: (text) => agent.noteSessionEvent(sessionId, text),
       reloadThread: async (ch, ts) => {
         const other = await Sessions.findAnyByThread({ team_id: teamId, channel_id: ch, thread_ts: ts }).catch(() => null);
         if (other) reloadSession(other.id);
@@ -3427,6 +3450,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       }
       if (slash.kind === "env") {
         await handleEnvCommand(slash, await remoteCommandCtx({ teamId, channelId, threadTs, userId, sessionId: session.id, personaId: dispatch?.personaId, app }));
+        return;
+      }
+      if (slash.kind === "sandbox") {
+        const rctx = await remoteCommandCtx({ teamId, channelId, threadTs, userId, sessionId: session.id, personaId: dispatch?.personaId, app });
+        await handleSandboxCommand(slash, { ...rctx, reloadAfterTurn: () => { reloadSession(session.id); } });
         return;
       }
       if (slash.kind === "one-on-one") {
@@ -5638,6 +5666,7 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
         }),
         setOneOnOne: (action, scope) => agentOneOnOne(claims.session, ctx, action, scope),
         setMentionOnly: (active) => agentMentionOnly(ctx, active),
+        ...(env.sandbox.activeUrl() ? { enterSandbox: () => agentEnterSandbox(claims.session, ctx) } : {}),
       }),
       connect: (claims, ctx, server) => agentConnect(claims.session, ctx, server),
       brainDeps: (ctx, surface, claims) => brainDepsFor(ctx, surface, undefined, claims),
@@ -5861,6 +5890,11 @@ export function createGateway(agent: AgentManager, t: Transport, opts: GatewayOp
       const route = routes.get(sessionId);
       if (!route) return Promise.resolve("no active thread for this session");
       return agentMentionOnly(route.ctx, active);
+    },
+    __agentEnterSandbox: (sessionId: string) => {
+      const route = routes.get(sessionId);
+      if (!route) return Promise.resolve("no active thread for this session");
+      return agentEnterSandbox(sessionId, route.ctx);
     },
   };
 }

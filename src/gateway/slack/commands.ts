@@ -45,6 +45,7 @@ export type SlashHit =
   | { kind: "one-on-one"; action: "lock" }
   | { kind: "remote"; action: "on"; addr: string; dir?: string }
   | { kind: "remote"; action: "off" | "status" | "key" }
+  | { kind: "sandbox"; action: "on" | "off" | "status" }
   | { kind: "env"; action: "status" | "list" | "off" }
   | { kind: "env"; action: "key"; kindName?: string }
   | { kind: "env"; action: "use"; name: string; dir?: string }
@@ -72,6 +73,7 @@ export const AGENT_COMMANDS: SlashSpec[] = [
   { usage: "/1on1 [lock | off]", summary: "start a private 1on1 (locked to you); `lock` re-restricts after open; `off` releases — to open to guests, ask the agent directly" },
   { usage: "/env [list | use <name> [dir] | add | edit <name> | rm <name> | off | key [kind]]", summary: "choose where this thread's shell + file tools run: one of your saved environments (tailcat, ssh, …) or the server; no arg shows status and your environments" },
   { usage: "/remote [off | key | <addr> [dir]]", summary: "alias for a tailcat environment: run this thread's shell + file tools on your own machine (locks the thread to you); no arg shows status and, when off, a private Connect button" },
+  { usage: "/sandbox [on | off]", summary: "run this thread's shell + file tools in its own sandbox (for code work); `off` destroys it; no arg shows status" },
   { usage: "/mention-only [off]", summary: "reply only when @-mentioned in this thread; `off` restores normal" },
   { usage: "/mcp [connect|disconnect <server>]", summary: "list/connect/disconnect OAuth HTTP MCP servers — in 1on1: as you; outside 1on1: manager manages the agent's shared identity" },
   { usage: "/ignore @user [dur]", summary: "ignore a user (optional duration, e.g. 1h, 30m)" },
@@ -233,6 +235,12 @@ export function parseSlashCommand(text: string): SlashHit | null {
     if (sub === "key") return { kind: "remote", action: "key" };
     const dir = rest.slice(1).join(" ").trim();
     return dir ? { kind: "remote", action: "on", addr: rest[0], dir } : { kind: "remote", action: "on", addr: rest[0] };
+  }
+  if (cmd === "sandbox") {
+    const sub = (rest[0] ?? "").toLowerCase();
+    if (!rest[0] || sub === "status") return { kind: "sandbox", action: "status" };
+    if (sub === "on" || sub === "off") return { kind: "sandbox", action: sub };
+    return null;
   }
   if (cmd === "env") {
     return parseEnvCommand(rest);
