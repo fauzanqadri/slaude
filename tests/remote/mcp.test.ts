@@ -1,6 +1,7 @@
 import { afterEach, describe, it, expect } from "bun:test";
 import {
   REMOTE_TOOL_ALIASES, REMOTE_DENIED_LOCAL_TOOLS, builtinFor, remotePermission, denyLocalBuiltins, makeRemoteCanUseTool, createRemoteMcp, REMOTE_MCP_NAME,
+  gitPushGuard, sandboxMcpServer, validBranch,
 } from "../../src/remote/mcp";
 import { RemoteError } from "../../src/remote/types";
 import { localExec } from "./local-exec";
@@ -27,6 +28,13 @@ describe("remotePermission — parity with how the SDK treats each built-in", ()
     ["mcp__remote__glob", "default", "allow"],
     ["mcp__remote__grep", "default", "allow"],
     ["mcp__remote__bash_output", "default", "allow"],
+    ["mcp__remote__git_fetch", "default", "allow"],
+    ["mcp__remote__git_fetch", "plan", "allow"],
+    ["mcp__remote__git_push", "default", "ask"],
+    ["mcp__remote__git_push", "acceptEdits", "ask"],
+    ["mcp__remote__git_push", "plan", "deny"],
+    ["mcp__remote__git_push", "dontAsk", "deny"],
+    ["mcp__remote__git_push", "bypassPermissions", "deny"],
     ["mcp__remote__write", "default", "ask"],
     ["mcp__remote__edit", "default", "ask"],
     ["mcp__remote__write", "acceptEdits", "allow"],
@@ -203,5 +211,63 @@ describe("createRemoteMcp", () => {
     expect(line).toContain("subject=sh");
     expect(line).toContain("code=3");
     expect(line).not.toContain("secret-token");
+  });
+});
+
+describe("git_push from the sandbox server", () => {
+  afterEach(() => { delete process.env.SLAUDE_GIT_PUSH_BRANCH_PATTERN; });
+  const ev = (branch: unknown) => ({ hook_event_name: "PreToolUse", tool_name: "mcp__remote__git_push", tool_input: { branch, remote: "origin" } }) as any;
+  const denied = (r: any) => r?.hookSpecificOutput?.permissionDecision === "deny";
+
+  it("an approval is never remembered as an allow rule", async () => {
+    const always = async (name: string, input: any) =>
+      ({ behavior: "allow", updatedInput: input, updatedPermissions: [{ type: "addRules", rules: [{ toolName: name }], behavior: "allow", destination: "session" }] }) as any;
+    const can = makeRemoteCanUseTool(always as any, () => "default");
+    const p: any = await can("mcp__remote__git_push", { branch: "agent/x", remote: "o" }, sig);
+    expect(p.behavior).toBe("allow");
+    expect(p.updatedPermissions).toBeUndefined();
+    const b: any = await can("mcp__remote__bash", { command: "ls" }, sig);
+    expect(b.updatedPermissions).toBeDefined();
+  });
+
+  it("the guard refuses bypass mode, whatever the branch", async () => {
+    expect(denied(await gitPushGuard(() => "bypassPermissions")(ev("agent/x"), "tu", sig))).toBe(true);
+  });
+
+  it("the guard refuses a branch outside the pattern and allows one inside it", async () => {
+    const g = gitPushGuard(() => "default");
+    expect(denied(await g(ev("agent/fix-1"), "tu", sig))).toBe(false);
+    for (const b of ["main", "agentx/y", "agent/../main", "agent/x.lock", "-agent/x", "refs/heads/agent/x", "", 7]) {
+      expect(denied(await g(ev(b), "tu", sig))).toBe(true);
+    }
+  });
+
+  it("the pattern comes from SLAUDE_GIT_PUSH_BRANCH_PATTERN and must match the whole name", async () => {
+    process.env.SLAUDE_GIT_PUSH_BRANCH_PATTERN = "^bot/[a-z0-9-]+$";
+    const g = gitPushGuard(() => "default");
+    expect(denied(await g(ev("bot/fix-1"), "tu", sig))).toBe(false);
+    expect(denied(await g(ev("agent/fix-1"), "tu", sig))).toBe(true);
+    expect(validBranch("bot/fix-1-extra", /bot\/[a-z]+/)).toBe(false);
+  });
+
+  it("an invalid pattern falls back to the default", async () => {
+    process.env.SLAUDE_GIT_PUSH_BRANCH_PATTERN = "([";
+    expect(denied(await gitPushGuard(() => "default")(ev("agent/x"), "tu", sig))).toBe(false);
+  });
+
+  it("ignores every other tool", async () => {
+    const g = gitPushGuard(() => "bypassPermissions");
+    expect(await g({ hook_event_name: "PreToolUse", tool_name: "mcp__remote__bash", tool_input: {} } as any, "tu", sig)).toEqual({});
+  });
+});
+
+describe("sandboxMcpServer", () => {
+  it("an HTTP server keyed by session, with the bearer only when set", () => {
+    expect(sandboxMcpServer("https://sandbox.test/mcp", "s1", "tok")).toEqual({
+      type: "http", url: "https://sandbox.test/mcp", headers: { "X-Sandbox-Session": "s1", Authorization: "Bearer tok" },
+    });
+    expect(sandboxMcpServer("https://sandbox.test/mcp", "s1", "")).toEqual({
+      type: "http", url: "https://sandbox.test/mcp", headers: { "X-Sandbox-Session": "s1" },
+    });
   });
 });

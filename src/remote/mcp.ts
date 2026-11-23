@@ -1,4 +1,5 @@
-import { createSdkMcpServer, tool, type CanUseTool, type HookCallback, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, tool, type CanUseTool, type HookCallback, type McpHttpServerConfig, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import { env } from "../config/env";
 import { z } from "zod";
 import { RemoteError, type Exec } from "./types";
 import { ReadState, readTool, writeTool, editTool, fail, type ToolText } from "./tools/files";
@@ -26,9 +27,14 @@ export const REMOTE_DENIED_LOCAL_TOOLS = [
 ] as const;
 
 const PREFIX = `mcp__${REMOTE_MCP_NAME}__`;
-const READ_ONLY = new Set(["read", "glob", "grep", "bash_output"]);
+/** git_fetch (sandbox server) only moves refs from the server's mirror into the sandbox;
+ *  it publishes nothing and touches no working tree, so it is allowed like a read. */
+const READ_ONLY = new Set(["read", "glob", "grep", "bash_output", "git_fetch"]);
 const EDITS = new Set(["write", "edit"]);
 const SHELL = new Set(["bash", "bash_kill"]);
+/** Publishes code (sandbox server): asks in every mode that can ask, never auto-allowed,
+ *  never remembered (see gitPushGuard). */
+const PUBLISH = new Set(["git_push"]);
 
 export function builtinFor(toolName: string): string | null {
   if (!toolName.startsWith(PREFIX)) return null;
@@ -61,6 +67,7 @@ export function remotePermission(toolName: string, mode: string): "allow" | "ask
   if (!toolName.startsWith(PREFIX)) return null;
   const t = toolName.slice(PREFIX.length);
   if (READ_ONLY.has(t)) return "allow";
+  if (PUBLISH.has(t)) return mode === "plan" || mode === "dontAsk" || mode === "bypassPermissions" ? "deny" : "ask";
   // An unknown tool under our prefix is never approved (and never reaches an approver).
   if (!EDITS.has(t) && !SHELL.has(t)) return "deny";
   if (mode === "plan" || mode === "dontAsk") return "deny";
@@ -79,7 +86,12 @@ export function makeRemoteCanUseTool(base: CanUseTool | undefined, getMode: () =
     }
     // Fail closed: with no approver, anything not decided above is denied.
     if (!base) return { behavior: "deny", message: "No approver is configured." };
-    return base(d === "ask" ? builtinFor(toolName) ?? toolName : toolName, input, ctx);
+    const r = await base(d === "ask" ? builtinFor(toolName) ?? toolName : toolName, input, ctx);
+    // A publish is never remembered: an allow rule would skip this gate on the next push.
+    if (r.behavior === "allow" && r.updatedPermissions && PUBLISH.has(toolName.slice(PREFIX.length))) {
+      return { ...r, updatedPermissions: undefined };
+    }
+    return r;
   };
 }
 
@@ -98,6 +110,39 @@ export const denyLocalBuiltins: HookCallback = async (input) => {
     },
   };
 };
+
+const GIT_PUSH = `${PREFIX}git_push`;
+
+/** git_push must reach a human and may publish only allowed branch names. Hooks run
+ *  in every mode, while canUseTool may never be called in bypassPermissions, so the
+ *  bypass refusal lives here. The branch check repeats the server's own rule with
+ *  this deployment's pattern (SLAUDE_GIT_PUSH_BRANCH_PATTERN). */
+export function gitPushGuard(getMode: () => string): HookCallback {
+  return async (input) => {
+    if (input.hook_event_name !== "PreToolUse") return {};
+    if ((input as any).tool_name !== GIT_PUSH) return {};
+    const deny = (reason: string) => ({
+      hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: reason },
+    });
+    if (getMode() === "bypassPermissions") {
+      return deny("git_push needs an approval and this thread is in bypass mode. Ask the user to switch modes first.");
+    }
+    const branch = String((input as any).tool_input?.branch ?? "");
+    if (!validBranch(branch, env.gitPush.branchPattern())) {
+      return deny(`git_push may publish only branches matching ${env.gitPush.branchPattern().source}; got ${branch || "(none)"}. Commit on such a branch first.`);
+    }
+    return {};
+  };
+}
+
+/** A branch name the pattern accepts and git would accept as a plain ref name. */
+export function validBranch(branch: string, pattern: RegExp): boolean {
+  if (!branch || branch.startsWith("-") || branch.startsWith("refs/")) return false;
+  if (branch.includes("..") || branch.includes("//") || branch.endsWith("/") || branch.endsWith(".lock")) return false;
+  if (/[\s~^:?*\[\\]/.test(branch)) return false;
+  const m = pattern.exec(branch);
+  return !!m && m.index === 0 && m[0] === branch;
+}
 
 const GUIDANCE =
   "Stop and tell the user the thread's environment is not reachable. They can check with `/env`; if they restarted `tailcat serve` and got a new address, `/remote <new-address>` (or `/env edit`) re-points it. Do not retry in a loop or work around it.";
@@ -198,4 +243,16 @@ export function createRemoteMcp(o: { exec: Exec; root: string; sessionKey: strin
       }, guarded("grep", (i) => grepTool(files, i))),
     ],
   });
+}
+
+/** Sandbox mode: the remote tools served over HTTP by an external sandbox MCP server.
+ *  Mounted under REMOTE_MCP_NAME so aliases, permissions and status text are shared
+ *  with remote environments. The server binds X-Sandbox-Session to one sandbox
+ *  (created on first call, reused after); the model never sees a sandbox id. */
+export function sandboxMcpServer(url: string, sessionId: string, token: string = env.sandbox.mcpToken()): McpHttpServerConfig {
+  return {
+    type: "http",
+    url,
+    headers: { "X-Sandbox-Session": sessionId, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  };
 }
