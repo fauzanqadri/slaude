@@ -192,6 +192,18 @@ export const GUARDRAILS: readonly GuardrailDescriptor[] = [
     source: "remote/mcp.ts denyLocalBuiltins",
   },
   {
+    id: HOOK_IDS.gitPushGuard,
+    kind: "hook",
+    title: "git_push needs a human and an allowed branch",
+    summary: "In a thread whose tools run in a sandbox or remote environment, git_push is refused in bypass mode and for branch names outside the configured pattern.",
+    event: "PreToolUse",
+    effect: "Denies mcp__remote__git_push when the session mode is bypassPermissions (hooks run in every mode, the approval card does not) or when the branch does not match SLAUDE_GIT_PUSH_BRANCH_PATTERN.",
+    appliesTo: ["remote"],
+    state: () => (env.remote.enabled() || !!env.sandbox.activeUrl() ? "enforcing" : "off"),
+    toggle: { source: "env", key: "SLAUDE_REMOTE or SLAUDE_SANDBOX", default: "off" },
+    source: "remote/mcp.ts gitPushGuard",
+  },
+  {
     id: HOOK_IDS.guardrailFiles,
     kind: "hook",
     title: "Guardrail files are not editable",

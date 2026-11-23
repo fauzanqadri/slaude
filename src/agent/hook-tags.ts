@@ -17,6 +17,7 @@ export const HOOK_IDS = {
   stopMustReply: "hook.stop.must-reply",
   userPromptSuppress: "hook.user-prompt.suppress",
   remoteDenyLocal: "hook.pre-tool.remote-deny-local",
+  gitPushGuard: "hook.pre-tool.git-push-guard",
   guardrailFiles: "hook.pre-tool.guardrail-files",
   ownerGuardrails: "hook.pre-tool.owner-guardrails",
   skillGate: "hook.pre-tool.skill-gate",
