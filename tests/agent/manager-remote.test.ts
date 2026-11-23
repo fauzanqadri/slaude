@@ -32,6 +32,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 const { AgentManager, SCHEDULER_TOOLS } = await import("../../src/agent/manager");
 const { WAKE_ONLY_TOOL_IDS } = await import("../../src/proactive/wake-guard");
 const Sessions = await import("../../src/db/sessions");
+const Sandbox = await import("../../src/db/sandbox");
 
 // ---------------------------------------------------------------------------
 // Fake SDK session
@@ -210,8 +211,8 @@ describe("remote wiring", () => {
     await until(() => fs.options !== null, 3000, "boot");
     expect(fs.options.mcpServers.remote).toBeDefined();
     expect(fs.options.toolAliases.Bash).toBe("mcp__remote__bash");
-    // remote deny guard + guardrail files + owner guardrails + skill gate + synthetic-turn profile-write guard
-    expect(fs.options.hooks.PreToolUse.flatMap((m: any) => m.hooks)).toHaveLength(5);
+    // remote deny guard + git_push guard + guardrail files + owner guardrails + skill gate + synthetic-turn profile-write guard
+    expect(fs.options.hooks.PreToolUse.flatMap((m: any) => m.hooks)).toHaveLength(6);
     expect(fs.options.systemPrompt.append).toContain("<remote-mode>");
     for (const b of ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]) {
       expect(fs.options.disallowedTools ?? []).not.toContain(b); // enabled + alias (spike §8)
@@ -575,5 +576,130 @@ describe("remote handle disposal bound and fail-closed", () => {
     expect(fs.options).toBeNull();
     expect(mgr.isLive(row.id)).toBe(false);
     expect(log).toEqual(["release"]);
+  });
+});
+
+describe("sandbox mode (SLAUDE_SANDBOX_MCP_URL)", () => {
+  const withSandbox = async (fn: () => Promise<void>) => {
+    process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+    process.env.SLAUDE_SANDBOX = "1";
+    process.env.SLAUDE_SANDBOX_MCP_TOKEN = "tok";
+    try { await fn(); } finally {
+      delete process.env.SLAUDE_SANDBOX_MCP_URL;
+      delete process.env.SLAUDE_SANDBOX;
+      delete process.env.SLAUDE_SANDBOX_MCP_TOKEN;
+    }
+  };
+
+  it("no /remote target: HTTP remote server keyed by session, aliases, guard, sandbox block, gated tools", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    const asked: string[] = [];
+    mgr.setPermissionResolver(async (_sid, toolName, input) => { asked.push(toolName); return { behavior: "allow", updatedInput: input } as any; });
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    mgr.setSandboxResolver(async () => true);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers.remote).toEqual({
+      type: "http",
+      url: "https://sandbox.test/mcp",
+      headers: { "X-Sandbox-Session": row.id, Authorization: "Bearer tok" },
+    });
+    expect(fs.options.toolAliases.Bash).toBe("mcp__remote__bash");
+    expect(fs.options.disallowedTools).toContain("NotebookEdit");
+    expect(fs.options.hooks.PreToolUse).toHaveLength(1);
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-mode>");
+    expect(fs.options.systemPrompt.append).not.toContain("<remote-mode>");
+    // The git_push guard runs in sandbox mode: bypass is refused, and so is a branch outside the pattern.
+    const pre = fs.options.hooks.PreToolUse.flatMap((m: any) => m.hooks);
+    const push = (branch: string) => ({ hook_event_name: "PreToolUse", tool_name: "mcp__remote__git_push", tool_input: { branch, remote: "origin" } }) as any;
+    const decisions = await Promise.all(pre.map((h: any) => h(push("main"), "tu", { signal: new AbortController().signal })));
+    expect(decisions.some((d: any) => d?.hookSpecificOutput?.permissionDecision === "deny")).toBe(true);
+    const okDecisions = await Promise.all(pre.map((h: any) => h(push("agent/fix-1"), "tu", { signal: new AbortController().signal })));
+    expect(okDecisions.some((d: any) => d?.hookSpecificOutput?.permissionDecision === "deny")).toBe(false);
+    const sig = { signal: new AbortController().signal };
+    expect((await fs.options.canUseTool("mcp__remote__read", { file_path: "a" }, sig)).behavior).toBe("allow");
+    await fs.options.canUseTool("mcp__remote__bash", { command: "ls" }, sig);
+    expect(asked).toEqual(["Bash"]);
+    await shutdown(mgr, row.id);
+  }));
+
+  it("a /remote target wins over the sandbox", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setSandboxResolver(async () => true);
+    mgr.setRemote(
+      async () => ({ teamId: "T1", userId: "U_A", addr: "tcA", dir: "/r" }),
+      () => ({ exec: noopExec, release: async () => {}, dispose: async () => {} }),
+    );
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers.remote.type).not.toBe("http");
+    expect(fs.options.systemPrompt.append).toContain("<remote-mode>");
+    expect(fs.options.systemPrompt.append).not.toContain("<sandbox-mode>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("a thread not switched on runs locally, with the sandbox-available hint", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers?.remote).toBeUndefined();
+    expect(fs.options.toolAliases).toBeUndefined();
+    expect(fs.options.systemPrompt.append).not.toContain("<sandbox-mode>");
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-available>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("with no resolver, a /sandbox row in the database switches the thread on", () => withSandbox(async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    const t = thread();
+    await Sandbox.set({ channelId: t.channel_id, threadTs: t.thread_ts, createdBy: "U_A" });
+    const row = await mgr.ensureSession(t);
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers.remote.type).toBe("http");
+    expect(fs.options.systemPrompt.append).toContain("<sandbox-mode>");
+    await shutdown(mgr, row.id);
+  }));
+
+  it("SLAUDE_SANDBOX off with the URL set: no sandbox server and no hint, even with a /sandbox row", async () => {
+    process.env.SLAUDE_SANDBOX_MCP_URL = "https://sandbox.test/mcp";
+    delete process.env.SLAUDE_SANDBOX;
+    try {
+      const mgr = new AgentManager();
+      mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+      const t = thread();
+      await Sandbox.set({ channelId: t.channel_id, threadTs: t.thread_ts, createdBy: "U_A" });
+      const row = await mgr.ensureSession(t);
+      const fs = plan();
+      await mgr.sendMessage(row.id, "hello");
+      await until(() => fs.options !== null, 3000, "boot");
+      expect(fs.options.mcpServers?.remote).toBeUndefined();
+      expect(fs.options.systemPrompt.append).not.toContain("sandbox-");
+      await shutdown(mgr, row.id);
+    } finally {
+      delete process.env.SLAUDE_SANDBOX_MCP_URL;
+    }
+  });
+
+  it("no sandbox server configured: no hint, even with a stale row", async () => {
+    const mgr = new AgentManager();
+    mgr.setRemote(async () => null, () => { throw new Error("factory must not run"); });
+    mgr.setSandboxResolver(async () => true);
+    const row = await mgr.ensureSession(thread());
+    const fs = plan();
+    await mgr.sendMessage(row.id, "hello");
+    await until(() => fs.options !== null, 3000, "boot");
+    expect(fs.options.mcpServers?.remote).toBeUndefined();
+    expect(fs.options.systemPrompt.append).not.toContain("sandbox-");
+    await shutdown(mgr, row.id);
   });
 });

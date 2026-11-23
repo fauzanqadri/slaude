@@ -31,6 +31,9 @@ export interface SessionConfig {
    *  connect or disconnect changes it, so a warm session reboots and re-lists
    *  its bridged tools. Empty or absent leaves the fingerprint as before. */
   mcpEpoch?: string;
+  /** Sandbox mode: tools run on the sandbox MCP server. False or absent leaves
+   *  the fingerprint as before. */
+  sandbox?: boolean;
 }
 
 /** Identifies the session config a turn expects: who it runs as, the whole
@@ -46,6 +49,7 @@ export function sessionConfigFp(c: SessionConfig): string {
         remotePart(c.remote),
         // Appended only when set, so every existing fingerprint is unchanged.
         ...(c.mcpEpoch ? [c.mcpEpoch] : []),
+        ...(c.sandbox ? ["sandbox"] : []),
       ]),
     )
     .digest("hex")

@@ -51,3 +51,29 @@ describe("sessionModeBlock with an environment", () => {
     expect(b).not.toContain("own machine");
   });
 });
+
+describe("sessionModeBlock with sandbox mode", () => {
+  test("on: the sandbox block with the root and the branch pattern, and no remote block", () => {
+    const b = sessionModeBlock(null, null, { on: true, root: "/work", branchPattern: "^agent/" });
+    expect(b).toContain("<sandbox-mode>");
+    expect(b).toContain("/work");
+    expect(b).toContain("^agent/");
+    expect(b).not.toContain("<remote-mode>");
+  });
+
+  test("available: only the hint", () => {
+    const b = sessionModeBlock(null, null, { available: true });
+    expect(b).toContain("<sandbox-available>");
+    expect(b).not.toContain("<sandbox-mode>");
+  });
+
+  test("a remote environment wins over both", () => {
+    const b = sessionModeBlock(null, { userId: "U1", dir: "/r" }, { on: true, available: true });
+    expect(b).toContain("<remote-mode>");
+    expect(b).not.toContain("sandbox-");
+  });
+
+  test("nothing set: unchanged", () => {
+    expect(sessionModeBlock(lock("U1"), null, {})).toBe(sessionModeBlock(lock("U1")));
+  });
+});
