@@ -7,6 +7,7 @@
  * the agent.
  */
 import * as OneOnOne from "../../db/one-on-one";
+import * as Sandbox from "../../db/sandbox";
 import { remoteDecision, sharedBindingPresent, REFUSED_REMOTE_OFF_NOTICE, type Refusal, type TurnKind } from "../../remote/definitions/decision";
 import { sameAt } from "../../access/wired";
 import { env } from "../../config/env";
@@ -22,6 +23,9 @@ export interface ThreadIdentity {
   remote: RemoteClaim | undefined;
   /** The thread is bound to a shared environment this turn may not use. The turn must not run, and must not run on the server either. */
   refused?: Refusal;
+  /** Sandbox mode is on for this thread and no remote environment applies (only
+   *  when a sandbox server is configured). */
+  sandbox?: boolean;
 }
 
 /** Who is asking, for the shared-environment rule. Absent means the safest answer: no persona, not interactive. */
@@ -58,5 +62,6 @@ export async function threadIdentity(
     lock: lockRow ? { user: lockRow.locked_user, openScope: lockRow.open_scope } : null,
     remote: applies ? { addr: target!.addr, dir: target!.dir, ...(target!.env ? { env: target!.env } : {}) } : undefined,
     ...(refused ? { refused } : {}),
+    ...(!refused && !applies && env.sandbox.activeUrl() && (await Sandbox.find(channel, thread)) ? { sandbox: true } : {}),
   };
 }

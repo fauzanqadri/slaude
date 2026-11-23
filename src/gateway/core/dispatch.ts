@@ -441,7 +441,7 @@ export function makeQueueDispatch(agent: AgentManager, opts: QueueDispatchOpts =
       // A channel session's turn has the trigger's ts as its thread, a message
       // at root: a /1on1 under that message does not touch the session.
       const identityThread = meta.channelSession ? channelSessionKey(meta.channelId) : meta.threadTs;
-      const { runAsUser, lock: lockClaim, remote: remoteClaim, refused } = await threadIdentity(
+      const { runAsUser, lock: lockClaim, remote: remoteClaim, refused, sandbox: sandboxClaim } = await threadIdentity(
         meta.channelId,
         identityThread,
         async () => meta.oauthUser ?? (await agent.resolveEffectiveIdentity(session.id, meta.channelId, identityThread)),
@@ -482,8 +482,10 @@ export function makeQueueDispatch(agent: AgentManager, opts: QueueDispatchOpts =
           lock: lockClaim,
           remote: remoteClaim ?? null,
           mcpEpoch: await turnMcpEpoch({ tenant: tenantId, persona: personaId, team: meta.teamId, runAsUser }, epochs),
+          sandbox: sandboxClaim,
         }),
         ...(remoteClaim ? { remote: remoteClaim } : {}),
+        ...(sandboxClaim ? { sandbox: true } : {}),
         ...(meta.backgroundRunId ? { bgRun: meta.backgroundRunId } : {}),
         ...(meta.wake && meta.backgroundRunId ? { wake: true } : {}),
         ...(meta.postTarget ? { post: meta.postTarget } : {}),
