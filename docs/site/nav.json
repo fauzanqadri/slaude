@@ -35,6 +35,7 @@
             { "path": "guides/channel-sessions", "label": "Channel sessions" },
             { "path": "guides/environments", "label": "Environments" },
             { "path": "guides/remote", "label": "Remote mode" },
+            { "path": "guides/sandbox", "label": "Sandbox mode" },
             { "path": "guides/voice-mode", "label": "Voice mode" },
             { "path": "guides/examples", "label": "Examples" }
           ]
