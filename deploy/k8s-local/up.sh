@@ -27,6 +27,11 @@
 #                          taken from your shell when set, overriding the file.
 #   SLAUDE_LOCAL_OVERLAY   a kustomize directory to apply instead of this one;
 #                          it should build on this directory (used by e2e/up.sh).
+#   SLAUDE_LOCAL_HELM      1 to build the overlay on deploy/helm/slaude instead of
+#                          deploy/k8s-scale (same as --helm). helm-overlay.ts
+#                          renders the chart with helm-values.yaml and reuses
+#                          this directory's generators and patches, so the
+#                          cluster gets the same objects either way.
 #   SLAUDE_LOCAL_NODE_AUTH signed (default) | legacy: what the `default` node
 #                          deployment presents. legacy = the shared legacy token
 #                          (label default only); `finance` is always signed.
@@ -62,6 +67,14 @@ PROVIDER_KEYS=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_
 
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+USE_HELM="${SLAUDE_LOCAL_HELM:-0}"
+for a in "$@"; do
+  case "$a" in
+    --helm) USE_HELM=1 ;;
+    *) die "unknown argument: $a (only --helm)" ;;
+  esac
+done
 
 for bin in minikube kubectl openssl python3 bun; do
   command -v "$bin" >/dev/null || die "$bin is required"
@@ -296,8 +309,17 @@ minikube -p "$PROFILE" image build -t "$IMAGE" "$ROOT"
 existed=false
 kubectl --context "$PROFILE" -n "$NS" get deploy slaude-gateway >/dev/null 2>&1 && existed=true
 
+OVERLAY="${SLAUDE_LOCAL_OVERLAY:-$HERE}"
+if [[ "$USE_HELM" == 1 ]]; then
+  command -v helm >/dev/null || die "helm is required for --helm"
+  [[ -z "${SLAUDE_LOCAL_OVERLAY:-}" ]] || die "--helm builds its own overlay; unset SLAUDE_LOCAL_OVERLAY"
+  OVERLAY="$HERE/.helm-overlay"
+  log "rendering deploy/helm/slaude into $OVERLAY"
+  bun "$HERE/helm-overlay.ts" --out "$OVERLAY" >/dev/null
+fi
+
 log "applying overlay"
-kubectl kustomize --load-restrictor LoadRestrictionsNone "${SLAUDE_LOCAL_OVERLAY:-$HERE}" | kubectl --context "$PROFILE" apply -f -
+kubectl kustomize --load-restrictor LoadRestrictionsNone "$OVERLAY" | kubectl --context "$PROFILE" apply -f -
 
 # Same tag, new build: the Deployment spec is unchanged, so roll it explicitly.
 if $existed; then

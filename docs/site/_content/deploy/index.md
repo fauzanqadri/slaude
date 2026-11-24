@@ -331,6 +331,9 @@ behavior documented on this page, unchanged.
   Service/Ingress, RWX PVC, Secrets template (kubeseal example), KEDA
   queue-depth autoscaling with a CPU-HPA fallback. See its README for
   prerequisites (managed Postgres/Redis, RWX StorageClass, KEDA).
+- **[Helm charts](helm.md)** — `deploy/helm/slaude` renders the same objects
+  (`topology: scale`) or the single-pod deploy (`topology: mono`);
+  `deploy/helm/sandbox` runs the sandbox MCP server.
 - Slack ingress runs in **[http mode](webhook-mode.md)** (`SLAUDE_SLACK_MODE=http`,
   Events API) with per-workspace apps in the encrypted `slack_apps` registry;
   installs arrive via `bun run slack-app add` or the OAuth flow
