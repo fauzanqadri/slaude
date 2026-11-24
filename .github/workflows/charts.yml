@@ -1,0 +1,36 @@
+name: charts
+
+# Packages deploy/helm/* on a release tag and pushes them to GHCR as OCI
+# artifacts next to the image: oci://ghcr.io/<owner>/charts/<chart>, chart
+# version and appVersion both set to the tag (without the leading v).
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  publish:
+    name: package + push charts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with: { version: v3.16.4 }
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Package and push
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          owner="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          mkdir -p dist
+          for chart in deploy/helm/*/; do
+            helm package "$chart" --version "$version" --app-version "$version" -d dist
+          done
+          for pkg in dist/*.tgz; do
+            helm push "$pkg" "oci://ghcr.io/$owner/charts"
+          done

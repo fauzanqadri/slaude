@@ -46,6 +46,7 @@ deploy/k8s-local/gateway.env
 deploy/k8s-local/vault-root.env
 deploy/k8s-local/node-credentials.env
 deploy/k8s-local/node-cred-*.env
+deploy/k8s-local/.helm-overlay/
 
 # Redis snapshot written when a local test Redis runs from the repo root
 dump.rdb

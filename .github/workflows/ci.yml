@@ -420,3 +420,30 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: install smoke test
         run: bash tests/installer/smoke.sh
+
+  charts:
+    name: helm lint + template + kubeconform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with: { version: v3.16.4 }
+      - name: kubeconform
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar -xz -C /usr/local/bin kubeconform
+      # Every chart in every shape it ships in. -ignore-missing-schemas covers
+      # the KEDA ScaledObject, which has no built-in schema.
+      - name: render and validate
+        run: |
+          set -euo pipefail
+          check() { echo "--- $*"; helm lint "$@" >/dev/null; helm template ci "$@" | kubeconform -strict -summary -ignore-missing-schemas; }
+          check deploy/helm/slaude
+          check deploy/helm/slaude -f tests/deploy/fixtures/scale-values.yaml
+          check deploy/helm/slaude -f tests/deploy/fixtures/scale-values.yaml --set scale.autoscale.mode=hpa --set scale.egressPolicy.enabled=true
+          check deploy/helm/slaude -f deploy/k8s-local/helm-values.yaml
+          check deploy/helm/sandbox --set image.repository=example/sandbox --set tokenSecretRef.name=t
+          check deploy/helm/sandbox --set image.repository=example/sandbox --set tokenSecretRef.name=t --set backend=docker --set networkPolicy.enabled=true
