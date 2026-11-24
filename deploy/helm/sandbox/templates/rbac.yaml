@@ -1,0 +1,42 @@
+{{- if eq .Values.backend "k8s" }}
+{{/* The k8s backend runs kubectl against one namespace: a Pod and a PVC per
+     session, exec into the Pod, annotations on the PVC. Nothing else. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "sandbox.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sandbox.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sandbox.fullname" . }}
+  namespace: {{ include "sandbox.podNamespace" . }}
+  labels:
+    {{- include "sandbox.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, persistentvolumeclaims]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sandbox.fullname" . }}
+  namespace: {{ include "sandbox.podNamespace" . }}
+  labels:
+    {{- include "sandbox.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "sandbox.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sandbox.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

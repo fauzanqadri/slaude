@@ -1,0 +1,111 @@
+# The sandbox MCP server that slaude's sandbox mode talks to
+# (docs/site/_content/guides/sandbox.md, "The server contract"). Point slaude at
+# it with sandbox.mcpUrl: http://<fullname>.<namespace>:<service.port>/mcp.
+#
+# Secrets are referenced by name and never created from values.
+
+nameOverride: ""
+fullnameOverride: ""
+commonLabels: {}
+
+# The server image (required).
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicas: 1
+port: 8080
+service:
+  port: 8080
+
+# Bearer slaude sends (SLAUDE_SANDBOX_MCP_TOKEN on both sides).
+tokenSecretRef:
+  name: ""
+  key: SLAUDE_SANDBOX_MCP_TOKEN
+
+# local | docker | vps | k8s | vercel. Only k8s gets RBAC from this chart.
+backend: k8s
+
+sandbox:
+  # The image every sandbox starts from (SANDBOX_IMAGE).
+  image: ""
+  root: /workspace
+  idleTtlMinutes: 60     # SANDBOX_IDLE_TTL_MIN: stop an idle sandbox
+  keepDays: 7            # SANDBOX_KEEP_DAYS: delete a stopped sandbox
+  sweepSeconds: 60       # SANDBOX_SWEEP_SEC
+
+# Repositories cloned into a new sandbox from server-side mirrors.
+repos: []                # SANDBOX_REPOS
+mirrors:
+  mountPath: /mirrors
+  refreshMinutes: 10
+  # A PVC keeps mirrors across restarts; emptyDir re-clones them.
+  persistence:
+    enabled: true
+    existingClaim: ""
+    storageClass: ""
+    size: 20Gi
+  # A read-only deploy key for cloning, mounted at /etc/sandbox/clone (key `id`,
+  # and `known_hosts` for the git hosts), used through SANDBOX_CLONE_SSH_COMMAND.
+  cloneKeySecret: ""
+  cloneSshCommand: "ssh -i /etc/sandbox/clone/id -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/sandbox/clone/known_hosts"
+
+git:
+  user: ""               # SANDBOX_GIT_USER
+  email: ""              # SANDBOX_GIT_EMAIL
+
+# git_push: the server pushes with its own credential, never with force, and
+# only to these remotes (SLAUDE_GIT_PUSH_REMOTES).
+push:
+  remotes: []
+  tokenSecretRef:
+    name: ""
+    key: SLAUDE_GIT_PUSH_TOKEN
+  tokenUser: ""          # SLAUDE_GIT_PUSH_TOKEN_USER, default x-access-token
+
+# The Kubernetes backend: one Pod and PVC per session in `namespace`.
+k8s:
+  namespace: ""          # default: the release namespace
+  storageClass: ""
+  diskSize: 10Gi
+  nodeSelector: ""       # `key: value` pairs, as the server reads them
+  toleration: ""         # one toleration as YAML flow fields
+  cpuRequest: "1"
+  cpuLimit: "4"
+  memRequest: 2Gi
+  memLimit: 8Gi
+
+# Any other server setting (SANDBOX_DOCKER_*, SANDBOX_VERCEL_*, ...).
+env: []
+extraEnvFrom: []
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { cpu: "1", memory: 1Gi }
+podSecurityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+networkPolicy:
+  enabled: false
+  # Pods allowed to call the server (slaude's gateway and nodes).
+  clientPodSelector:
+    app.kubernetes.io/name: slaude
+  clientNamespaceSelector: {}
+  # Sandbox pods: nothing may connect in (the server reaches them through the
+  # Kubernetes API, not the pod network). Egress as listed here.
+  sandboxEgress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+      ports:
+        - { protocol: TCP, port: 443 }

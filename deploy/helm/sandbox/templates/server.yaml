@@ -1,0 +1,210 @@
+{{- $k8s := eq .Values.backend "k8s" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sandbox.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sandbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  # Sessions live in the server's memory between calls and on its mirrors
+  # volume: never two servers at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "sandbox.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sandbox.labels" . | nindent 8 }}
+    spec:
+      {{- if $k8s }}
+      serviceAccountName: {{ include "sandbox.fullname" . }}
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: server
+          image: {{ required "image.repository is required" .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: PORT
+              value: {{ .Values.port | quote }}
+            - name: SLAUDE_SANDBOX_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "tokenSecretRef.name is required" .Values.tokenSecretRef.name }}
+                  key: {{ .Values.tokenSecretRef.key }}
+            - name: SANDBOX_BACKEND
+              value: {{ .Values.backend | quote }}
+            - name: SANDBOX_ROOT
+              value: {{ .Values.sandbox.root | quote }}
+            - name: SANDBOX_IDLE_TTL_MIN
+              value: {{ .Values.sandbox.idleTtlMinutes | quote }}
+            - name: SANDBOX_KEEP_DAYS
+              value: {{ .Values.sandbox.keepDays | quote }}
+            - name: SANDBOX_SWEEP_SEC
+              value: {{ .Values.sandbox.sweepSeconds | quote }}
+            {{- with .Values.sandbox.image }}
+            - name: SANDBOX_IMAGE
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SANDBOX_REPOS
+              value: {{ join "," .Values.repos | quote }}
+            - name: SANDBOX_MIRRORS_DIR
+              value: {{ .Values.mirrors.mountPath | quote }}
+            - name: SANDBOX_MIRROR_REFRESH_MIN
+              value: {{ .Values.mirrors.refreshMinutes | quote }}
+            {{- if .Values.mirrors.cloneKeySecret }}
+            - name: SANDBOX_CLONE_SSH_COMMAND
+              value: {{ .Values.mirrors.cloneSshCommand | quote }}
+            {{- end }}
+            {{- with .Values.git.user }}
+            - name: SANDBOX_GIT_USER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.git.email }}
+            - name: SANDBOX_GIT_EMAIL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SLAUDE_GIT_PUSH_REMOTES
+              value: {{ join "," .Values.push.remotes | quote }}
+            {{- if .Values.push.tokenSecretRef.name }}
+            - name: SLAUDE_GIT_PUSH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.push.tokenSecretRef.name }}
+                  key: {{ .Values.push.tokenSecretRef.key }}
+            {{- end }}
+            {{- with .Values.push.tokenUser }}
+            - name: SLAUDE_GIT_PUSH_TOKEN_USER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $k8s }}
+            - name: SANDBOX_NAMESPACE
+              value: {{ include "sandbox.podNamespace" . | quote }}
+            {{- with .Values.k8s.storageClass }}
+            - name: SANDBOX_K8S_STORAGE_CLASS
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SANDBOX_K8S_DISK
+              value: {{ .Values.k8s.diskSize | quote }}
+            {{- with .Values.k8s.nodeSelector }}
+            - name: SANDBOX_K8S_NODE_SELECTOR
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.k8s.toleration }}
+            - name: SANDBOX_K8S_TOLERATION
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SANDBOX_K8S_CPU_REQUEST
+              value: {{ .Values.k8s.cpuRequest | quote }}
+            - name: SANDBOX_K8S_CPU_LIMIT
+              value: {{ .Values.k8s.cpuLimit | quote }}
+            - name: SANDBOX_K8S_MEM_REQUEST
+              value: {{ .Values.k8s.memRequest | quote }}
+            - name: SANDBOX_K8S_MEM_LIMIT
+              value: {{ .Values.k8s.memLimit | quote }}
+            {{- end }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.port }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: mirrors
+              mountPath: {{ .Values.mirrors.mountPath }}
+            {{- if .Values.mirrors.cloneKeySecret }}
+            - name: clone-key
+              mountPath: /etc/sandbox/clone
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: mirrors
+          {{- if .Values.mirrors.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "sandbox.mirrorsClaim" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- with .Values.mirrors.cloneKeySecret }}
+        - name: clone-key
+          secret:
+            secretName: {{ . }}
+            defaultMode: 256 # 0400: helm re-emits octal literals as decimal
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sandbox.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sandbox.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "sandbox.selector" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+{{- if and .Values.mirrors.persistence.enabled (not .Values.mirrors.persistence.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sandbox.mirrorsClaim" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sandbox.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.mirrors.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.mirrors.persistence.size }}
+{{- end }}

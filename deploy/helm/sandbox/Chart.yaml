@@ -1,0 +1,9 @@
+apiVersion: v2
+name: sandbox
+description: A sandbox MCP server for slaude's sandbox mode, with the RBAC and storage its Kubernetes backend needs.
+type: application
+# Released with the slaude image tag. The server image is a value: the server
+# lives in its own repository.
+version: 0.46.0
+appVersion: "0.46.0"
+keywords: [slaude, sandbox, mcp]
