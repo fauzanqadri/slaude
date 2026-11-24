@@ -1,0 +1,123 @@
+{{- if eq .Values.topology "scale" }}
+{{- $root := . }}
+{{- $n := .Values.scale.node }}
+{{- range $i, $node := .Values.scale.nodes }}
+{{- $name := include "slaude.nodeName" (dict "root" $root "node" $node) }}
+{{- $component := include "slaude.nodeComponent" (dict "root" $root "node" $node) }}
+{{- if $i }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "slaude.labels" (dict "root" $root "component" $component) | nindent 4 }}
+spec:
+  replicas: {{ $node.replicas | default 2 }}
+  selector:
+    matchLabels:
+      {{- include "slaude.selector" (dict "root" $root "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slaude.labels" (dict "root" $root "component" $component) | nindent 8 }}
+        slaude.dev/tier: node
+        slaude.dev/node-label: {{ $node.label }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ $n.terminationGracePeriodSeconds }}
+      {{- include "slaude.podExtras" $root | nindent 6 }}
+      containers:
+        - name: node
+          image: {{ include "slaude.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: ["bun", "--no-env-file", "src/node/main.ts"]
+          envFrom:
+            - secretRef:
+                name: {{ required "scale.secrets.node is required" $root.Values.scale.secrets.node }}
+            - configMapRef:
+                name: {{ include "slaude.configName" $root }}
+            {{- with $n.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: SLAUDE_NODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required (printf "scale.nodes[%d].credentialSecret is required" $i) $node.credentialSecret }}
+                  key: SLAUDE_NODE_TOKEN
+            - name: SLAUDE_NODE_BOOT_CHECK
+              value: refuse
+            - name: SLAUDE_NODE_MANIFEST
+              value: /etc/slaude/node.json
+            - name: SLAUDE_HOME
+              value: {{ $root.Values.home.mountPath }}
+            - name: SLAUDE_ROLE
+              value: node
+            - name: SLAUDE_GATEWAY_URL
+              value: {{ printf "http://%s:%v" (include "slaude.gatewayName" $root) $root.Values.scale.gateway.port }}
+            - name: SLAUDE_NODE_PORT
+              value: {{ $n.port | quote }}
+            - name: SLAUDE_NODE_CONFIG_ROOT
+              value: /config-home
+            {{- include "slaude.sandboxEnv" $root | nindent 12 }}
+            {{- with $n.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: {{ $n.port }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: slaude-home
+              mountPath: {{ $root.Values.home.mountPath }}
+            - name: config-home
+              mountPath: /config-home
+            - name: node-manifest
+              mountPath: /etc/slaude
+              readOnly: true
+          resources:
+            {{- toYaml ($node.resources | default $n.resources) | nindent 12 }}
+      volumes:
+        - name: slaude-home
+          persistentVolumeClaim:
+            claimName: {{ include "slaude.homeClaim" $root }}
+        - name: config-home
+          emptyDir:
+            sizeLimit: {{ $n.configHomeSizeLimit }}
+        - name: node-manifest
+          configMap:
+            name: {{ include "slaude.nodeManifestName" $root }}
+{{- if $n.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  {{- with $root.Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  minAvailable: {{ $n.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "slaude.selector" (dict "root" $root "component" $component) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}

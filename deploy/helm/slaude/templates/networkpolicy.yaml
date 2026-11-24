@@ -1,0 +1,38 @@
+{{- if and (eq .Values.topology "scale") .Values.scale.egressPolicy.enabled }}
+{{- $p := .Values.scale.egressPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "slaude.fullname" . }}-node-egress
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "slaude.name" . }}
+      slaude.dev/tier: node
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "slaude.selector" (dict "root" . "component" "gateway") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.scale.gateway.port }} }
+    - ports:
+        - { protocol: TCP, port: {{ $p.redisPort }} }
+    - ports:
+        - { protocol: TCP, port: 443 }
+    {{- with $p.extraRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

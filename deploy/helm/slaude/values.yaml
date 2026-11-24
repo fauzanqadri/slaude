@@ -1,0 +1,179 @@
+# slaude Helm chart. Two shapes, chosen by `topology`:
+#
+#   mono   one Deployment (one replica) and a ReadWriteOnce PVC for $SLAUDE_HOME:
+#          the single-persona deploy, as deploy/k8s/slaude.yaml.
+#   scale  gateway replicas plus one node Deployment per label, a shared
+#          ReadWriteMany $SLAUDE_HOME, the Service and Ingress, KEDA or HPA
+#          autoscaling, and an optional node egress NetworkPolicy: the same
+#          objects as deploy/k8s-scale (tests/deploy/helm-parity.test.ts keeps
+#          them identical).
+#
+# Secrets are referenced by name and never created from values. Create them as
+# deploy/k8s-scale/10-secrets.yaml describes (sealed, or from your secret store).
+topology: mono
+
+# Selector and name prefix. Two releases in one namespace need different values.
+nameOverride: ""
+fullnameOverride: ""
+# Extra labels on every object's metadata (never on selectors).
+commonLabels: {}
+
+image:
+  repository: ghcr.io/barockok/slaude
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# $SLAUDE_HOME. mono defaults to ReadWriteOnce; scale needs ReadWriteMany,
+# because every gateway and node pod mounts it.
+home:
+  mountPath: /data
+  claimName: ""      # default: <fullname>-home
+  existingClaim: ""  # use this PVC instead of creating one
+  accessModes: []    # default: [ReadWriteOnce] for mono, [ReadWriteMany] for scale
+  storageClass: ""   # empty: the cluster default
+  size: 20Gi
+
+# Pod-level settings applied to every slaude pod. The image runs as uid 1000.
+podSecurityContext: {}
+#  runAsUser: 1000
+#  runAsGroup: 1000
+#  fsGroup: 1000
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# --- Sandbox mode (docs/site/_content/guides/sandbox.md) ---------------------
+# A non-empty mcpUrl turns sandbox mode on (SLAUDE_SANDBOX=1) on every slaude
+# container. The token is read from a Secret, by key.
+sandbox:
+  mcpUrl: ""
+  tokenSecretRef:
+    name: ""
+    key: SLAUDE_SANDBOX_MCP_TOKEN
+  root: ""                  # SLAUDE_SANDBOX_ROOT, default /workspace
+  autoUsers: ""             # SLAUDE_SANDBOX_AUTO_USERS
+  gitPushBranchPattern: ""  # SLAUDE_GIT_PUSH_BRANCH_PATTERN
+
+# --- Agent API (/agent/v1) ---------------------------------------------------
+# Registered clients are files under $SLAUDE_HOME/api-clients/. With enabled,
+# the named ConfigMap (one key per client, `<name>.yaml`) is mounted there on
+# the gateway (mono: the pod).
+agentApi:
+  enabled: false
+  clientsConfigMap: ""
+
+# --- mono ---------------------------------------------------------------------
+mono:
+  # Loaded whole through envFrom (Slack tokens, provider key, master key).
+  secretName: ""
+  # Rendered into <fullname>-config and loaded through envFrom.
+  config: {}
+  env: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  port: 8080
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  service:
+    enabled: true
+
+# --- scale --------------------------------------------------------------------
+scale:
+  # Names of the objects the chart renders, for clusters that already use other names.
+  names:
+    config: ""          # default: <fullname>-config
+    gatewayConfig: ""   # default: <fullname>-gateway-config
+    nodeManifest: ""    # default: <fullname>-node-manifest
+  # Secrets, by name. gateway: loaded whole by the gateway only. node: loaded
+  # whole by every node deployment; the gateway reads SLAUDE_REDIS_URL from it.
+  secrets:
+    gateway: ""
+    node: ""
+  # Shared by the gateway and every node (deploy/k8s-scale/20-config.yaml).
+  config:
+    SLAUDE_DB: "pg"
+    SLAUDE_BRAIN_ENGINE: "postgres"
+    SLAUDE_SLACK_MODE: "http"
+    SLAUDE_REDIS_PREFIX: "slaude"
+    SLAUDE_NODE_DRAIN_SEC: "120"
+    SLAUDE_NODE_CONCURRENCY: "8"
+  # The gateway only: Vault, the outbound policy, the node-credential door. A
+  # node refuses to boot with any SLAUDE_VAULT_* or VAULT_* variable.
+  gatewayConfig: {}
+  # The nodes' stdio MCP manifest, mounted at /etc/slaude/node.json.
+  nodeManifest:
+    version: 1
+    mcpServers: {}
+    allow: {}
+
+  gateway:
+    replicas: 2
+    port: 8080
+    env: []
+    extraEnvFrom: []
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+    # A projected ServiceAccount token for Vault's Kubernetes login.
+    vaultToken:
+      enabled: true
+      audience: vault
+      expirationSeconds: 600
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  # One Deployment per node label. Label `default` is <fullname>-node; any other
+  # is <fullname>-node-<label>. Each reads SLAUDE_NODE_TOKEN from its own Secret.
+  nodes:
+    - label: default
+      replicas: 2
+      credentialSecret: ""
+      minReplicas: 2
+      maxReplicas: 20
+  node:
+    port: 8081
+    # MUST exceed SLAUDE_NODE_DRAIN_SEC.
+    terminationGracePeriodSeconds: 150
+    env: []
+    extraEnvFrom: []
+    configHomeSizeLimit: 1Gi
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: "2", memory: 4Gi }
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  # keda: a ScaledObject per label on its BullMQ wait list. hpa: a CPU HPA per
+  # label (a poor proxy; use until KEDA is installed). none: fixed replicas.
+  autoscale:
+    mode: none
+    keda:
+      redisAddress: ""   # host:port, the same Redis as SLAUDE_REDIS_URL
+      listLength: "5"
+      cooldownPeriod: 300
+      authenticationRef: ""
+    hpa:
+      cpuUtilization: 60
+      scaleDownStabilizationSeconds: 600
+
+  # Node egress allow-list (deploy/k8s-scale/optional/node-egress-networkpolicy.yaml).
+  # Needs a CNI that enforces NetworkPolicy.
+  egressPolicy:
+    enabled: false
+    redisPort: 6379
+    # Extra egress rules, as NetworkPolicyEgressRule objects (e.g. the sandbox server).
+    extraRules: []
+
+# The public Slack ingress (scale: the gateway Service; mono: the pod's Service).
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tlsSecret: ""
+  path: /slack

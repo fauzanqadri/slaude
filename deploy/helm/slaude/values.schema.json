@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "slaude chart values",
+  "type": "object",
+  "required": ["topology", "image", "home"],
+  "additionalProperties": false,
+  "properties": {
+    "topology": { "enum": ["mono", "scale"] },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "commonLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array" },
+    "home": {
+      "type": "object",
+      "properties": {
+        "mountPath": { "type": "string", "pattern": "^/" },
+        "claimName": { "type": "string" },
+        "existingClaim": { "type": "string" },
+        "accessModes": { "type": "array", "items": { "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadWriteOncePod"] } },
+        "storageClass": { "type": "string" },
+        "size": { "type": "string" }
+      }
+    },
+    "podSecurityContext": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mcpUrl": { "type": "string", "pattern": "^(|https?://.+)$" },
+        "tokenSecretRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "name": { "type": "string" }, "key": { "type": "string", "minLength": 1 } }
+        },
+        "root": { "type": "string" },
+        "autoUsers": { "type": "string" },
+        "gitPushBranchPattern": { "type": "string" }
+      }
+    },
+    "agentApi": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "enabled": { "type": "boolean" }, "clientsConfigMap": { "type": "string" } }
+    },
+    "mono": { "type": "object" },
+    "scale": {
+      "type": "object",
+      "properties": {
+        "secrets": {
+          "type": "object",
+          "properties": { "gateway": { "type": "string" }, "node": { "type": "string" } }
+        },
+        "config": { "type": "object" },
+        "gatewayConfig": {
+          "type": "object",
+          "description": "Gateway-only settings. Node-shared settings go in scale.config."
+        },
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["label"],
+            "properties": {
+              "label": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" },
+              "replicas": { "type": "integer", "minimum": 0 },
+              "credentialSecret": { "type": "string" },
+              "minReplicas": { "type": "integer", "minimum": 0 },
+              "maxReplicas": { "type": "integer", "minimum": 1 },
+              "resources": { "type": "object" }
+            }
+          }
+        },
+        "autoscale": {
+          "type": "object",
+          "properties": { "mode": { "enum": ["none", "keda", "hpa"] } }
+        }
+      }
+    },
+    "ingress": { "type": "object" },
+    "global": { "type": "object" }
+  }
+}

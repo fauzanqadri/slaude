@@ -1,0 +1,54 @@
+{{- if eq .Values.topology "scale" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slaude.configName" . }}
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{- range $k, $v := .Values.scale.config }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slaude.gatewayConfigName" . }}
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{- range $k, $v := .Values.scale.gatewayConfig }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slaude.nodeManifestName" . }}
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  node.json: |
+    {{- toPrettyJson .Values.scale.nodeManifest | nindent 4 }}
+{{- else if .Values.mono.config }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slaude.configName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "slaude.labels" (dict "root" . "component" "agent") | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.mono.config }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+{{- end }}

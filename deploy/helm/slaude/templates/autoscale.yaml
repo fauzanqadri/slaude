@@ -1,0 +1,66 @@
+{{- if eq .Values.topology "scale" }}
+{{- $root := . }}
+{{- $a := .Values.scale.autoscale }}
+{{- $prefix := .Values.scale.config.SLAUDE_REDIS_PREFIX | default "slaude" }}
+{{- range $i, $node := .Values.scale.nodes }}
+{{- $name := include "slaude.nodeName" (dict "root" $root "node" $node) }}
+{{- if eq $a.mode "keda" }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  {{- with $root.Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    name: {{ $name }}
+  minReplicaCount: {{ $node.minReplicas | default 2 }}
+  maxReplicaCount: {{ $node.maxReplicas | default 10 }}
+  cooldownPeriod: {{ $a.keda.cooldownPeriod }}
+  triggers:
+    - type: redis
+      metadata:
+        address: {{ required "scale.autoscale.keda.redisAddress is required for mode keda" $a.keda.redisAddress }}
+        listName: {{ printf "%s:bull:%s:wait" $prefix (include "slaude.labelQueue" $node.label) }}
+        listLength: {{ $a.keda.listLength | toString | quote }}
+      {{- with $a.keda.authenticationRef }}
+      authenticationRef:
+        name: {{ . }}
+      {{- end }}
+{{- else if eq $a.mode "hpa" }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $name }}-cpu-fallback
+  namespace: {{ $root.Release.Namespace }}
+  {{- with $root.Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  annotations:
+    slaude/disabled: "delete the ScaledObject before applying this fallback"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $name }}
+  minReplicas: {{ $node.minReplicas | default 2 }}
+  maxReplicas: {{ $node.maxReplicas | default 10 }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $a.hpa.cpuUtilization }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: {{ $a.hpa.scaleDownStabilizationSeconds }}
+{{- end }}
+{{- end }}
+{{- end }}
