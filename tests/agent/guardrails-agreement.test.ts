@@ -168,7 +168,8 @@ describe("the registry agrees with the wired hooks", () => {
   it("remote", async () => {
     const o = await remoteOptions();
     expect(wired(o)).toEqual(expected("remote"));
-    expect(o.hooks.PreToolUse[0].hooks).toHaveLength(5);
+    // The remote deny-local hook, the git_push guard and the four shared ones.
+    expect(o.hooks.PreToolUse[0].hooks).toHaveLength(6);
   });
   it("background pass", () => {
     expect(wired(backgroundOptions())).toEqual(expected("background"));
