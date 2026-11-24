@@ -5,6 +5,7 @@
  * SLAUDE_SANDBOX_AUTO_USERS; status is open. On replaces the thread's
  * environment (the last command wins); off destroys the sandbox at once.
  */
+import { someSameAt } from "../../access/wired";
 import { env } from "../../config/env";
 import * as Envs from "../../db/environments";
 import * as Sandbox from "../../db/sandbox";
@@ -25,6 +26,19 @@ export interface SandboxCommandDeps {
   envCleanup: EnvCommandDeps["cleanup"];
 }
 
+/**
+ * Whether a person may switch sandbox mode (`/sandbox on|off`, and the agent's
+ * `enter_sandbox` on their turn). Unset, empty or `*` means everyone; otherwise
+ * the speaker must be one of SLAUDE_SANDBOX_AUTO_USERS, compared through the
+ * access seam.
+ */
+export async function maySwitchSandbox(o: { persona: string | null | undefined; teamId: string | null | undefined; userId: string | null | undefined }): Promise<boolean> {
+  const listed = env.sandbox.autoUsers();
+  if (listed.length === 0 || listed.includes("*")) return true;
+  if (!o.userId) return false;
+  return someSameAt(listed, (other) => ({ site: "sandbox.switch_allowed", persona: o.persona, teamId: o.teamId, userId: o.userId, otherUserId: other }));
+}
+
 const defaultDeps: SandboxCommandDeps = { destroy: destroySandbox, envCleanup: defaultEnvDeps.cleanup };
 
 export async function handleSandboxCommand(hit: SandboxHit, ctx: SandboxCommandCtx, deps: SandboxCommandDeps = defaultDeps): Promise<void> {
@@ -42,7 +56,7 @@ export async function handleSandboxCommand(hit: SandboxHit, ctx: SandboxCommandC
     return;
   }
 
-  if (!env.sandbox.autoAllowed(userId)) {
+  if (!(await maySwitchSandbox({ persona: ctx.personaId, teamId: ctx.teamId, userId }))) {
     await ctx.reply(":no_entry: You may not switch sandbox mode on this deployment (SLAUDE_SANDBOX_AUTO_USERS). Ask the manager to add you.");
     return;
   }

@@ -25,6 +25,9 @@ const ALLOW: Record<string, string> = {
   SLAUDE_NODE_TOKEN: "the node's own /v1 credential",
   SLAUDE_REDIS_URL: "nodes run the queues",
   SLAUDE_GATEWAY_URL: "nodes call the gateway; not a secret",
+  // Sandbox mode: the node mounts the sandbox MCP server for a thread's tools.
+  SLAUDE_SANDBOX_MCP_URL: "the sandbox server's address; the node mounts it",
+  SLAUDE_SANDBOX_MCP_TOKEN: "the node sends it to the sandbox server; stripped from the agent child (child-env.ts)",
   SLAUDE_NODE_ALLOW_GATEWAY_SECRETS: "the boot check's escape switch; not a secret",
   // Agent provider credentials: the node's provider env fallback, and the child needs them.
   ANTHROPIC_API_KEY: "provider env fallback on nodes",
