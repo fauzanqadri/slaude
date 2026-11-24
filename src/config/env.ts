@@ -972,10 +972,6 @@ export const env = {
      *  and `enter_sandbox` on their turns), comma-separated. Unset, empty or `*` =
      *  everyone. `/sandbox` status is always open. */
     autoUsers: () => csv(opt("SLAUDE_SANDBOX_AUTO_USERS")),
-    autoAllowed: (userId: string | undefined): boolean => {
-      const list = csv(opt("SLAUDE_SANDBOX_AUTO_USERS"));
-      return list.length === 0 || list.includes("*") || (!!userId && list.includes(userId));
-    },
   },
   gitPush: {
     /** Branch names `git_push` may publish (`SLAUDE_GIT_PUSH_BRANCH_PATTERN`, a

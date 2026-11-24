@@ -32,6 +32,7 @@ import { ApprovalGate } from "../../src/gateway/slack/approval-gate";
 import { handleEnvCommand, useEnvironment } from "../../src/gateway/core/env-command";
 import { createGateway, type GatewayHandle } from "../../src/gateway/core/gateway";
 import { handleRemoteCommand, decodeRemoteOffer, encodeRemoteOffer } from "../../src/gateway/core/remote-command";
+import { maySwitchSandbox } from "../../src/gateway/core/sandbox-command";
 import { createV1Api } from "../../src/gateway/api/index";
 import { JOB_HEADER, mintJobToken } from "../../src/gateway/api/auth";
 import { threadIdentity } from "../../src/gateway/core/thread-identity";
@@ -229,6 +230,15 @@ const exercisers: Record<string, () => Promise<void>> = {
     if (t7?.env) {
       const tok = mintJobToken({ tenant: "t1", persona: "default", session: "S1", team: TEAM, channel: "C0EXAMPLE", thread: "7.0", initiator: "U0OWNER", scope: "turn", runAs: "user:U0OWNER", remote: { addr: t7.addr, dir: t7.dir, env: t7.env } } as any);
       await api.fetch(new Request("http://gw/v1/tenants/t1/remote-env", { headers: { authorization: "Bearer smoke-node-token", [JOB_HEADER]: tok } }));
+    }
+    // The sandbox switch allowlist, compared through the seam.
+    const prevAuto = process.env.SLAUDE_SANDBOX_AUTO_USERS;
+    process.env.SLAUDE_SANDBOX_AUTO_USERS = "U0OWNER";
+    try {
+      await maySwitchSandbox({ persona: "default", teamId: TEAM, userId: "U0OTHER" });
+    } finally {
+      if (prevAuto === undefined) delete process.env.SLAUDE_SANDBOX_AUTO_USERS;
+      else process.env.SLAUDE_SANDBOX_AUTO_USERS = prevAuto;
     }
     (await decodeRemoteOffer(encodeRemoteOffer({ sessionId: "S", teamId: TEAM, channelId: "C", threadTs: "1.0", userId: "U0OWNER", issuedAt: Date.now() }), "U0OWNER"));
   },

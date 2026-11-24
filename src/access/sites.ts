@@ -75,6 +75,7 @@ export const SITES = [
   { id: "env.turn_off_owner", group: 17, kind: "same", where: "/env off: the speaker owns the environment" },
   { id: "env.release_lock_owner", group: 17, kind: "same", where: "/env off: the lock still belongs to the environment's owner" },
   { id: "env.remove_lock_owner", group: 17, kind: "same", where: "/env remove: the lock still belongs to the environment's owner" },
+  { id: "sandbox.switch_allowed", group: 17, kind: "same", where: "/sandbox on|off and enter_sandbox: the speaker is on SLAUDE_SANDBOX_AUTO_USERS" },
   { id: "gateway.remote_ctx.role", group: 17, kind: "role", where: "/remote and /env context: the speaker's manager role" },
   // Task 18: background and display.
   { id: "scheduler.persona_manager", group: 18, kind: "list", where: "heartbeat and wake recipient: the persona's manager from its soul (no workspace on the call)" },
