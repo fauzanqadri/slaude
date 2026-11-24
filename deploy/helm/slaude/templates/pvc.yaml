@@ -1,0 +1,23 @@
+{{- if not .Values.home.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "slaude.homeClaim" . }}
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- $modes := .Values.home.accessModes }}
+  {{- if not $modes }}
+  {{- $modes = ternary (list "ReadWriteMany") (list "ReadWriteOnce") (eq .Values.topology "scale") }}
+  {{- end }}
+  accessModes: {{ toJson $modes }}
+  {{- with .Values.home.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.home.size }}
+{{- end }}

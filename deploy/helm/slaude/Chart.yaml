@@ -1,0 +1,11 @@
+apiVersion: v2
+name: slaude
+description: The slaude agent runtime, as one pod (mono) or as gateways and per-label node workers (scale).
+type: application
+# Released with the image: CI sets both to the image tag when it packages the chart.
+version: 0.46.0
+appVersion: "0.46.0"
+home: https://github.com/barockok/slaude
+sources:
+  - https://github.com/barockok/slaude
+keywords: [slack, agent, claude]

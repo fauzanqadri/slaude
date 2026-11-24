@@ -1,0 +1,120 @@
+{{- if eq .Values.topology "scale" }}
+{{- $g := .Values.scale.gateway }}
+{{- $name := include "slaude.gatewayName" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "slaude.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "slaude.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  replicas: {{ $g.replicas }}
+  selector:
+    matchLabels:
+      {{- include "slaude.selector" (dict "root" . "component" "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slaude.labels" (dict "root" . "component" "gateway") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      terminationGracePeriodSeconds: 30
+      {{- include "slaude.podExtras" . | nindent 6 }}
+      containers:
+        - name: gateway
+          image: {{ include "slaude.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - secretRef:
+                name: {{ required "scale.secrets.gateway is required" .Values.scale.secrets.gateway }}
+            - configMapRef:
+                name: {{ include "slaude.configName" . }}
+            - configMapRef:
+                name: {{ include "slaude.gatewayConfigName" . }}
+            {{- with $g.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: SLAUDE_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "scale.secrets.node is required" .Values.scale.secrets.node }}
+                  key: SLAUDE_REDIS_URL
+            - name: SLAUDE_HOME
+              value: {{ .Values.home.mountPath }}
+            - name: SLAUDE_ROLE
+              value: gateway
+            - name: SLAUDE_HTTP_PORT
+              value: {{ $g.port | quote }}
+            {{- include "slaude.sandboxEnv" . | nindent 12 }}
+            {{- with $g.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $g.port }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: slaude-home
+              mountPath: {{ .Values.home.mountPath }}
+            {{- if $g.vaultToken.enabled }}
+            - name: vault-token
+              mountPath: /var/run/secrets/vault
+              readOnly: true
+            {{- end }}
+            {{- include "slaude.agentApiMount" . | nindent 12 }}
+          resources:
+            {{- toYaml $g.resources | nindent 12 }}
+      volumes:
+        - name: slaude-home
+          persistentVolumeClaim:
+            claimName: {{ include "slaude.homeClaim" . }}
+        {{- if $g.vaultToken.enabled }}
+        - name: vault-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ $g.vaultToken.audience }}
+                  expirationSeconds: {{ $g.vaultToken.expirationSeconds }}
+                  path: token
+        {{- end }}
+        {{- include "slaude.agentApiVolume" . | nindent 8 }}
+{{- if $g.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.commonLabels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  minAvailable: {{ $g.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "slaude.selector" (dict "root" . "component" "gateway") | nindent 6 }}
+{{- end }}
+{{- end }}
