@@ -134,12 +134,13 @@ The sandbox server runs `git_push` with its own key and remote allowlist; slaude
 ### Task 3.1: Client registry
 **Files:** Create `src/agentapi/clients.ts`; Test `tests/agentapi/clients.test.ts`.
 **Interfaces:** `loadClients(dir): Promise<Map<string, ApiClient>>`; `ApiClient = { name, tokenHash, personas, channels, actions, events: { url, secret, notifyHosts } }`; a token given as `token: { env: NAME }` or `tokenSha256: <hex>` (C1), the secret from `{ env: NAME }`. The directory is the Helm chart's `agentApi.clientsConfigMap` mount (PR 2), so every gateway replica reads the same files.
-- [ ] **Step 1:** Tests: valid file loads; unknown key fails (zod `.strict()`); missing env reference fails loudly at boot; two clients with one token (or one hash) fail; `token` and `tokenSha256` together fail. **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `agentapi: client registry`.
+- [x] **Step 1:** Tests: valid file loads; unknown key fails (zod `.strict()`); missing env reference fails loudly at boot; two clients with one token (or one hash) fail; `token` and `tokenSha256` together fail. **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `agentapi: client registry`.
 
 ### Task 3.2: Router, auth and mount
 **Files:** Create `src/agentapi/{index,routes,auth}.ts`; Modify `src/health.ts`, `src/server.ts`, `src/gateway/core/gateway.ts`; Test `tests/agentapi/auth.test.ts`, `tests/gateway/api/route-table.test.ts`.
-- [ ] **Step 1:** Tests over real HTTP (pattern of `tests/gateway/api/v1-roundtrip.test.ts`): no clients means `404` everywhere; wrong token `401`; constant-time compare (`timingSafeStringEqual`); body over the cap `413` (`readBodyCapped`); errors are `{error}`; mounted for gateway only; mono only with `SLAUDE_AGENT_API_ON_MONO=1`; never node (C1). A `tokenSha256` client matches by hash.
-- [ ] **Step 2:** FAIL. **Step 3:** `RouteDef` table in the style of `src/gateway/api/index.ts`. **Step 4:** PASS; commit `agentapi: router and bearer auth`.
+- [x] **Step 1:** Tests over real HTTP (pattern of `tests/gateway/api/v1-roundtrip.test.ts`): no clients means `404` everywhere; wrong token `401`; constant-time compare (`timingSafeStringEqual`); body over the cap `413` (`readBodyCapped`); errors are `{error}`; mounted for gateway only; mono only with `SLAUDE_AGENT_API_ON_MONO=1`; never node (C1). A `tokenSha256` client matches by hash.
+- [x] **Step 2:** FAIL. **Step 3:** `RouteDef` table in the style of `src/gateway/api/index.ts`. **Step 4:** PASS; commit `agentapi: router and bearer auth`.
+- **As built:** the handler is assembled in `src/server.ts` (clients loaded before anything listens, so a bad file stops boot) and mounted through `agentApiHandlerForRole` in `src/health.ts`; `GatewayHandle` is not changed until a route needs the gateway (PR 4). Settings `SLAUDE_AGENT_API_CLIENTS_DIR` and `SLAUDE_AGENT_API_ON_MONO`. One route, `GET /agent/v1/whoami`, so a client can check its token. Authentication runs before route matching, so an unauthenticated caller cannot tell a route from a missing one.
 
 ### Task 3.3: Idempotency and conversations
 **Files:** Create `src/agentapi/{idempotency,conversations}.ts`, `src/db/agent-api.ts`, migration `0056_agent_api_base.sql` (`agent_idempotency`, `agent_conversations`); Modify `src/db/drivers/sqlite.ts`; Test `tests/agentapi/conversations.test.ts`.

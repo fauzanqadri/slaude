@@ -25,6 +25,10 @@ export type HealthDeps = {
    *  mono/gateway roles; it returns null for every request while SLAUDE_PORTAL
    *  is off, so mounting it costs nothing when disabled. */
   portal?: (req: Request) => Promise<Response | null>;
+  /** Optional agent host API handler (`/agent/v1`). Mounted for the gateway
+   *  role, and for mono only when opted in (see agentApiHandlerForRole); it
+   *  404s every path while no client is registered. */
+  agentApi?: (req: Request) => Promise<Response | null>;
 };
 
 /**
@@ -54,6 +58,21 @@ export function brainImportHandlerForRole(
   handler: (req: Request) => Promise<Response | null>,
 ): ((req: Request) => Promise<Response | null>) | undefined {
   return role === "gateway" || role === "mono" ? handler : undefined;
+}
+
+/**
+ * /agent/v1 is mounted for the gateway role, never for a node. On mono the
+ * agent child runs as the same OS user as the process that holds the clients'
+ * event signing secrets, so an agent could read one and sign a forged event;
+ * mono serves the API only when `onMono` (SLAUDE_AGENT_API_ON_MONO=1) says so,
+ * for development.
+ */
+export function agentApiHandlerForRole(
+  role: string,
+  onMono: boolean,
+  handler: (req: Request) => Promise<Response | null>,
+): ((req: Request) => Promise<Response | null>) | undefined {
+  return role === "gateway" || (role === "mono" && onMono) ? handler : undefined;
 }
 
 /**
@@ -96,6 +115,10 @@ export function healthRoutes(deps: HealthDeps, startedAt = Date.now()) {
     }
     if (deps.v1 && (url.pathname === "/v1" || url.pathname.startsWith("/v1/"))) {
       const res = await deps.v1(req);
+      if (res) return res;
+    }
+    if (deps.agentApi && (url.pathname === "/agent/v1" || url.pathname.startsWith("/agent/v1/"))) {
+      const res = await deps.agentApi(req);
       if (res) return res;
     }
     if (deps.deploy && (url.pathname === "/deploy" || url.pathname.startsWith("/deploy/"))) {

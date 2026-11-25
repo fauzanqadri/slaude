@@ -5,7 +5,7 @@ import { AgentManager } from "./agent/manager";
 import { createSlackApp } from "./gateway/slack/adapter";
 import { createGateway } from "./gateway/core/gateway";
 import { createHttpSlackTransport } from "./gateway/slack/http-transport";
-import { startHealthServer, deployHandlerForRole, brainImportHandlerForRole } from "./health";
+import { startHealthServer, deployHandlerForRole, brainImportHandlerForRole, agentApiHandlerForRole } from "./health";
 import { assertOAuthKeyCanary } from "./agent/mcp-oauth/store";
 import { sharedLoopback } from "./agent/mcp-oauth/shared-loopback";
 import { verifyState } from "./agent/mcp-oauth/state";
@@ -128,6 +128,20 @@ async function main() {
   // Same rule for the portal: it rides on the panel's provider settings, so a
   // portal that cannot authenticate must stop the process rather than serve.
   assertPortalConfig();
+  // Agent host API (/agent/v1): gateway role, or mono when opted in. The
+  // clients are loaded before anything listens, so a bad client file stops the
+  // process instead of serving with that client missing.
+  const agentApiMounted = role === "gateway" || (role === "mono" && env.agentApi.onMono());
+  let agentApi: ((req: Request) => Promise<Response | null>) | undefined;
+  if (agentApiMounted) {
+    const { loadClients } = await import("./agentapi/clients");
+    const { makeAgentApiHandler } = await import("./agentapi/index");
+    const dir = env.agentApi.clientsDir();
+    const clients = await loadClients(dir);
+    agentApi = agentApiHandlerForRole(role, env.agentApi.onMono(), makeAgentApiHandler({ clients: () => clients }));
+    console.log(`[slaude] /agent/v1 mounted (role=${role}, clients=${clients.size}${clients.size ? "" : `, none in ${dir}: every path answers 404`})`);
+    if (role === "mono") console.warn("[slaude] /agent/v1 on mono (SLAUDE_AGENT_API_ON_MONO=1): the agent can read the clients' signing secrets; development only");
+  }
   let slack: import("./gateway/core/gateway").GatewayHandle;
   let health: ReturnType<typeof startHealthServer> = null;
   if (slackMode === "http") {
@@ -144,6 +158,7 @@ async function main() {
         brainImport: brainImportHandlerForRole(role, (req) => slack.fetchBrainImport?.(req) ?? Promise.resolve(null)),
         panel: panelMounted ? (req: Request) => slack.fetchPanel(req) : undefined,
         portal: role !== "node" ? (req: Request) => slack.fetchPortal(req) : undefined,
+        agentApi,
       },
     });
     slack = createGateway(agent, transport, { mcpConnectEnabled: mcpOAuthHealthy, backgroundLearning: true, domainReconcile: true });
@@ -156,6 +171,7 @@ async function main() {
       brainImport: brainImportHandlerForRole(role, (req) => slack.fetchBrainImport?.(req) ?? Promise.resolve(null)),
       panel: panelMounted ? (req) => slack.fetchPanel(req) : undefined,
       portal: role !== "node" ? (req) => slack.fetchPortal(req) : undefined,
+      agentApi,
     });
   }
   if (role !== "node") console.log(`[slaude] /v1 REST mounted (role=${role})`);

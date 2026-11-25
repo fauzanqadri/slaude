@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { join } from "node:path";
 import { paths } from "./home";
 import { flag } from "./security-switches";
 
@@ -988,6 +989,20 @@ export const env = {
       }
       return DEFAULT_GIT_PUSH_BRANCH;
     },
+  },
+  agentApi: {
+    /** Directory of registered client files for `/agent/v1`
+     *  (`SLAUDE_AGENT_API_CLIENTS_DIR`, absolute or relative to $SLAUDE_HOME).
+     *  Default `$SLAUDE_HOME/api-clients`, where the Helm chart mounts its ConfigMap.
+     *  No directory, or no client in it, means the API answers 404 everywhere. */
+    clientsDir: (): string => {
+      const raw = opt("SLAUDE_AGENT_API_CLIENTS_DIR").trim();
+      return raw ? (raw.startsWith("/") ? raw : join(paths.home, raw)) : join(paths.home, "api-clients");
+    },
+    /** `SLAUDE_AGENT_API_ON_MONO=1`: serve `/agent/v1` on the mono role too. For
+     *  development only: on mono the agent child runs as the same OS user as the
+     *  process holding the clients' signing secrets. Default off. */
+    onMono: (): boolean => truthy(opt("SLAUDE_AGENT_API_ON_MONO", "0")),
   },
   /** Static Prometheus labels applied to every metric, e.g.
    *  `SLAUDE_METRICS_LABELS="agent=hermes,env=prod"`. Malformed entries are
