@@ -2,10 +2,10 @@
 
 | Metadata | Value |
 | --- | --- |
-| Status | Proposal for review. Nothing in this document is built on `main`. |
+| Status | Proposal for review. Pull requests 1 and 2 (sandbox mode, Helm charts) are built on branches; nothing is merged to `main`. The agent API (pull requests 3 to 7) is not built. |
 | Components | slaude gateway, agent loop, database; a separate sandbox MCP server |
 | First client | A workflow engine that runs multi-stage, human-approved work (Temporal-based) |
-| Last updated | 23 November 2026 |
+| Last updated | 25 November 2026 |
 | Delivery | Seven pull requests after this one, each released as a release candidate (section 9) |
 
 ## 1. Background
@@ -157,14 +157,16 @@ events:
 
 - The client is the authorisation boundary: the personas, channels and action tools it may use.
 - A client sees only the resources it created.
-- Bearer tokens are compared in constant time. An unknown or wrong token gets `401`, a resource of another client gets `404`.
+- A client file gives its bearer token as `token: { env: NAME }` or as `tokenSha256`, so the plaintext need not reach slaude. Bearer tokens are compared in constant time. An unknown or wrong token gets `401`, a resource of another client gets `404`.
 - Every create call takes an `Idempotency-Key`. A repeat returns the first response.
+- `/agent/v1` is mounted on the `gateway` role only, never on a node. On `mono` the agent child runs as the same OS user as the process that holds the clients' signing secrets, so it could sign a forged event; `mono` serves the API only with `SLAUDE_AGENT_API_ON_MONO=1`, for development. This follows the rule for `/deploy` in `src/health.ts`.
 
 ### 5.3 Tasks
 
 A task asks the persona to do work in a conversation.
 
-- `context: thread` runs the task as a turn in the conversation's thread, through the turn queue, with a new turn origin `api`.
+- `context: thread` runs the task as a turn in the conversation's thread, through the turn queue, with a new turn origin `api`. The turn is its own job: it never coalesces with a person's message waiting in the same thread. `api` is not an interactive origin, so a permission card in a task turn can be decided only by an approver or manager.
+- A task finishes through the path a background turn already uses (the ledger run a node finishes with the turn's outcome), so there is one completion path for turns that no person started.
 - `context: fresh` runs a locked-down query built like a background run: no tools unless allowed, no setting sources, a scrubbed environment.
 - `placement: workspace` runs the task in sandbox mode (section 6).
 - `output` declares a JSON Schema and an optional validation URL. A `submit_result` tool checks the result against the schema, then posts it to the validation URL through `outboundFetch`. A `422 {problems}` answer goes back to the model in the same turn.
@@ -189,6 +191,8 @@ An action runs one named tool with given arguments and no model, for example `gi
 
 - The client's action allowlist is checked first.
 - The call then goes through the same permission policy, owner guardrails and audit as a model's tool call, acting as the persona.
+- An action never posts a card. When an owner guardrail with `action: approve` matches, the call is refused with `409`; the client opens a request, and retries the action once it is answered.
+- In a sandbox thread, `git_push` is called on the sandbox server directly, with the same bearer and session header the turn uses.
 
 ### 5.6 Events
 
@@ -233,7 +237,7 @@ The sandbox server is a separate service with local, Docker, Kubernetes and VPS 
 
 ## 8. Data model
 
-Every table has a Postgres migration and a matching sqlite schema, checked by `tests/db/schema-drift.test.ts`.
+Every table has a Postgres migration and a matching sqlite schema, checked by `tests/db/schema-drift.test.ts`. Migration numbers on the branch stack: `0055` sandbox threads (`main` took `0054`), `0056` agent API base (idempotency, conversations), `0057` tasks, `0058` requests, `0059` outbox. They are renumbered on rebase if `main` gains a migration first.
 
 | Table | Columns (summary) | Pull request |
 | --- | --- | --- |
@@ -266,6 +270,8 @@ Each pull request is usable without the ones after it, and each ships as a relea
 2. Is a file per client under `$SLAUDE_HOME/api-clients/` the right registry, or should clients be console-managed resources like guardrails?
 3. Should sandbox mode become one more environment kind beside SSH remote environments, rather than its own switch?
 4. Should requests support `form` and free-text answers (Slack modals) in the first version?
+5. Is a gateway-only mount, with `mono` behind a development flag, acceptable, or must `mono` serve the API by default? The alternative is to run the agent child under a separate OS user on `mono`.
+6. Should an action refused by an `approve` guardrail post a card itself, rather than answer `409` and leave the request to the client?
 
 ## Appendix A. Payload sketches
 
