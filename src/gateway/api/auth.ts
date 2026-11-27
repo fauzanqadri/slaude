@@ -67,7 +67,8 @@ export interface JobClaims {
    *  token from before the change) means "default". */
   label?: string;
   /** What started the turn, signed at dispatch: "slack" (a person's Slack
-   *  message), "panel" (an operator), or "cron". Only slack and panel are
+   *  message), "panel" (an operator), "cron", or "api" (a task from an agent API
+   *  client). Only slack and panel are
    *  interactive; an absent claim (an older gateway) reads as NOT interactive
    *  (fail closed). It describes the job's origin only: a synthetic turn the
    *  node's manager injects under the same token (auto-evolve, a continuation

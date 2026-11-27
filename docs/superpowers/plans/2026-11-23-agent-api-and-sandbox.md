@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-23-agent-api-and-sandbox-trd.md`
 
-**Progress (25 November 2026):** PR 0 to PR 2 are built on stacked branches (`agent/00-spec`, `agent/01-sandbox`, `agent/02-helm`) and not yet opened upstream. PR 3 starts on `agent/03-api-foundation`, stacked on `agent/02-helm`. The tasks below were checked against the code at `agent/02-helm` (`4a51cda6`, before the rebase onto `main` at `ee14d428`); the section "Checked before PR 3" records what changed in the plan as a result.
+**Progress (27 November 2026):** PR 0 to PR 3 are built on stacked branches (`agent-v2/00-spec`, `agent-v2/01-sandbox`, `agent-v2/02-helm`, `agent-v2/03-api-foundation`), pushed to the fork after the rebase onto `main` and not yet opened upstream. The tasks below were checked against the code at `agent/02-helm` (`4a51cda6`, before the rebase onto `main` at `ee14d428`); the section "Checked before PR 3" records what changed in the plan as a result.
 
 ## Global Constraints
 
@@ -150,8 +150,9 @@ The sandbox server runs `git_push` with its own key and remote allowlist; slaude
 
 ### Task 3.4: Capabilities and turn origin `api`
 **Files:** Create `src/agentapi/capabilities.ts`; Modify `src/knowledge/gated-dispatch.ts` (`TurnOrigin`, `TURN_ORIGINS`), `src/gateway/slack/permission-gate.ts` (`TURN_ORIGIN_SET`) (C2); Test `tests/agentapi/capabilities.test.ts`, existing job-token tests.
-- [ ] **Step 1:** Tests: capabilities report fresh context, sandbox (from `env.sandbox`), allowed actions (client allowlist intersected with persona tools); `TurnOrigin` accepts `api`, is signed into the job token, and is not interactive (`isInteractiveOrigin` false); a permission card in an `api` turn stamps `initiator: null`, so only an approver or manager can decide it.
-- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `agentapi: capabilities and api turn origin`.
+- [x] **Step 1:** Tests: capabilities report fresh context, sandbox (from `env.sandbox`), allowed actions (client allowlist intersected with persona tools); `TurnOrigin` accepts `api`, is signed into the job token, and is not interactive (`isInteractiveOrigin` false); a permission card in an `api` turn stamps `initiator: null`, so only an approver or manager can decide it.
+- [x] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `agentapi: capabilities and api turn origin`.
+- **As built:** a persona has no tool allowlist of its own, so "persona tools" is the set of tools this host can run as an action (`ACTION_TOOLS` in `src/agentapi/capabilities.ts`, today only `git_push`, which needs sandbox mode). The answer is `{persona, contexts, placements, sandbox, actions, connectors}`; connectors are the persona's MCP server names, never their URLs. A persona outside the client allowlist or unknown here is `404`. Every reader that branches on origin already treats an unlisted origin as not interactive (the brain gate, `stop-guard`, `rule-tool`, the remote decision), so `api` needed no change there.
 
 ---
 

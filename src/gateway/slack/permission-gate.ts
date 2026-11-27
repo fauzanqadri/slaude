@@ -51,7 +51,7 @@ export interface TurnStamp {
 }
 
 
-const TURN_ORIGIN_SET: ReadonlySet<string> = new Set<TurnOrigin>(["slack", "panel", "cron"]);
+const TURN_ORIGIN_SET: ReadonlySet<string> = new Set<TurnOrigin>(["slack", "panel", "cron", "api"]);
 
 /**
  * The stamp for a prompt from the senders of the inputs the turn is

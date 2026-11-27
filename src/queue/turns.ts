@@ -52,7 +52,7 @@ export interface TurnMessage {
 export interface TurnSender {
   userId: string;
   teamId: string | null;
-  /** "slack" | "panel" | "cron"; null = unknown. */
+  /** "slack" | "panel" | "cron" | "api"; null = unknown. */
   origin: string | null;
 }
 

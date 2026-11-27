@@ -7,13 +7,14 @@ import { agentSourceId, isProfileSourceId, noPerson, resolveBrainScope, SHARED_S
 
 export type GateTier = "auto" | "approval" | "manager" | "deny";
 
-/** What started a turn: a human Slack message, an operator in the panel, or
- *  a cron job. Signed into a node's job token as `origin`. */
-export type TurnOrigin = "cron" | "slack" | "panel";
-export const TURN_ORIGINS: readonly TurnOrigin[] = ["cron", "slack", "panel"];
+/** What started a turn: a human Slack message, an operator in the panel, a
+ *  cron job, or a task from an agent API client (`/agent/v1`). Signed into a
+ *  node's job token as `origin`. */
+export type TurnOrigin = "cron" | "slack" | "panel" | "api";
+export const TURN_ORIGINS: readonly TurnOrigin[] = ["cron", "slack", "panel", "api"];
 
 /** Interactive origin = a person started the turn's job (Slack or panel).
- *  Cron, and an absent or unknown origin (an older token), read as not
+ *  Cron, api, and an absent or unknown origin (an older token), read as not
  *  interactive. Says nothing about synthetic follow-up turns inside the job:
  *  see GateInput.interactive and AgentManager.isSyntheticTurn. */
 export const isInteractiveOrigin = (origin: unknown): boolean => origin === "slack" || origin === "panel";

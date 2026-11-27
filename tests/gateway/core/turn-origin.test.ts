@@ -81,7 +81,7 @@ describe("isInteractiveOrigin", () => {
   test("slack and panel are interactive; cron, absent and unknown are not", () => {
     expect(isInteractiveOrigin("slack")).toBe(true);
     expect(isInteractiveOrigin("panel")).toBe(true);
-    for (const o of ["cron", undefined, null, "", "SLACK", "agent"]) expect(isInteractiveOrigin(o)).toBe(false);
+    for (const o of ["cron", "api", undefined, null, "", "SLACK", "agent"]) expect(isInteractiveOrigin(o)).toBe(false);
   });
 });
 
@@ -172,13 +172,14 @@ describe("node turns: the brain gate reads team and origin from the signed claim
     return v.claims;
   };
 
-  test("slack and panel claims are interactive; cron and an absent claim are not", async () => {
+  test("slack and panel claims are interactive; cron, api and an absent claim are not", async () => {
     const { t } = transport();
     h = createGateway(new AgentManager(), t);
     const gate = (o: Partial<JobClaims>) => h!.__brainGateForClaims!(claimsWith(o));
     expect(await gate({ origin: "slack" })).toMatchObject({ interactive: true, teamId: "T0TEAM", userId: "U0ALICE" });
     expect((await gate({ origin: "panel" })).interactive).toBe(true);
     expect((await gate({ origin: "cron" })).interactive).toBe(false);
+    expect((await gate({ origin: "api" })).interactive).toBe(false);
     expect((await gate({})).interactive).toBe(false);
   });
 

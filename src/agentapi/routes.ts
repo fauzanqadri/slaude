@@ -5,6 +5,7 @@
  */
 import { json } from "../gateway/api/http";
 import type { ApiClient } from "./clients";
+import { capabilityRoutes } from "./capabilities";
 import { conversationRoutes } from "./conversations";
 
 export interface AgentRouteCtx {
@@ -41,5 +42,6 @@ export function agentRoutes(): AgentRouteDef[] {
         json(200, { name: client.name, personas: client.personas, channels: client.channels, actions: client.actions }),
     },
     ...conversationRoutes(),
+    ...capabilityRoutes(),
   ];
 }
