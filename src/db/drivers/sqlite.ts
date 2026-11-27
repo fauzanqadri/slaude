@@ -511,6 +511,30 @@ CREATE TABLE IF NOT EXISTS sandbox_threads (
   PRIMARY KEY (channel_id, thread_ts)
 );
 
+CREATE TABLE IF NOT EXISTS agent_idempotency (
+  client       TEXT    NOT NULL,
+  idem_key     TEXT    NOT NULL,
+  route        TEXT    NOT NULL,
+  request_hash TEXT    NOT NULL,
+  status       INTEGER NOT NULL,
+  response     TEXT    NOT NULL,
+  resource_id  TEXT,
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY (client, idem_key)
+);
+CREATE INDEX IF NOT EXISTS agent_idempotency_created_idx ON agent_idempotency (created_at);
+
+CREATE TABLE IF NOT EXISTS agent_conversations (
+  id         TEXT    PRIMARY KEY,
+  client     TEXT    NOT NULL,
+  persona    TEXT    NOT NULL,
+  channel    TEXT    NOT NULL,
+  thread_ts  TEXT,
+  title      TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_conversations_client_idx ON agent_conversations (client, created_at);
+
 CREATE TABLE IF NOT EXISTS soul_overrides (
   field      TEXT    NOT NULL CHECK(field IN
               ('trustedChannels','allowedChannels','dmAllowedUsers','blockedUsers')),

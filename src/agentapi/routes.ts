@@ -5,6 +5,7 @@
  */
 import { json } from "../gateway/api/http";
 import type { ApiClient } from "./clients";
+import { conversationRoutes } from "./conversations";
 
 export interface AgentRouteCtx {
   req: Request;
@@ -29,7 +30,7 @@ export function matchAgentRoute(route: Pick<AgentRouteDef, "pattern">, seg: read
   return route.pattern.every((p, i) => p.startsWith(":") ? seg[i]!.length > 0 : p === seg[i]);
 }
 
-/** The route table. Later pull requests add conversations, tasks, requests and actions. */
+/** The route table. Later pull requests add tasks, requests and actions. */
 export function agentRoutes(): AgentRouteDef[] {
   return [
     {
@@ -39,5 +40,6 @@ export function agentRoutes(): AgentRouteDef[] {
       handle: async ({ client }) =>
         json(200, { name: client.name, personas: client.personas, channels: client.channels, actions: client.actions }),
     },
+    ...conversationRoutes(),
   ];
 }

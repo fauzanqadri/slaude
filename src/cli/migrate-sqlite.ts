@@ -29,6 +29,8 @@ export const EXPORT_TABLES = [
   "one_on_one_locks",
   "mention_only_threads",
   "sandbox_threads",
+  "agent_conversations",
+  "agent_idempotency",
   "soul_overrides",
   "kb_ingest_jobs",
   "memory_turns",

@@ -92,6 +92,8 @@ if (pgTest && process.env.SLAUDE_DB === "pg" && process.env.SLAUDE_PG_URL === pg
     "remote_keys",
     "mention_only_threads",
     "sandbox_threads",
+    "agent_conversations",
+    "agent_idempotency",
     "soul_overrides",
     "sessions",
   ]) {

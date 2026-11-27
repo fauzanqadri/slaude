@@ -144,8 +144,9 @@ The sandbox server runs `git_push` with its own key and remote allowlist; slaude
 
 ### Task 3.3: Idempotency and conversations
 **Files:** Create `src/agentapi/{idempotency,conversations}.ts`, `src/db/agent-api.ts`, migration `0056_agent_api_base.sql` (`agent_idempotency`, `agent_conversations`); Modify `src/db/drivers/sqlite.ts`; Test `tests/agentapi/conversations.test.ts`.
-- [ ] **Step 1:** Tests: create returns `201 {conversationId}`; persona or channel outside the client allowlist `403`; same key and body returns the first response; same key, different body `409`; another client's conversation `404`.
-- [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `agentapi: conversations and idempotency`.
+- [x] **Step 1:** Tests: create returns `201 {conversationId}`; persona or channel outside the client allowlist `403`; same key and body returns the first response; same key, different body `409`; another client's conversation `404`.
+- [x] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS; commit `agentapi: conversations and idempotency`.
+- **As built:** `idempotent()` stores the first response under (client, key) in the same transaction as the resource, so the two cannot disagree; the hash covers the route and the body as canonical JSON (keys sorted), so a reordered body is a repeat and the same key on another route is `409`. A missing or malformed key is `400`. A refusal (`400`, `403`) is not stored, so a client can fix the call and retry under the same key. Two calls racing on one key create one resource: the loser's insert finds the row, its transaction rolls back, and it answers from the row. Records count as absent after 24 hours; `purgeIdempotency` deletes them, and the leader-only sweep that calls it arrives with the task sweep in PR 4. A replay carries `idempotent-replayed: true`. Conversation ids are `conv_<32 hex>`; any other id is `404` without a query. The persona is checked against the client allowlist only; whether it exists is checked when a task runs (PR 4). Tested on sqlite and pglite.
 
 ### Task 3.4: Capabilities and turn origin `api`
 **Files:** Create `src/agentapi/capabilities.ts`; Modify `src/knowledge/gated-dispatch.ts` (`TurnOrigin`, `TURN_ORIGINS`), `src/gateway/slack/permission-gate.ts` (`TURN_ORIGIN_SET`) (C2); Test `tests/agentapi/capabilities.test.ts`, existing job-token tests.
